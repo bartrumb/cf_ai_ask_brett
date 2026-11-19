@@ -16,7 +16,7 @@ Prompt 1 is a brief written by another Claude Code session that was helping me p
 | 6–8 | Personal knowledge base work, first live model test and first public deployment |
 | 9–10 | Recognizing the wrong direction and converting the project into a showcase of my work |
 | 11–14 | Voice selection, then live testing and repairs from Worker logs |
-| 15–17 | Lighthouse tuning, public release preparation and final polish |
+| 15–18 | Lighthouse tuning, public release preparation, final polish and publishing |
 
 This file holds the prompts and their outcomes. The raw session transcript is not published because it also contains unrelated private material, such as personal career notes and local machine details.
 
@@ -331,3 +331,13 @@ if you have not creates a fav icon yet create one of my initials BBB but make it
 ````
 
 **Produced:** the neon BBB icon in SVG, ICO and Apple touch formats.
+
+---
+
+## Prompt 18
+
+````text
+Deploy and create the public repo to share for job req
+````
+
+**Produced:** the final deployment and this public repository.
