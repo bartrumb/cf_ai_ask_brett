@@ -2,8 +2,8 @@
  * Single list of model IDs. Primary and secondary roles are applied in `llm.ts` and `speech.ts`.
  */
 /**
- * Every model the app calls. Each one is routed through AI Gateway, except `tts.direct`, which is
- * Deepgram's own API and runs only when the `DEEPGRAM_API_KEY` Worker secret is set.
+ * Every model the app calls. Each one is routed through AI Gateway, except `tts.elevenLabs` and
+ * `tts.deepgram`, which call those vendors' own APIs and run only when their Worker secrets are set.
  */
 export const MODELS = {
   llm: {
@@ -15,10 +15,17 @@ export const MODELS = {
     secondary: "@cf/openai/whisper-large-v3-turbo",
   },
   tts: {
-    direct: "aura-2-aries-en",
+    elevenLabs: "eleven_v4",
+    deepgram: "aura-2-aries-en",
     primary: "@cf/deepgram/aura-2-en",
     secondary: "@cf/deepgram/aura-1",
   },
+} as const;
+
+/** Jarnathan, the ElevenLabs voice of the "Brett" podcast host, with the podcast's settings. */
+export const ELEVENLABS_VOICE = {
+  id: "c6SfcYrb2t09NHXiT80T",
+  settings: { stability: 0.3, similarity_boost: 0.72 },
 } as const;
 
 /**

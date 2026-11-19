@@ -1,16 +1,19 @@
 /*
  * Speech-to-text and text-to-speech calls, each with a fallback model and an offline path. Calls go
- * through AI Gateway, except text to speech when a Deepgram key is set. `ShowcaseAgent` handles
- * validation, rate limits and redaction around these calls.
+ * through AI Gateway, except text to speech when an ElevenLabs or Deepgram key is set.
+ * `ShowcaseAgent` handles validation, rate limits and redaction around these calls.
  */
 import { Buffer } from "node:buffer";
 import type { AnswerSource } from "./domain/types";
 import { gatewayMetadata, gatewayOptions, type GatewayContext } from "./gateway";
 import { isOffline } from "./llm";
-import { MODELS, TTS_SPEAKERS } from "./models";
+import { ELEVENLABS_VOICE, MODELS, TTS_SPEAKERS } from "./models";
 
-/** Deepgram's speech endpoint, set to the podcast voice. */
-const DEEPGRAM_SPEAK_URL = `https://api.deepgram.com/v1/speak?model=${MODELS.tts.direct}&encoding=mp3`;
+/** ElevenLabs' speech endpoint for the podcast voice. 64 kbps keeps long answers small to send. */
+const ELEVENLABS_SPEAK_URL = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE.id}?output_format=mp3_44100_64`;
+
+/** Deepgram's speech endpoint, set to the podcast's backup voice. */
+const DEEPGRAM_SPEAK_URL = `https://api.deepgram.com/v1/speak?model=${MODELS.tts.deepgram}&encoding=mp3`;
 
 /** Fixed transcript returned in offline mode, so the voice flow can be tried for free. */
 export const OFFLINE_TRANSCRIPT = "What is the strongest proof of this work?";
@@ -19,7 +22,11 @@ export const OFFLINE_TRANSCRIPT = "What is the strongest proof of this work?";
 const SPEECH_TIMEOUT_MS = 12_000;
 
 /** Bindings needed for speech calls. */
-type SpeechEnv = Pick<Env, "AI" | "AI_MODE" | "AI_GATEWAY_ID"> & { AI_GATEWAY_TOKEN?: string; DEEPGRAM_API_KEY?: string };
+type SpeechEnv = Pick<Env, "AI" | "AI_MODE" | "AI_GATEWAY_ID"> & {
+  AI_GATEWAY_TOKEN?: string;
+  DEEPGRAM_API_KEY?: string;
+  ELEVENLABS_API_KEY?: string;
+};
 /** Where a successful speech result came from. */
 type Source = Extract<AnswerSource, "workers-ai" | "offline">;
 /** Loose signature for `env.AI.run`, which is called here with model-specific input shapes. */
@@ -36,7 +43,7 @@ export interface Transcript {
 export interface SpokenAudio {
   audio: string;
   mimeType: string;
-  source: Source | "deepgram";
+  source: Source | "deepgram" | "elevenlabs";
   model: string | null;
 }
 
@@ -164,6 +171,20 @@ function offlineTone(): string {
 }
 
 /**
+ * Requests speech from ElevenLabs' own API. Redirects are not followed, so the key is only ever sent
+ * to ElevenLabs, and a redirect counts as a failure.
+ */
+function requestElevenLabsSpeech(apiKey: string, text: string, signal: AbortSignal): Promise<Response> {
+  return fetch(ELEVENLABS_SPEAK_URL, {
+    method: "POST",
+    headers: { "xi-api-key": apiKey, "Content-Type": "application/json", Accept: "audio/mpeg" },
+    body: JSON.stringify({ text, model_id: MODELS.tts.elevenLabs, voice_settings: ELEVENLABS_VOICE.settings }),
+    redirect: "manual",
+    signal,
+  });
+}
+
+/**
  * Requests speech from Deepgram's own API. Redirects are not followed, so the key is only ever sent
  * to Deepgram, and a redirect counts as a failure.
  */
@@ -178,9 +199,9 @@ function requestDeepgramSpeech(apiKey: string, text: string, signal: AbortSignal
 }
 
 /**
- * Synthesizes MP3 speech in two attempts, so both fit inside the browser's call limit. The first is
- * Deepgram directly when `DEEPGRAM_API_KEY` is set, otherwise Aura-2 through the gateway. The second
- * is always Aura-1 through the gateway, which keeps speech working if Deepgram's API is unavailable.
+ * Synthesizes MP3 speech in at most two attempts, so both fit inside the browser's call limit. The
+ * order of preference is ElevenLabs, Deepgram, then Aura-1 through the gateway, skipping a vendor
+ * with no key. With no vendor key, Aura-2 through the gateway goes first.
  *
  * @param text - Text already prepared and length-limited by `domain/audio.ts`.
  * @param context - Gateway metadata for the request.
@@ -218,16 +239,32 @@ export async function synthesizeSpeech(
     const audio = await readWithin((signal) => run(model, input, { ...options, signal }));
     return { audio, mimeType: "audio/mpeg", source: "workers-ai", model };
   };
-  const speakFirstChoice = async (): Promise<SpokenAudio> => {
-    const apiKey = env.DEEPGRAM_API_KEY;
-    if (!apiKey) return speakThroughGateway(MODELS.tts.primary, TTS_SPEAKERS.primary);
-    const audio = await readWithin((signal) => requestDeepgramSpeech(apiKey, text, signal));
-    return { audio, mimeType: "audio/mpeg", source: "deepgram", model: MODELS.tts.direct };
-  };
+  const attempts: (() => Promise<SpokenAudio>)[] = [];
+  const { ELEVENLABS_API_KEY: elevenLabsKey, DEEPGRAM_API_KEY: deepgramKey } = env;
+  if (elevenLabsKey) {
+    attempts.push(async () => ({
+      audio: await readWithin((signal) => requestElevenLabsSpeech(elevenLabsKey, text, signal)),
+      mimeType: "audio/mpeg",
+      source: "elevenlabs",
+      model: MODELS.tts.elevenLabs,
+    }));
+  }
+  if (deepgramKey) {
+    attempts.push(async () => ({
+      audio: await readWithin((signal) => requestDeepgramSpeech(deepgramKey, text, signal)),
+      mimeType: "audio/mpeg",
+      source: "deepgram",
+      model: MODELS.tts.deepgram,
+    }));
+  }
+  if (attempts.length === 0) attempts.push(() => speakThroughGateway(MODELS.tts.primary, TTS_SPEAKERS.primary));
+  attempts.push(() => speakThroughGateway(MODELS.tts.secondary, TTS_SPEAKERS.secondary));
+
+  const [first, second] = attempts as [() => Promise<SpokenAudio>, () => Promise<SpokenAudio>];
   try {
-    return await speakFirstChoice();
+    return await first();
   } catch (error) {
     console.warn("primary speech failed", error instanceof Error ? error.message : "unknown error");
   }
-  return speakThroughGateway(MODELS.tts.secondary, TTS_SPEAKERS.secondary);
+  return second();
 }

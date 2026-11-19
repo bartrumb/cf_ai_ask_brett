@@ -78,17 +78,23 @@ Open <http://127.0.0.1:8787>.
 
 ## Models
 
-Model IDs live in `src/models.ts`. Calls go through the `codex-guard` AI Gateway, an existing gateway ID kept so its logs and limits carry over, except direct Deepgram speech described below. Gateway requests carry `app: ask-brett` metadata.
+Model IDs live in `src/models.ts`. Calls go through the `codex-guard` AI Gateway, an existing gateway ID kept so its logs and limits carry over, except direct ElevenLabs and Deepgram speech described below. Gateway requests carry `app: ask-brett` metadata.
 
 | Purpose | Primary | Fallback |
 | --- | --- | --- |
 | Language | `@cf/deepseek-ai/deepseek-v4.1-flash-1017` | `@cf/thinkingmachines/inkling-2-small` |
 | Speech to text | `@cf/deepgram/nova-3` | `@cf/openai/whisper-large-v3-turbo` |
-| Text to speech | Deepgram `aura-2-aries-en` (direct), or `@cf/deepgram/aura-2-en` with the `aries` voice | `@cf/deepgram/aura-1` with the `orion` voice |
+| Text to speech | ElevenLabs `eleven_v4` with the Jarnathan voice (direct) | Deepgram `aura-2-aries-en` (direct), then `@cf/deepgram/aura-1` with the `orion` voice |
 
 Nova runs through the gateway's HTTP endpoint only when the `AI_GATEWAY_TOKEN` Worker secret is set. Otherwise speech recognition uses Whisper through the gateway.
 
-Text to speech calls Deepgram's API directly only when the `DEEPGRAM_API_KEY` Worker secret is set. Those calls do not pass through AI Gateway, so its logs and spend limit do not cover them. Set the secret from a hidden prompt:
+Each Listen makes at most two speech attempts, taken in the order above and skipping a vendor with no key. With neither key set, it tries `@cf/deepgram/aura-2-en` with the `aries` voice and then Aura-1.
+
+ElevenLabs and Deepgram are called directly only when the `ELEVENLABS_API_KEY` and `DEEPGRAM_API_KEY` Worker secrets are set. Those calls do not pass through AI Gateway, so its logs and spend limit do not cover them. Set each secret from a hidden prompt:
+
+```powershell
+npx wrangler secret put ELEVENLABS_API_KEY
+```
 
 ```powershell
 npx wrangler secret put DEEPGRAM_API_KEY

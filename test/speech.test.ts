@@ -100,6 +100,44 @@ describe("text to speech", () => {
     expect(calls.map((call) => call.model)).toEqual([MODELS.tts.secondary]);
   });
 
+  it("prefers the ElevenLabs podcast voice over every other option", async () => {
+    const { calls, env } = fakeEnv(() => new Response("unused"));
+    const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(new Uint8Array([1, 2, 3])));
+    const result = await synthesizeSpeech({ ...env, ELEVENLABS_API_KEY: "eleven-key", DEEPGRAM_API_KEY: "test-key" }, "Hello.", context);
+    expect(result).toEqual({ audio: "AQID", mimeType: "audio/mpeg", source: "elevenlabs", model: "eleven_v4" });
+    expect(calls).toEqual([]);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const [url, init] = fetcher.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.elevenlabs.io/v1/text-to-speech/c6SfcYrb2t09NHXiT80T?output_format=mp3_44100_64");
+    expect(url).not.toContain("eleven-key");
+    expect(new Headers(init.headers).get("xi-api-key")).toBe("eleven-key");
+    expect(JSON.parse(String(init.body))).toEqual({
+      text: "Hello.",
+      model_id: "eleven_v4",
+      voice_settings: { stability: 0.3, similarity_boost: 0.72 },
+    });
+    expect(init.redirect).toBe("manual");
+  });
+
+  it("falls back from ElevenLabs to Deepgram when both keys are set", async () => {
+    const { calls, env } = fakeEnv(() => new Response("unused"));
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) =>
+      String(url).includes("elevenlabs") ? new Response("no", { status: 429 }) : new Response(new Uint8Array([1, 2, 3])),
+    );
+    const result = await synthesizeSpeech({ ...env, ELEVENLABS_API_KEY: "eleven-key", DEEPGRAM_API_KEY: "test-key" }, "Hello.", context);
+    expect(result).toMatchObject({ source: "deepgram", model: MODELS.tts.deepgram });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(calls).toEqual([]);
+  });
+
+  it("falls back from ElevenLabs to Aura-1 without a Deepgram key", async () => {
+    const { calls, env } = fakeEnv(() => new Response(new Uint8Array([1, 2, 3])));
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("no", { status: 401 }));
+    const result = await synthesizeSpeech({ ...env, ELEVENLABS_API_KEY: "eleven-key" }, "Hello.", context);
+    expect(result).toMatchObject({ source: "workers-ai", model: MODELS.tts.secondary });
+    expect(calls.map((call) => call.model)).toEqual([MODELS.tts.secondary]);
+  });
+
   it("falls back when Deepgram stalls", async () => {
     const { env } = fakeEnv(() => new Response(new Uint8Array([1, 2, 3])));
     vi.spyOn(globalThis, "fetch").mockImplementation(() => new Promise(() => {}));

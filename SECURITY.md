@@ -31,10 +31,10 @@ Ask about Brett is a public site. Every question, transcript and model response 
 - The visitor key is an unsalted daily hash of an IP network. It limits spend and is not strong anonymity. Shared networks share a limit, and rotating addresses can get around it. The global limits still apply.
 - The conversation ID in `localStorage` is a bearer value for that conversation. Anyone with it can read that conversation.
 - Set an AI Gateway spend limit. Application limits count actions, and one action can call a primary and a fallback model.
-- With `DEEPGRAM_API_KEY` set, stored answers are sent directly to Deepgram for speech. The gateway spend limit and logs do not cover those calls. The application's speech limits still apply, so also set a usage limit or low balance in Deepgram.
+- With `ELEVENLABS_API_KEY` or `DEEPGRAM_API_KEY` set, stored answers are sent directly to that vendor for speech. The gateway spend limit and logs do not cover those calls. The application's speech limits still apply, so also set a credit limit on the ElevenLabs key and a usage limit or low balance in Deepgram.
 - Guardrails does not enforce responses on streamed requests.
 - Speech-to-text requests ask the gateway not to store audio payloads. Confirm this in gateway logs.
 
 ## Handling tokens
 
-The application needs no API token at runtime unless Nova-3 is enabled through the optional `AI_GATEWAY_TOKEN` Worker secret or direct Deepgram speech through the optional `DEEPGRAM_API_KEY` Worker secret. Give the Deepgram key the narrowest role available and store it only as a Worker secret. A separate token is used only to configure AI Gateway. Scope it to AI Gateway, give it a short expiry, keep it out of files and command history, and revoke it after setup.
+The application needs no API token at runtime unless Nova-3 is enabled through the optional `AI_GATEWAY_TOKEN` Worker secret or direct speech through the optional `ELEVENLABS_API_KEY` and `DEEPGRAM_API_KEY` Worker secrets. Give each speech key the narrowest permissions available and store it only as a Worker secret. A separate token is used only to configure AI Gateway. Scope it to AI Gateway, give it a short expiry, keep it out of files and command history, and revoke it after setup.

@@ -253,3 +253,13 @@ I set the spend limit perhaps we should switch over to deep gram direct using th
 ````
 
 **Produced:** text to speech in the podcast's Deepgram Aura-2 Aries voice, called directly when a Deepgram key is set, with AI Gateway models as fallbacks.
+
+---
+
+## Prompt 12
+
+````text
+ElevenLabs Jarnathan it is for primary. I have used so many models that I'm getting them confused.
+````
+
+**Produced:** ElevenLabs Jarnathan as the primary speech voice when its key is set, with Deepgram Aries and Aura-1 as fallbacks.
