@@ -263,3 +263,15 @@ ElevenLabs Jarnathan it is for primary. I have used so many models that I'm gett
 ````
 
 **Produced:** ElevenLabs Jarnathan as the primary speech voice when its key is set, with Deepgram Aries and Aura-1 as fallbacks.
+
+---
+
+## Prompt 13
+
+````text
+[Attached terminal output redacted: it contained a Cloudflare account ID and local log paths. It showed `wrangler secret put ELEVENLABS_API_KEY` failing with "No access to the specified resource."]
+
+tried setting key failed
+````
+
+**Produced:** a diagnosis. The terminal was still using the short-lived AI Gateway token, which cannot change Worker secrets.
