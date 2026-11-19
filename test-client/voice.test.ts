@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_RECORDING_MS, playAudio, startRecording, stopPlayback } from "../client/voice";
+import { MAX_RECORDING_MS, startRecording, startSpeech, stopPlayback } from "../client/voice";
 
 class FakeRecorder extends EventTarget {
   state = "inactive";
@@ -33,6 +33,7 @@ function installAudioFakes() {
 afterEach(() => {
   stopPlayback();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -62,27 +63,85 @@ describe("recording", () => {
   });
 });
 
-describe("playback", () => {
-  it("plays decoded audio, replaces earlier playback and cleans up", async () => {
-    const audios: FakeAudio[] = [];
-    class FakeAudio extends EventTarget {
-      pause = vi.fn();
-      play = vi.fn(async () => {});
-      constructor(public src: string) {
-        super();
-        audios.push(this);
-      }
+describe("streamed playback", () => {
+  const audios: FakeAudio[] = [];
+  let failPlay = false;
+  class FakeAudio extends EventTarget {
+    src = "";
+    sources: string[] = [];
+    pause = vi.fn();
+    play = vi.fn(async () => {
+      this.sources.push(this.src);
+      if (failPlay && this.src !== "blob:0") throw new Error("blocked");
+    });
+    constructor() {
+      super();
+      audios.push(this);
     }
+  }
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const handlers = () => ({ onStart: vi.fn(), onEnd: vi.fn(), onError: vi.fn() });
+
+  const install = () => {
+    audios.length = 0;
+    failPlay = false;
+    let count = 0;
     vi.stubGlobal("Audio", FakeAudio);
-    const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
-    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:test");
-    const onEnd = vi.fn();
-    await playAudio("AAAA", "audio/mpeg", onEnd);
-    await playAudio("AAAA", "audio/mpeg", onEnd);
+    vi.spyOn(URL, "createObjectURL").mockImplementation(() => `blob:${count++}`);
+    return vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+  };
+
+  it("unlocks audio in the gesture, then plays parts in order through one element", async () => {
+    const revoke = install();
+    const events = handlers();
+    const player = startSpeech(events);
+    const audio = audios[0] as FakeAudio;
+    expect(audio.sources).toEqual(["blob:0"]);
+    player.add("AAAA", "audio/mpeg");
+    player.add("AAAA", "audio/mpeg");
+    await settle();
+    expect(events.onStart).toHaveBeenCalledTimes(1);
+    audio.dispatchEvent(new Event("ended"));
+    player.finish();
+    expect(events.onEnd).not.toHaveBeenCalled();
+    audio.dispatchEvent(new Event("ended"));
+    expect(audio.sources).toEqual(["blob:0", "blob:1", "blob:2"]);
+    expect(events.onEnd).toHaveBeenCalledTimes(1);
+    expect(revoke).toHaveBeenCalledTimes(3);
+    expect(audios).toHaveLength(1);
+  });
+
+  it("ends at once when the stream finishes with nothing left to play", async () => {
+    install();
+    const events = handlers();
+    const player = startSpeech(events);
+    player.add("AAAA", "audio/mpeg");
+    await settle();
+    (audios[0] as FakeAudio).dispatchEvent(new Event("ended"));
+    player.finish();
+    expect(events.onEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a refused part and stops", async () => {
+    install();
+    failPlay = true;
+    const events = handlers();
+    const player = startSpeech(events);
+    player.add("AAAA", "audio/mpeg");
+    await settle();
+    expect(events.onError).toHaveBeenCalledTimes(1);
+    player.add("AAAA", "audio/mpeg");
+    expect((audios[0] as FakeAudio).sources).toHaveLength(2);
+  });
+
+  it("replaces earlier playback without running its callbacks", () => {
+    install();
+    const first = handlers();
+    startSpeech(first);
+    startSpeech(handlers());
     expect(audios[0]?.pause).toHaveBeenCalled();
-    audios[0]?.dispatchEvent(new Event("ended"));
-    audios[1]?.dispatchEvent(new Event("ended"));
-    expect(onEnd).toHaveBeenCalledTimes(2);
-    expect(revoke).toHaveBeenCalledTimes(2);
+    stopPlayback();
+    expect(audios[1]?.pause).toHaveBeenCalled();
+    expect(first.onEnd).not.toHaveBeenCalled();
   });
 });

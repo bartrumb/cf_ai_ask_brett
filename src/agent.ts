@@ -5,7 +5,7 @@
  * `domain/schemas.ts`; one reserved instance also holds the shared daily budget.
  */
 import { Think, type ChatResponseResult, type TurnConfig, type TurnContext } from "@cloudflare/think";
-import { callable, getAgentByName, getCurrentAgent, type Connection, type ConnectionContext, type WSMessage } from "agents";
+import { callable, getAgentByName, getCurrentAgent, type Connection, type ConnectionContext, type StreamingResponse, type WSMessage } from "agents";
 import { ACCESS_EXPIRES_HEADER, CLIENT_KEY_HEADER } from "./access";
 import { decodeWav, toSpokenText } from "./domain/audio";
 import { classifyQuestion, guardedAnswer } from "./domain/guards";
@@ -17,7 +17,7 @@ import type { GatewayContext } from "./gateway";
 import { KNOWLEDGE_SECTIONS, PROFILE } from "./generated/knowledge";
 import { createLanguageModel, isOffline } from "./llm";
 import { createOfflineModel } from "./offline-model";
-import { synthesizeSpeech, transcribeAudio, type SpokenAudio, type Transcript } from "./speech";
+import { streamSpeech, transcribeAudio, type Transcript } from "./speech";
 
 /** Questions, transcriptions and speech requests one conversation may make in a rolling hour. */
 const MAX_AI_ACTIONS_PER_HOUR = 60;
@@ -384,24 +384,28 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
   }
 
   /**
-   * Reads a stored answer aloud. It speaks stored content only, so this cannot become a general
-   * speech API. Each call costs `SPEECH_BUDGET_UNITS`.
+   * Reads a stored answer aloud, streaming audio part by part so playback starts after the first
+   * sentence. It speaks stored content only, so this cannot become a general speech API. Each call
+   * costs `SPEECH_BUDGET_UNITS` once, however many parts it has. The stream ends with the result.
    *
+   * @param stream - Receives each `SpokenPart`, then the final `ActionResult`.
    * @param raw - Untrusted input matching `speakRequestSchema`.
    */
-  @callable()
-  async speak(raw: unknown): Promise<ActionResult<SpokenAudio>> {
+  @callable({ streaming: true })
+  async speak(stream: StreamingResponse, raw: unknown): Promise<void> {
+    const finish = (result: ActionResult<{ parts: number }>) => void stream.end(result);
     const input = parseInput(speakRequestSchema, raw);
-    if (!input.ok) return input;
+    if (!input.ok) return finish(input);
     const [row] = this.sql<{ text: string }>`SELECT text FROM messages WHERE id = ${input.data.messageId} AND role = 'assistant'`;
     const text = row ? toSpokenText(row.text) : "";
-    if (!text) return { ok: false, error: "There is nothing to read aloud yet." };
-    if (!(await this.reserveAiAction(SPEECH_BUDGET_UNITS))) return { ok: false, error: BUSY_MESSAGE };
+    if (!text) return finish({ ok: false, error: "There is nothing to read aloud yet." });
+    if (!(await this.reserveAiAction(SPEECH_BUDGET_UNITS))) return finish({ ok: false, error: BUSY_MESSAGE });
     try {
-      return { ok: true, ...(await synthesizeSpeech(this.env, text, { conversation: this.name, feature: "speech" })) };
+      const parts = await streamSpeech(this.env, text, { conversation: this.name, feature: "speech" }, (part) => void stream.send(part));
+      finish({ ok: true, parts });
     } catch (error) {
       console.error("speech failed", error instanceof Error ? error.message : "unknown error");
-      return { ok: false, error: "Speech is unavailable right now." };
+      finish({ ok: false, error: "Speech is unavailable right now." });
     }
   }
 

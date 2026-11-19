@@ -31,5 +31,14 @@ export interface Snapshot {
 /** Result of a browser action. Expected failures are returned, not thrown. */
 export type ActionResult<T = object> = ({ ok: true } & T) | { ok: false; error: string };
 
+/** One streamed part of a spoken answer, in playback order. The model is null in offline mode. */
+export interface SpokenPart {
+  index: number;
+  audio: string;
+  mimeType: string;
+  source: "workers-ai" | "offline" | "deepgram" | "elevenlabs";
+  model: string | null;
+}
+
 /** Messages broadcast to connected clients while an answer is generated. */
 export type LiveMessage = { type: "answer-delta"; delta: string } | { type: "answer-reset" };

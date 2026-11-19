@@ -4,7 +4,7 @@
  * `ShowcaseAgent` handles validation, rate limits and redaction around these calls.
  */
 import { Buffer } from "node:buffer";
-import type { AnswerSource } from "./domain/types";
+import type { AnswerSource, SpokenPart } from "./domain/types";
 import { gatewayMetadata, gatewayOptions, type GatewayContext } from "./gateway";
 import { isOffline } from "./llm";
 import { ELEVENLABS_VOICE, MODELS, TTS_SPEAKERS } from "./models";
@@ -18,10 +18,10 @@ const DEEPGRAM_SPEAK_URL = `https://api.deepgram.com/v1/speak?model=${MODELS.tts
 /** Fixed transcript returned in offline mode, so the voice flow can be tried for free. */
 export const OFFLINE_TRANSCRIPT = "What is the strongest proof of this work?";
 
-/** Time allowed for most speech models. */
+/** Time allowed for most speech models on one part. */
 const SPEECH_TIMEOUT_MS = 12_000;
-/** ElevenLabs takes longer on the longest answers. With a fallback, this fits the browser's 45-second limit. */
-const ELEVENLABS_TIMEOUT_MS = 25_000;
+/** Time allowed for ElevenLabs on one part, before the fallback is tried. */
+const ELEVENLABS_TIMEOUT_MS = 15_000;
 
 /** Bindings needed for speech calls. */
 type SpeechEnv = Pick<Env, "AI" | "AI_MODE" | "AI_GATEWAY_ID"> & {
@@ -47,6 +47,95 @@ export interface SpokenAudio {
   mimeType: string;
   source: Source | "deepgram" | "elevenlabs";
   model: string | null;
+}
+
+export type { SpokenPart };
+
+/** Surrounding text, which helps ElevenLabs keep its delivery consistent across parts. */
+export interface SpeechNeighbors {
+  previous?: string;
+  next?: string;
+}
+
+/** The first part is one sentence, so playback can start after a short request. */
+const FIRST_PART_MAX_CHARS = 200;
+/** Later parts group sentences up to this length. */
+const PART_MAX_CHARS = 320;
+/** Parts generated at once. ElevenLabs plans allow a few concurrent requests. */
+const PARALLEL_PARTS = 3;
+
+/** Splits an over-long sentence into word-aligned pieces. */
+function splitWords(sentence: string, limit: number): string[] {
+  const pieces: string[] = [];
+  let current = "";
+  for (const word of sentence.split(/\s+/)) {
+    if (current && current.length + 1 + word.length > limit) {
+      pieces.push(current);
+      current = word;
+    } else current = current ? `${current} ${word}` : word;
+  }
+  if (current) pieces.push(current);
+  return pieces;
+}
+
+/**
+ * Splits text into parts for streamed speech: a short first part so audio starts quickly, then
+ * sentence groups that keep natural pauses at part boundaries.
+ */
+export function splitForSpeech(text: string): string[] {
+  const sentences = (text.match(/[^.!?]+(?:[.!?]+["'”’)\]]*|$)/g) ?? []).map((sentence) => sentence.trim()).filter(Boolean);
+  const parts: string[] = [];
+  let current = "";
+  for (const sentence of sentences) {
+    const limit = parts.length === 0 && !current ? FIRST_PART_MAX_CHARS : PART_MAX_CHARS;
+    for (const piece of sentence.length > limit ? splitWords(sentence, limit) : [sentence]) {
+      if (parts.length === 0 && !current) {
+        parts.push(piece);
+      } else if (current && current.length + 1 + piece.length > PART_MAX_CHARS) {
+        parts.push(current);
+        current = piece;
+      } else current = current ? `${current} ${piece}` : piece;
+    }
+  }
+  if (current) parts.push(current);
+  return parts;
+}
+
+/**
+ * Speaks text as a stream of parts. Up to `PARALLEL_PARTS` are generated at once, and each is
+ * emitted in order as soon as it and every earlier part are ready.
+ *
+ * @param emit - Receives each part in playback order.
+ * @returns The number of parts emitted.
+ * @throws The first part's error when no audio could be produced at all.
+ */
+export async function streamSpeech(env: SpeechEnv, text: string, context: GatewayContext, emit: (part: SpokenPart) => void): Promise<number> {
+  const parts = splitForSpeech(text);
+  const pending: Promise<SpokenAudio>[] = [];
+  const start = (index: number) => {
+    const request = synthesizeSpeech(env, parts[index] ?? "", context, undefined, { previous: parts[index - 1], next: parts[index + 1] });
+    // A later failure is handled when its turn comes, or ignored once the stream has stopped.
+    request.catch(() => {});
+    pending[index] = request;
+  };
+  let started = 0;
+  for (; started < Math.min(PARALLEL_PARTS, parts.length); started += 1) start(started);
+  let emitted = 0;
+  for (let index = 0; index < parts.length; index += 1) {
+    let audio: SpokenAudio;
+    try {
+      audio = await (pending[index] as Promise<SpokenAudio>);
+    } catch (error) {
+      // Stopping here avoids a gap in the middle of an answer.
+      if (emitted === 0) throw error;
+      console.warn("speech part failed", error instanceof Error ? error.message : "unknown error");
+      break;
+    }
+    if (started < parts.length) start(started++);
+    emit({ index, ...audio });
+    emitted += 1;
+  }
+  return emitted;
 }
 
 // The SDK's audio helpers omit the gateway option, so these calls set it directly.
@@ -176,11 +265,17 @@ function offlineTone(): string {
  * Requests speech from ElevenLabs' own API. Redirects are not followed, so the key is only ever sent
  * to ElevenLabs, and a redirect counts as a failure.
  */
-function requestElevenLabsSpeech(apiKey: string, text: string, signal: AbortSignal): Promise<Response> {
+function requestElevenLabsSpeech(apiKey: string, text: string, signal: AbortSignal, neighbors: SpeechNeighbors = {}): Promise<Response> {
   return fetch(ELEVENLABS_SPEAK_URL, {
     method: "POST",
     headers: { "xi-api-key": apiKey, "Content-Type": "application/json", Accept: "audio/mpeg" },
-    body: JSON.stringify({ text, model_id: MODELS.tts.elevenLabs, voice_settings: ELEVENLABS_VOICE.settings }),
+    body: JSON.stringify({
+      text,
+      model_id: MODELS.tts.elevenLabs,
+      voice_settings: ELEVENLABS_VOICE.settings,
+      ...(neighbors.previous ? { previous_text: neighbors.previous } : {}),
+      ...(neighbors.next ? { next_text: neighbors.next } : {}),
+    }),
     redirect: "manual",
     signal,
   });
@@ -208,6 +303,7 @@ function requestDeepgramSpeech(apiKey: string, text: string, signal: AbortSignal
  * @param text - Text already prepared and length-limited by `domain/audio.ts`.
  * @param context - Gateway metadata for the request.
  * @param timeoutMs - Overrides the time allowed for every attempt.
+ * @param neighbors - Text before and after this part, for consistent delivery.
  * @throws The fallback model's error when both attempts fail.
  */
 export async function synthesizeSpeech(
@@ -215,6 +311,7 @@ export async function synthesizeSpeech(
   text: string,
   context: GatewayContext,
   timeoutMs?: number,
+  neighbors: SpeechNeighbors = {},
 ): Promise<SpokenAudio> {
   if (isOffline(env)) return { audio: offlineTone(), mimeType: "audio/wav", source: "offline", model: null };
 
@@ -246,7 +343,7 @@ export async function synthesizeSpeech(
   const { ELEVENLABS_API_KEY: elevenLabsKey, DEEPGRAM_API_KEY: deepgramKey } = env;
   if (elevenLabsKey) {
     attempts.push(async () => ({
-      audio: await readWithin((signal) => requestElevenLabsSpeech(elevenLabsKey, text, signal), timeoutMs ?? ELEVENLABS_TIMEOUT_MS),
+      audio: await readWithin((signal) => requestElevenLabsSpeech(elevenLabsKey, text, signal, neighbors), timeoutMs ?? ELEVENLABS_TIMEOUT_MS),
       mimeType: "audio/mpeg",
       source: "elevenlabs",
       model: MODELS.tts.elevenLabs,

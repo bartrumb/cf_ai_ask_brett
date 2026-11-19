@@ -3,7 +3,7 @@ import html from "../client/index.template.html?raw";
 import { renderRichText } from "../client/rich-text";
 
 vi.mock("agents/client", () => ({ AgentClient: class extends EventTarget {} }));
-vi.mock("../client/voice", () => ({ startRecording: vi.fn(), playAudio: vi.fn(), stopPlayback: vi.fn() }));
+vi.mock("../client/voice", () => ({ startRecording: vi.fn(), startSpeech: vi.fn(), stopPlayback: vi.fn() }));
 
 describe("page resilience", () => {
   it("shows a clear error when the profile cannot load and storage is blocked", async () => {

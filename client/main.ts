@@ -5,10 +5,10 @@
  */
 import { AgentClient } from "agents/client";
 import type { SiteContent } from "../src/domain/content";
-import type { ActionResult, AnswerSource, ChatMessage, LiveMessage, ShowcaseState, Snapshot } from "../src/domain/types";
+import type { ActionResult, AnswerSource, ChatMessage, LiveMessage, ShowcaseState, Snapshot, SpokenPart } from "../src/domain/types";
 import { byId, disclaimerText, emptyPrompt, h, renderProfile, setText } from "./profile";
 import { renderRichText } from "./rich-text";
-import { playAudio, startRecording, stopPlayback, type Recording } from "./voice";
+import { startRecording, startSpeech, stopPlayback, type Recording } from "./voice";
 
 /** Mirrors the server limit so the composer can warn before submitting. */
 const MAX_QUESTION_CHARS = 500;
@@ -16,8 +16,8 @@ const MAX_QUESTION_CHARS = 500;
 const CONVERSATION_KEY = "ask-brett-conversation";
 /** localStorage key for an explicit theme choice. */
 const THEME_KEY = "ask-brett-theme";
-/** Time allowed for speech, which can include a slow primary voice and a fallback. */
-const SPEECH_CALL_TIMEOUT_MS = 45_000;
+/** Backstop for a whole streamed answer. Parts play as they arrive, well before this. */
+const SPEECH_CALL_TIMEOUT_MS = 60_000;
 /** Labels shown under answers. */
 const SOURCE_LABELS: Record<AnswerSource, string> = {
   "workers-ai": "AI-generated",
@@ -262,28 +262,46 @@ async function toggleSpeech(id: number): Promise<void> {
   speakingId = id;
   speechLoading = true;
   render();
-  try {
-    const result = (await client.call("speak", [{ messageId: id }], { timeout: SPEECH_CALL_TIMEOUT_MS })) as unknown as ActionResult<{ audio: string; mimeType: string; source: AnswerSource }>;
-    if (speakingId !== id) return;
-    if (!result.ok) {
-      setNotice(result.error);
-      speakingId = null;
-    } else {
-      if (result.source === "offline") setNotice("Offline preview: Listen plays a test tone instead of speech.");
+  const active = () => speakingId === id;
+  const end = (message = "") => {
+    if (!active()) return;
+    speakingId = null;
+    speechLoading = false;
+    if (message) setNotice(message);
+    render();
+  };
+  // Created before any await, so it runs inside the click that started it.
+  const player = startSpeech({
+    onStart: () => {
+      if (!active()) return;
       speechLoading = false;
       render();
-      await playAudio(result.audio, result.mimeType, () => {
-        if (speakingId === id) speakingId = null;
-        render();
-      });
-      return;
+    },
+    onEnd: () => end(),
+    onError: () => end("Audio could not be played."),
+  });
+  try {
+    const result = (await client.call("speak", [{ messageId: id }], {
+      timeout: SPEECH_CALL_TIMEOUT_MS,
+      stream: {
+        onChunk: (chunk: unknown) => {
+          const part = chunk as SpokenPart;
+          if (!active()) return;
+          if (part.source === "offline") setNotice("Offline preview: Listen plays a test tone instead of speech.");
+          player.add(part.audio, part.mimeType);
+        },
+      },
+    })) as ActionResult<{ parts: number }>;
+    if (!active()) return player.stop();
+    if (result.ok) player.finish();
+    else {
+      player.stop();
+      end(result.error);
     }
   } catch {
-    if (speakingId === id) speakingId = null;
-    setNotice("Audio could not be played.");
+    player.stop();
+    end("Audio could not be played.");
   }
-  speechLoading = false;
-  render();
 }
 
 /** Applies streamed text directly, avoiding a full render per delta. */

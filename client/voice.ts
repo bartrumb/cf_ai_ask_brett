@@ -8,7 +8,7 @@ const TARGET_SAMPLE_RATE = 16_000;
 export const MAX_RECORDING_MS = 30_000;
 
 /** Encodes mono samples as a 16-bit PCM WAV file, clipping values outside the valid range. */
-function toWav(samples: Float32Array): Uint8Array {
+function toWav(samples: Float32Array): Uint8Array<ArrayBuffer> {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
   const view = new DataView(buffer);
   const write = (offset: number, text: string) => {
@@ -97,34 +97,106 @@ export async function startRecording(): Promise<Recording> {
   return { stop, result };
 }
 
-/** The one active playback and the object URL to release. */
-let current: { audio: HTMLAudioElement; url: string } | null = null;
+/** Plays streamed parts of one answer back to back. */
+export interface SpeechPlayer {
+  /** Queues one part. Parts must arrive in playback order. */
+  add: (base64: string, mimeType: string) => void;
+  /** Marks the stream complete, so playback ends after the last queued part. */
+  finish: () => void;
+  /** Stops at once and frees all audio. No callback runs. */
+  stop: () => void;
+}
 
-/** Stops playback and frees its URL. The `onEnd` callback is not called. */
+/** Callbacks for a speech player's lifecycle. Each runs at most once. */
+export interface SpeechHandlers {
+  onStart: () => void;
+  onEnd: () => void;
+  onError: () => void;
+}
+
+/** The one active player. */
+let current: SpeechPlayer | null = null;
+
+/** Stops any current playback. Its callbacks do not run. */
 export function stopPlayback(): void {
-  if (!current) return;
-  current.audio.pause();
-  URL.revokeObjectURL(current.url);
+  current?.stop();
   current = null;
 }
 
 /**
- * Replaces any current playback with the given audio.
- *
- * @param base64 - Encoded audio from the server.
- * @param mimeType - Audio type of the decoded bytes.
- * @param onEnd - Called when playback reaches its end.
- * @throws An error when decoding fails or the browser refuses to start playback.
+ * Starts a player for streamed speech, replacing any current playback. Call it directly from the
+ * click handler: one audio element is started there with a moment of silence, which counts as the
+ * user's gesture on Safari and iOS, and every later part plays through that same element.
  */
-export async function playAudio(base64: string, mimeType: string, onEnd: () => void): Promise<void> {
+export function startSpeech(handlers: SpeechHandlers): SpeechPlayer {
   stopPlayback();
-  const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
-  const url = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
-  const audio = new Audio(url);
-  current = { audio, url };
+  const audio = new Audio();
+  const urls: string[] = [];
+  const queue: string[] = [];
+  let playing = false;
+  let started = false;
+  let finished = false;
+  let stopped = false;
+
+  const release = () => {
+    stopped = true;
+    audio.pause();
+    for (const url of urls) URL.revokeObjectURL(url);
+    urls.length = 0;
+    if (current === player) current = null;
+  };
+  const playNext = () => {
+    if (stopped) return;
+    const url = queue.shift();
+    if (!url) {
+      playing = false;
+      if (finished) {
+        release();
+        handlers.onEnd();
+      }
+      return;
+    }
+    playing = true;
+    audio.src = url;
+    audio.play().then(
+      () => {
+        if (!started && !stopped) {
+          started = true;
+          handlers.onStart();
+        }
+      },
+      () => {
+        if (stopped) return;
+        release();
+        handlers.onError();
+      },
+    );
+  };
   audio.addEventListener("ended", () => {
-    if (current?.audio === audio) stopPlayback();
-    onEnd();
+    if (playing) playNext();
   });
-  await audio.play();
+
+  // A short silent clip, started inside the gesture, unlocks this element for later parts.
+  const silence = URL.createObjectURL(new Blob([toWav(new Float32Array(TARGET_SAMPLE_RATE / 20))], { type: "audio/wav" }));
+  urls.push(silence);
+  audio.src = silence;
+  audio.play().catch(() => {});
+
+  const player: SpeechPlayer = {
+    add(base64, mimeType) {
+      if (stopped) return;
+      const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+      const url = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+      urls.push(url);
+      queue.push(url);
+      if (!playing) playNext();
+    },
+    finish() {
+      finished = true;
+      if (!playing && !stopped) playNext();
+    },
+    stop: release,
+  };
+  current = player;
+  return player;
 }

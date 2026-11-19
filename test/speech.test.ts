@@ -5,7 +5,7 @@ import { applyGateway, desiredGateway } from "../src/domain/gateway-config";
 import { MAX_AUDIO_BYTES, parseInput, transcribeSchema } from "../src/domain/schemas";
 import { gatewayMetadata } from "../src/gateway";
 import { MODELS, TTS_SPEAKERS } from "../src/models";
-import { synthesizeSpeech, transcribeAudio } from "../src/speech";
+import { splitForSpeech, streamSpeech, synthesizeSpeech, transcribeAudio } from "../src/speech";
 import { FAKE_SECRET, wavBase64 } from "./fixtures";
 
 const context = { conversation: "sample-conversation", feature: "speech" } as const;
@@ -165,6 +165,51 @@ describe("text to speech", () => {
   it("reports an empty speech response as a failure", async () => {
     const { env } = fakeEnv(() => new Response(new Uint8Array()));
     await expect(synthesizeSpeech(env, "Hello.", context)).rejects.toThrow("empty");
+  });
+});
+
+describe("streamed speech", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("starts with one short sentence, then groups the rest", () => {
+    const parts = splitForSpeech(`First point. ${"Then a longer sentence that adds detail. ".repeat(12)}Last!`);
+    expect(parts[0]).toBe("First point.");
+    expect(parts.slice(1).every((part) => part.length <= 320)).toBe(true);
+    expect(parts.join(" ")).toContain("Last!");
+  });
+
+  it("splits a very long sentence on word boundaries", () => {
+    const parts = splitForSpeech("word ".repeat(150).trim());
+    expect(parts.length).toBeGreaterThan(1);
+    expect(parts.every((part) => part.length <= 320 && !part.startsWith(" "))).toBe(true);
+  });
+
+  it("emits parts in order and passes neighbouring text to ElevenLabs", async () => {
+    const { env } = fakeEnv(() => new Response("unused"));
+    const bodies: Record<string, unknown>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      // Later parts finish first, which must not change the order they are emitted in.
+      await new Promise((resolve) => setTimeout(resolve, bodies.length === 1 ? 20 : 0));
+      return new Response(new Uint8Array([1, 2, 3]));
+    });
+    const parts: number[] = [];
+    const count = await streamSpeech({ ...env, ELEVENLABS_API_KEY: "eleven-key" }, "One. Two is here. Three is here too.", context, (part) => parts.push(part.index));
+    expect(count).toBe(2);
+    expect(parts).toEqual([0, 1]);
+    expect(bodies.find((body) => body.text === "One.")).toMatchObject({ next_text: "Two is here. Three is here too." });
+    expect(bodies.find((body) => body.text !== "One.")).toMatchObject({ previous_text: "One." });
+  });
+
+  it("fails when the first part cannot be spoken, and stops quietly after a later failure", async () => {
+    const { env } = fakeEnv(() => new Response(new Uint8Array()));
+    await expect(streamSpeech(env, "One. Two.", context, () => {})).rejects.toThrow();
+    let calls = 0;
+    const partial = fakeEnv(() => (calls++ < 1 ? new Response(new Uint8Array([1])) : new Response(new Uint8Array())));
+    const emitted: number[] = [];
+    const long = `Short start. ${"More words here to fill the second part of this answer. ".repeat(8)}`;
+    expect(await streamSpeech(partial.env, long, context, (part) => emitted.push(part.index))).toBe(1);
+    expect(emitted).toEqual([0]);
   });
 });
 

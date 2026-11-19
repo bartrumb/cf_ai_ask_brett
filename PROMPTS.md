@@ -17,6 +17,7 @@ Prompt 1 is a brief written by another Claude Code session that was helping me p
 | 9–10 | Recognizing the wrong direction and converting the project into a showcase of my work |
 | 11–14 | Voice selection, then live testing and repairs from Worker logs |
 | 15–18 | Lighthouse tuning, public release preparation, final polish and publishing |
+| 19 | Streaming speech after reading live Worker logs |
 
 This file holds the prompts and their outcomes. The raw session transcript is not published because it also contains unrelated private material, such as personal career notes and local machine details.
 
@@ -341,3 +342,13 @@ Deploy and create the public repo to share for job req
 ````
 
 **Produced:** the final deployment and this public repository.
+
+---
+
+## Prompt 19
+
+````text
+Check the traces the tts still isn't working, perhaps we should switch to a streaming tts to eliminate the wait times like we made for shepherd
+````
+
+**Produced:** a live log check showing ElevenLabs succeeded but took about 12 seconds per answer, then streamed speech: a short first sentence plays within seconds while later parts are generated in parallel, through an audio element unlocked by the tap for Safari and iPhones.

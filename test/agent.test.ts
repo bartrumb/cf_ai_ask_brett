@@ -22,6 +22,15 @@ const answered = (agent: Stub, count = 1) => until(async () => {
 });
 const topic = KNOWLEDGE_SECTIONS[0]?.title.replace(/^\d+\.\s*/, "") ?? "work";
 
+/** Calls the streaming `speak` method and collects what it sends. */
+async function speak(instance: ShowcaseAgent, raw: unknown) {
+  const parts: { index: number; mimeType: string }[] = [];
+  let result: unknown;
+  const stream = { send: (chunk: never) => (parts.push(chunk), true), end: (final: unknown) => ((result = final), true) };
+  await instance.speak(stream as never, raw);
+  return { parts, result };
+}
+
 async function openSocket(name = conversationId()) {
   const response = await worker.fetch(new Request(`https://site.example/agents/showcase-agent/${name}`, { headers: { Upgrade: "websocket" } }), env);
   const socket = response.webSocket;
@@ -276,7 +285,7 @@ describe("spend limits", () => {
       state.storage.sql.exec("INSERT INTO messages (dedupe_key, role, text, source, created_at) VALUES ('a', 'assistant', 'Hello', 'offline', 1)");
       const id = state.storage.sql.exec<{ id: number }>("SELECT id FROM messages").one().id;
       setEnv(instance, { AI_MODE: "workers-ai", AI: { run: async () => { throw new Error("offline test"); } } as never });
-      expect(await instance.speak({ messageId: id })).toMatchObject({ ok: false });
+      expect((await speak(instance, { messageId: id })).result).toMatchObject({ ok: false });
       setEnv(instance, { DAILY_AI_ACTION_LIMIT: "0" });
       expect((await instance.transcribe({ audio })).ok).toBe(false);
       setEnv(instance, { DAILY_AI_ACTION_LIMIT: "5", ShowcaseAgent: { idFromName: () => { throw new Error("down"); } } as never });
@@ -308,14 +317,20 @@ describe("voice", () => {
     expect((await agent.transcribe({})).ok).toBe(false);
   });
 
-  it("speaks stored answers only", async () => {
+  it("streams stored answers only, part by part", async () => {
     const agent = await newAgent();
     await agent.ask({ question: "What is his salary?", requestId: requestId() });
     const { messages } = await agent.getSnapshot();
-    expect(await agent.speak({ messageId: messages[1]?.id })).toMatchObject({ ok: true, mimeType: "audio/wav" });
-    expect((await agent.speak({ messageId: messages[0]?.id })).ok).toBe(false);
-    expect((await agent.speak({ messageId: 999 })).ok).toBe(false);
-    expect((await agent.speak({ text: "Say anything" })).ok).toBe(false);
+    await runInDurableObject(agent, async (instance) => {
+      const spoken = await speak(instance, { messageId: messages[1]?.id });
+      expect(spoken.result).toEqual({ ok: true, parts: spoken.parts.length });
+      expect(spoken.parts.length).toBeGreaterThan(0);
+      expect(spoken.parts.map((part) => part.index)).toEqual(spoken.parts.map((_part, index) => index));
+      expect(spoken.parts[0]).toMatchObject({ mimeType: "audio/wav", source: "offline" });
+      for (const raw of [{ messageId: messages[0]?.id }, { messageId: 999 }, { text: "Say anything" }]) {
+        expect(await speak(instance, raw)).toMatchObject({ parts: [], result: { ok: false } });
+      }
+    });
   });
 
   it("returns safe errors when speech services fail", async () => {
@@ -327,7 +342,7 @@ describe("voice", () => {
       const failing = { run: async () => { throw new Error("internal detail"); } };
       setEnv(instance, { AI_MODE: "workers-ai", AI: failing as never });
       expect(await instance.transcribe({ audio })).toEqual({ ok: false, error: "Speech recognition is unavailable right now." });
-      expect(await instance.speak({ messageId: id })).toEqual({ ok: false, error: "Speech is unavailable right now." });
+      expect(await speak(instance, { messageId: id })).toEqual({ parts: [], result: { ok: false, error: "Speech is unavailable right now." } });
     });
   });
 });

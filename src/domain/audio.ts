@@ -7,7 +7,7 @@ import { normalizeText, redactAnswer } from "./redaction";
 import { MAX_AUDIO_BYTES } from "./schemas";
 
 /** Longest text sent to text-to-speech, which bounds the wait and cost of one request. */
-export const MAX_SPOKEN_CHARS = 900;
+export const MAX_SPOKEN_CHARS = 1_200;
 
 /** Decoded audio bytes, or a message that can be shown to the visitor. */
 export type DecodedAudio = { ok: true; bytes: Uint8Array } | { ok: false; error: string };

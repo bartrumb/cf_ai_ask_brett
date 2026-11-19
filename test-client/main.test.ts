@@ -8,17 +8,22 @@ interface FakeClient extends EventTarget {
   call: ReturnType<typeof vi.fn>;
 }
 
+interface CallOptions {
+  timeout?: number;
+  stream?: { onChunk?: (chunk: unknown) => void };
+}
+
 const mocks = vi.hoisted(() => ({
   clients: [] as unknown[],
-  respond: (_method: string, _args: unknown[]): unknown => undefined,
+  respond: (_method: string, _args: unknown[], _options?: CallOptions): unknown => undefined,
   startRecording: vi.fn(),
-  playAudio: vi.fn(),
+  startSpeech: vi.fn(),
   stopPlayback: vi.fn(),
 }));
 
 vi.mock("agents/client", () => ({
   AgentClient: class extends EventTarget {
-    call = vi.fn(async (method: string, args: unknown[] = []) => mocks.respond(method, args));
+    call = vi.fn(async (method: string, args: unknown[] = [], options?: CallOptions) => mocks.respond(method, args, options));
     close = vi.fn();
     constructor(public options: unknown) {
       super();
@@ -26,7 +31,7 @@ vi.mock("agents/client", () => ({
     }
   },
 }));
-vi.mock("../client/voice", () => ({ startRecording: mocks.startRecording, playAudio: mocks.playAudio, stopPlayback: mocks.stopPlayback }));
+vi.mock("../client/voice", () => ({ startRecording: mocks.startRecording, startSpeech: mocks.startSpeech, stopPlayback: mocks.stopPlayback }));
 
 const HOSTILE = '<img src=x onerror="alert(1)"> **bold** and `code`';
 const byId = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -42,6 +47,7 @@ const setInput = (value: string) => {
 const submit = async () => { byId("ask-form").dispatchEvent(new Event("submit", { cancelable: true })); await flush(); };
 const notice = () => byId("notice").textContent;
 let responses: Record<string, unknown>;
+let speakParts: unknown[] = [];
 let messages: ChatMessage[];
 let revision = 10;
 let offline = false;
@@ -61,8 +67,9 @@ beforeAll(async () => {
   document.body.append(data);
   const stored = new Map<string, string>([["ask-brett-conversation", "not-valid"]]);
   vi.stubGlobal("localStorage", { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => void stored.set(key, value) });
-  mocks.respond = (method) => {
+  mocks.respond = (method, _args, options) => {
     if (method === "getSnapshot") return { offline, messages } satisfies Snapshot;
+    if (method === "speak") for (const part of speakParts) options?.stream?.onChunk?.(part);
     const value = responses[method];
     if (value instanceof Error) throw value;
     return value;
@@ -80,7 +87,8 @@ beforeEach(async () => {
   messages = [];
   offline = false;
   mocks.startRecording.mockReset();
-  mocks.playAudio.mockReset();
+  mocks.startSpeech.mockReset();
+  speakParts = [];
   client().call.mockClear();
   setInput("");
   await publish();
@@ -267,14 +275,31 @@ describe("voice", () => {
     await flush();
   };
 
-  it("plays a stored answer and can stop it", async () => {
-    responses.speak = { ok: true, audio: "AAAA", mimeType: "audio/wav", source: "offline" };
-    mocks.playAudio.mockResolvedValue(undefined);
+  /** A fake player that records calls and exposes the handlers main.ts gave it. */
+  const fakePlayer = () => {
+    const player = { add: vi.fn(), finish: vi.fn(), stop: vi.fn(), handlers: null as null | Record<"onStart" | "onEnd" | "onError", () => void> };
+    mocks.startSpeech.mockImplementation((handlers) => {
+      player.handlers = handlers;
+      return player;
+    });
+    return player;
+  };
+  const button = () => byId("conversation").querySelector(".listen") as HTMLElement;
+  const part = (source = "workers-ai") => ({ index: 0, audio: "AAAA", mimeType: "audio/mpeg", source, model: null });
+
+  it("streams parts to the player and can stop it", async () => {
+    const player = fakePlayer();
+    speakParts = [part("offline"), part("offline")];
+    responses.speak = { ok: true, parts: 2 };
     await listen();
     expect(callsTo("speak")[0]?.[1]).toEqual([{ messageId: 7 }]);
-    expect(callsTo("speak")[0]?.[2]).toEqual({ timeout: 45_000 });
+    expect(callsTo("speak")[0]?.[2]).toMatchObject({ timeout: 60_000 });
+    expect(player.add).toHaveBeenCalledTimes(2);
+    expect(player.add).toHaveBeenCalledWith("AAAA", "audio/mpeg");
+    expect(player.finish).toHaveBeenCalled();
     expect(notice()).toContain("test tone");
-    const button = () => byId("conversation").querySelector(".listen") as HTMLElement;
+    expect(button().textContent).toBe("Preparing audio");
+    player.handlers?.onStart();
     expect(button().textContent).toBe("Stop");
     button().click();
     await flush();
@@ -283,19 +308,32 @@ describe("voice", () => {
   });
 
   it("resets when playback ends", async () => {
-    responses.speak = { ok: true, audio: "AAAA", mimeType: "audio/mpeg", source: "workers-ai" };
-    mocks.playAudio.mockImplementation(async (_audio: string, _type: string, onEnd: () => void) => onEnd());
+    const player = fakePlayer();
+    speakParts = [part()];
+    responses.speak = { ok: true, parts: 1 };
     await listen();
-    expect(byId("conversation").querySelector(".listen")?.textContent).toBe("Listen");
+    player.handlers?.onStart();
+    player.handlers?.onEnd();
+    expect(button().textContent).toBe("Listen");
   });
 
   it("reports speech errors and playback failures", async () => {
+    let player = fakePlayer();
     responses.speak = { ok: false, error: "Speech is unavailable right now." };
     await listen();
     expect(notice()).toBe("Speech is unavailable right now.");
-    responses.speak = { ok: true, audio: "AAAA", mimeType: "audio/mpeg", source: "workers-ai" };
-    mocks.playAudio.mockRejectedValue(new Error("blocked"));
+    expect(player.stop).toHaveBeenCalled();
+    player = fakePlayer();
+    speakParts = [part()];
+    responses.speak = { ok: true, parts: 1 };
+    await listen();
+    player.handlers?.onError();
+    expect(notice()).toBe("Audio could not be played.");
+    expect(button().textContent).toBe("Listen");
+    player = fakePlayer();
+    responses.speak = new Error("socket closed");
     await listen();
     expect(notice()).toBe("Audio could not be played.");
+    expect(player.stop).toHaveBeenCalled();
   });
 });

@@ -10,8 +10,8 @@
 
 [![Live site](https://img.shields.io/badge/live-ask--brett.shopdawg.workers.dev-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](https://ask-brett.shopdawg.workers.dev)
 [![CI](https://img.shields.io/github/actions/workflow/status/bartrumb/cf_ai_ask_brett/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/bartrumb/cf_ai_ask_brett/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-97.6%25-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
-[![Tests](https://img.shields.io/badge/tests-247%20passing-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
+[![Coverage](https://img.shields.io/badge/coverage-97.3%25-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
+[![Tests](https://img.shields.io/badge/tests-254%20passing-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
 
 [![Lighthouse mobile](https://img.shields.io/badge/Lighthouse%20mobile-99%20%C2%B7%20100%20%C2%B7%20100%20%C2%B7%20100-0CCE6B?logo=lighthouse&logoColor=white)](#quality)
 [![Lighthouse desktop](https://img.shields.io/badge/Lighthouse%20desktop-100%20%C2%B7%20100%20%C2%B7%20100%20%C2%B7%20100-0CCE6B?logo=lighthouse&logoColor=white)](#quality)
@@ -48,7 +48,7 @@ All of this lives on computers spread around the world, so the receptionist is a
 | --- | --- | --- |
 | **LLM** | DeepSeek V4.1 Flash on Workers AI, with Inkling 2 Small as the automatic fallback. Every language-model call goes through AI Gateway | [`src/llm.ts`](./src/llm.ts), [`src/models.ts`](./src/models.ts) |
 | **Workflow or coordination** | One Durable Object per conversation runs the Agents SDK and the **Think** harness. Questions enter a durable inbox with idempotency keys, turns survive interruption, and alarms handle cleanup. A separate Durable Object instance coordinates the shared daily budget | [`src/agent.ts`](./src/agent.ts) |
-| **User input through chat or voice** | A streaming web chat, plus push-to-talk speech recognition and spoken answers | [`client/main.ts`](./client/main.ts), [`client/voice.ts`](./client/voice.ts), [`src/speech.ts`](./src/speech.ts) |
+| **User input through chat or voice** | A streaming web chat, plus push-to-talk speech recognition and streamed spoken answers | [`client/main.ts`](./client/main.ts), [`client/voice.ts`](./client/voice.ts), [`src/speech.ts`](./src/speech.ts) |
 | **Memory or state** | Each conversation keeps its messages in Durable Object SQLite, and recent redacted exchanges give the model context for follow-up questions | [`src/agent.ts`](./src/agent.ts), [`src/domain/prompt.ts`](./src/domain/prompt.ts) |
 | **AI-assisted coding with prompt history** | Every prompt is recorded in order, with a note on what it produced | [`PROMPTS.md`](./PROMPTS.md) |
 | **Documentation and run instructions** | This file, with an offline mode that needs no Cloudflare account | [Run it yourself](#run-it-yourself) |
@@ -139,12 +139,15 @@ flowchart LR
   subgraph IN["Speak"]
     MIC["Microphone"] --> WAV["16 kHz WAV, 30 s maximum"] --> WH["Whisper via AI Gateway"]
   end
-  subgraph OUT["Listen: at most two attempts"]
-    TXT["Stored answer only,<br/>900 characters maximum"] --> E["ElevenLabs Jarnathan"]
+  subgraph OUT["Listen: streamed part by part"]
+    TXT["Stored answer only,<br/>1,200 characters maximum"] --> SPLIT["Short first sentence,<br/>then sentence groups,<br/>three generated at once"]
+    SPLIT --> E["ElevenLabs Jarnathan"]
     E -->|"failure or timeout"| D["Deepgram Aries<br/>when a key is set"]
     E -->|"failure, no Deepgram key"| AU["Aura-1 via AI Gateway"]
   end
 ```
+
+Listen streams speech the way a podcast player buffers: the first sentence is generated on its own and starts playing within a couple of seconds, while the next parts are generated in parallel and queued behind it. Every part has its own fallback chain, and playback uses one audio element unlocked by the tap itself, so Safari and iPhones allow parts that arrive later.
 
 Listen can only read answers already stored in that conversation, so it can't be used as a general text-to-speech service.
 
@@ -244,11 +247,11 @@ A question or transcription costs one unit, Listen costs five, and fixed replies
 
 | Check | Result |
 | --- | --- |
-| Tests | 247 passing across 13 files, in the Workers runtime and a simulated DOM |
-| Statements | 97.6% |
-| Branches | 89.5% |
-| Functions | 98.6% |
-| Lines | 98.8% |
+| Tests | 254 passing across 13 files, in the Workers runtime and a simulated DOM |
+| Statements | 97.3% |
+| Branches | 88.9% |
+| Functions | 98.3% |
+| Lines | 98.9% |
 | Coverage gate | `npm run check` fails below 80% on any measure |
 | Lighthouse mobile | Performance 99, Accessibility 100, Best Practices 100, SEO 100 |
 | Lighthouse desktop | Performance 100, Accessibility 100, Best Practices 100, SEO 100 |
