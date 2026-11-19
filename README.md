@@ -100,7 +100,7 @@ Gateway logs store prompts, which contain redacted excerpts of submitted changes
 
 ## Local setup
 
-Requires Node.js 22 or later.
+Requires Node.js 22.18 or later.
 
 ```sh
 npm install
