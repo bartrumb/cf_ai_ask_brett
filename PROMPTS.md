@@ -50,3 +50,34 @@ Shared notes folder for this group of sessions (outside the repo; read siblings'
 ````
 
 **Produced:** this repository: the rule engine, Durable Object agent, review Workflow, chat UI, tests and documentation.
+
+---
+
+## Prompt 2
+
+````text
+Lets setup cloudflare AI gateway and use
+Primary TTS: @cf/deepgram/aura-2-en
+Secondary TTS: @cf/myshell-ai/melotts
+Primary SST: @cf/deepgram/nova-3
+Secondary SST: @cf/deepgram/flux
+Primary LLM: @cf/deepseek-ai/deepseek-v4-pro-0813
+Secondary LLLM: @cf/thinkingmachines/inkling-2-small
+Reference these resources: https://developers.cloudflare.com/ai-gateway/llms-full.txt
+https://developers.cloudflare.com/agents/llms-full.txt
+We should configure all of the models to go through the gateway so we can monitor spend and prompt injections.
+````
+
+**Produced:** research into AI Gateway and the requested models. It found that two of them are scheduled for removal on 2026-11-20 and that Flux is WebSocket-only, which led to Prompt 3.
+
+---
+
+## Prompt 3
+
+````text
+Primary LLM: @cf/deepseek-ai/deepseek-v4.1-flash-1017
+Secondary SST: @cf/openai/whisper-large-v3-turbo
+Swap these out then
+````
+
+**Produced:** AI Gateway routing for every language, speech-to-text and text-to-speech model, with primary and fallback models, request metadata, a gateway setup script that flags prompt injection, voice input, spoken results, tests and documentation.
