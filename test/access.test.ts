@@ -130,4 +130,20 @@ describe("Cloudflare Access", () => {
     await until(() => frames.some((frame) => frame.includes('"id":"ok"') && frame.includes('"success":true')));
     socket.close();
   });
+
+  it("marks only listed networks as budget exempt, ignoring a forged header", async () => {
+    const exemptState = async (headers: Record<string, string>) => {
+      const id = conversationId();
+      const response = await connect({ BUDGET_EXEMPT_IPS: "203.0.113.7" } as Partial<Env>, headers, id);
+      const socket = response.webSocket;
+      if (!socket) throw new Error("Expected a WebSocket.");
+      socket.accept();
+      const agent = await getAgentByName<Env, ShowcaseAgent>(namespace, id);
+      const state = await until(() => runInDurableObject(agent, (instance) => [...instance.getConnections()][0]?.state as { budgetExempt?: boolean } | undefined));
+      socket.close();
+      return state.budgetExempt;
+    };
+    expect(await exemptState({ "CF-Connecting-IP": "203.0.113.7" })).toBe(true);
+    expect(await exemptState({ "CF-Connecting-IP": "198.51.100.9", "x-ask-brett-budget-exempt": "1" })).toBe(false);
+  });
 });

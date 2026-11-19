@@ -8,7 +8,7 @@ import { AgentClient } from "agents/client";
 import type { ActionResult, AnswerSource, ChatMessage, LiveMessage, ShowcaseState, Snapshot, SpokenPart } from "../src/domain/types";
 import { h } from "./profile";
 import { renderRichText } from "./rich-text";
-import { startRecording, startSpeech, stopPlayback, type Recording } from "./voice";
+import { dictationSupported, startDictation, startRecording, startSpeech, stopPlayback, type Dictation, type Recording } from "./voice";
 
 /** Mirrors the server limit so the composer can warn before submitting. */
 export const MAX_QUESTION_CHARS = 500;
@@ -32,7 +32,12 @@ export interface WidgetOptions {
   questions: readonly string[];
   /** Text shown before the first question. */
   emptyText?: string;
+  /** Where the host serves `capture-processor.js` for live dictation. */
+  workletUrl?: string;
 }
+
+/** Default worklet location on a host page. */
+const DEFAULT_WORKLET_URL = "/js/capture-processor.js";
 
 /** Reads storage, which can throw under strict privacy settings. */
 function readStored(key: string): string | null {
@@ -106,6 +111,7 @@ export function mountAskWidget(root: HTMLElement, options: WidgetOptions): { des
   let refreshing = false;
   let refreshQueued = false;
   let recording: Recording | null = null;
+  let dictation: Dictation | null = null;
   let transcribing = false;
   let speakingId: number | null = null;
   let speechLoading = false;
@@ -125,9 +131,10 @@ export function mountAskWidget(root: HTMLElement, options: WidgetOptions): { des
     count.classList.toggle("over", length >= MAX_QUESTION_CHARS);
     send.disabled = !connected || isBusy() || !input.value.trim() || length > MAX_QUESTION_CHARS;
     send.textContent = isBusy() ? "Answering" : "Ask";
+    const listening = Boolean(recording || dictation);
     mic.disabled = !connected || transcribing;
-    mic.textContent = recording ? "Stop" : transcribing ? "Transcribing" : "Speak";
-    mic.setAttribute("aria-pressed", String(Boolean(recording)));
+    mic.textContent = listening ? "Stop" : transcribing ? "Transcribing" : "Speak";
+    mic.setAttribute("aria-pressed", String(listening));
     for (const button of suggestions.querySelectorAll("button")) button.disabled = !connected || isBusy();
   };
 
@@ -218,12 +225,64 @@ export function mountAskWidget(root: HTMLElement, options: WidgetOptions): { des
     }
   };
 
-  /** Starts recording, or stops it. The transcript goes to the composer for checking. */
+  /** Shows a microphone failure in plain words. */
+  const reportMicError = (error: unknown) => {
+    const name = error instanceof DOMException ? error.name : "";
+    setNotice(
+      name === "NotAllowedError" ? "Microphone access was blocked. You can allow it in the browser's site settings."
+      : name === "NotFoundError" ? "No microphone was found."
+      : name === "NotReadableError" ? "The microphone is in use by another app."
+      : "The recording could not be processed.",
+    );
+  };
+
+  /**
+   * Live dictation: words appear in the composer while the visitor speaks. Starts synchronously
+   * inside the click, which iOS requires for audio. Returns false when it cannot run, so the
+   * caller can record instead.
+   */
+  const dictate = async (): Promise<boolean> => {
+    const prefix = input.value.trim();
+    const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/agents/dictation`;
+    const live = startDictation(url, options.workletUrl ?? DEFAULT_WORKLET_URL, (text) => {
+      input.value = [prefix, text].filter(Boolean).join(" ").slice(0, MAX_QUESTION_CHARS);
+      updateComposer();
+    });
+    dictation = live;
+    updateComposer();
+    try {
+      await live.ready;
+    } catch (error) {
+      dictation = null;
+      updateComposer();
+      if (error instanceof DOMException && error.name !== "AbortError") {
+        reportMicError(error);
+        return true;
+      }
+      return false;
+    }
+    try {
+      await live.result;
+    } finally {
+      dictation = null;
+      updateComposer();
+      input.focus();
+    }
+    return true;
+  };
+
+  /** Starts listening, or stops it. The transcript goes to the composer for checking. */
   const toggleRecording = async (): Promise<void> => {
+    if (dictation) {
+      dictation.stop();
+      return;
+    }
     if (recording) {
       recording.stop();
       return;
     }
+    setNotice("");
+    if (dictationSupported() && (await dictate())) return;
     setNotice("");
     const owner = client;
     try {
@@ -380,13 +439,134 @@ export function mountAskWidget(root: HTMLElement, options: WidgetOptions): { des
   };
 }
 
-/** Mounts every `[data-ask-widget]` element in the document once. */
+/** sessionStorage key that reopens the launcher's panel after a reload in the same tab. */
+export const LAUNCHER_OPEN_KEY = "ask-brett-open";
+
+/** Reads session storage, which can throw under strict privacy settings. */
+function readSession(key: string): string | null {
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+/** Writes session storage. The panel simply does not reopen if it cannot. */
+function writeSession(key: string, value: string | null): void {
+  try {
+    if (value === null) sessionStorage.removeItem(key);
+    else sessionStorage.setItem(key, value);
+  } catch {
+    // Nothing to do.
+  }
+}
+
+/**
+ * Builds a floating button with an avatar that opens the chat in a panel. The chat connects on
+ * first hover, focus or touch of the button, so a page view alone opens no socket. Links to
+ * `#ask` and elements with `data-ask-open` open the panel too.
+ *
+ * Reads `data-avatar`, `data-label`, `data-title`, `data-intro`, `data-questions`,
+ * `data-empty-text` and `data-worklet` from `root`.
+ *
+ * @returns A handle to open and close the panel, for the host page and tests.
+ */
+export function mountLauncher(root: HTMLElement, doc: Document = document): { open: (focus?: boolean) => void; close: () => void } {
+  mountCount += 1;
+  const panelId = `ask-panel-${mountCount}`;
+  const titleId = `ask-panel-title-${mountCount}`;
+  const { avatar = "", label = "Ask about my work", title = label, intro = "" } = root.dataset;
+  const avatarImage = (size: number) => h("img", { src: avatar, alt: "", width: String(size), height: String(size), decoding: "async" });
+
+  const fab = h("button", { class: "ask-fab", type: "button", "aria-expanded": "false", "aria-controls": panelId, "aria-label": label },
+    avatar && avatarImage(64), h("span", { class: "ask-fab-text", "aria-hidden": "true" }, label));
+  const close = h("button", { class: "ask-close", type: "button", "aria-label": "Close chat" }, "×");
+  const heading = h("h2", { id: titleId, tabindex: "-1" }, title);
+  const body = h("div", { class: "ask-panel-body" });
+  const panel = h("div", { class: "ask-panel", id: panelId, role: "dialog", "aria-modal": "false", "aria-labelledby": titleId, hidden: true },
+    h("div", { class: "ask-panel-head" }, avatar && avatarImage(40), h("div", { class: "ask-panel-titles" }, heading, intro && h("p", {}, intro)), close),
+    body);
+  root.classList.add("ask-launcher");
+  root.replaceChildren(panel, fab);
+
+  let widget: { destroy: () => void } | null = null;
+  const warm = () => {
+    widget ??= mountAskWidget(body, { questions: parseQuestions(root.dataset.questions), emptyText: root.dataset.emptyText, workletUrl: root.dataset.worklet });
+  };
+
+  // iOS Safari keeps 100dvh at full height while the keyboard is up, which hides the composer.
+  // While open on a small screen, size the panel to the visual viewport instead.
+  const view = window.visualViewport;
+  const fitViewport = () => {
+    if (!view) return;
+    root.style.setProperty("--ask-vvh", `${Math.round(view.height)}px`);
+    root.style.setProperty("--ask-vvtop", `${Math.round(view.offsetTop)}px`);
+  };
+  const small = () => window.matchMedia("(max-width: 640px)").matches;
+
+  const openPanel = (focus = true) => {
+    warm();
+    if (!panel.hidden) return;
+    panel.hidden = false;
+    root.dataset.open = "true";
+    fab.setAttribute("aria-expanded", "true");
+    writeSession(LAUNCHER_OPEN_KEY, "1");
+    fitViewport();
+    view?.addEventListener("resize", fitViewport);
+    view?.addEventListener("scroll", fitViewport);
+    if (small()) doc.documentElement.classList.add("ask-locked");
+    if (!focus) return;
+    // A fine pointer means a keyboard is likely, so go straight to the question box. On touch,
+    // focusing the box would throw up the keyboard over the suggestions, so focus the title.
+    const box = body.querySelector("textarea");
+    if (box && window.matchMedia("(pointer: fine)").matches) box.focus();
+    else heading.focus();
+  };
+  const closePanel = () => {
+    if (panel.hidden) return;
+    panel.hidden = true;
+    delete root.dataset.open;
+    fab.setAttribute("aria-expanded", "false");
+    writeSession(LAUNCHER_OPEN_KEY, null);
+    view?.removeEventListener("resize", fitViewport);
+    view?.removeEventListener("scroll", fitViewport);
+    doc.documentElement.classList.remove("ask-locked");
+    stopPlayback();
+    fab.focus();
+  };
+
+  fab.addEventListener("click", () => (panel.hidden ? openPanel() : closePanel()));
+  for (const type of ["pointerenter", "focus", "touchstart"]) fab.addEventListener(type, warm, { once: true, passive: true });
+  close.addEventListener("click", closePanel);
+  panel.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closePanel();
+    }
+  });
+  doc.addEventListener("click", (event) => {
+    const trigger = (event.target as Element | null)?.closest?.('a[href="#ask"], [data-ask-open]');
+    if (!trigger) return;
+    event.preventDefault();
+    openPanel();
+  });
+  if (readSession(LAUNCHER_OPEN_KEY) === "1") openPanel(false);
+  return { open: openPanel, close: closePanel };
+}
+
+/** Mounts every `[data-ask-widget]` and `[data-ask-launcher]` element in the document once. */
 export function mountAll(doc: Document = document): number {
   let mounted = 0;
   for (const element of doc.querySelectorAll<HTMLElement>("[data-ask-widget]")) {
     if (element.dataset.askMounted) continue;
     element.dataset.askMounted = "true";
-    mountAskWidget(element, { questions: parseQuestions(element.dataset.questions), emptyText: element.dataset.emptyText });
+    mountAskWidget(element, { questions: parseQuestions(element.dataset.questions), emptyText: element.dataset.emptyText, workletUrl: element.dataset.worklet });
+    mounted += 1;
+  }
+  for (const element of doc.querySelectorAll<HTMLElement>("[data-ask-launcher]")) {
+    if (element.dataset.askMounted) continue;
+    element.dataset.askMounted = "true";
+    mountLauncher(element, doc);
     mounted += 1;
   }
   return mounted;

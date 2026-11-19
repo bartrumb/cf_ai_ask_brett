@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   startRecording: vi.fn(),
   startSpeech: vi.fn(),
   stopPlayback: vi.fn(),
+  dictationSupported: vi.fn(() => false),
+  startDictation: vi.fn(),
 }));
 
 vi.mock("agents/client", () => ({
@@ -29,7 +31,13 @@ vi.mock("agents/client", () => ({
     }
   },
 }));
-vi.mock("../client/voice", () => ({ startRecording: mocks.startRecording, startSpeech: mocks.startSpeech, stopPlayback: mocks.stopPlayback }));
+vi.mock("../client/voice", () => ({
+  startRecording: mocks.startRecording,
+  startSpeech: mocks.startSpeech,
+  stopPlayback: mocks.stopPlayback,
+  dictationSupported: mocks.dictationSupported,
+  startDictation: mocks.startDictation,
+}));
 
 const HOSTILE = '<img src=x onerror="alert(1)"> **bold**';
 const flush = async () => {
@@ -67,6 +75,8 @@ beforeEach(async () => {
   mocks.startRecording.mockReset();
   mocks.startSpeech.mockReset();
   mocks.stopPlayback.mockReset();
+  mocks.dictationSupported.mockReset().mockReturnValue(false);
+  mocks.startDictation.mockReset();
   stored.clear();
   messages = [];
   responses = {};
@@ -188,6 +198,47 @@ describe("voice", () => {
     expect(q(".ask-notice").textContent).toBe("No speech was detected.");
   });
 
+  it("shows live dictation in the composer and stops on a second click", async () => {
+    mocks.dictationSupported.mockReturnValue(true);
+    let finishTurn: (text: string) => void = () => {};
+    const stop = vi.fn();
+    mocks.startDictation.mockImplementation((url: string, worklet: string, onText: (text: string) => void) => {
+      expect(url).toBe(`ws://${location.host}/agents/dictation`);
+      expect(worklet).toBe("/js/capture-processor.js");
+      onText("Tell me");
+      onText("Tell me about Shepherd");
+      return { ready: Promise.resolve(), result: new Promise<string>((resolve) => { finishTurn = resolve; }), stop };
+    });
+    setInput("Hi.");
+    q<HTMLButtonElement>(".ask-mic").click();
+    await flush();
+    expect(q<HTMLTextAreaElement>(".ask-composer textarea").value).toBe("Hi. Tell me about Shepherd");
+    expect(q(".ask-mic").getAttribute("aria-pressed")).toBe("true");
+    q<HTMLButtonElement>(".ask-mic").click();
+    expect(stop).toHaveBeenCalled();
+    finishTurn("Tell me about Shepherd");
+    await flush();
+    expect(q(".ask-mic").getAttribute("aria-pressed")).toBe("false");
+    expect(mocks.startRecording).not.toHaveBeenCalled();
+  });
+
+  it("falls back to recording when live dictation cannot connect, and explains a blocked microphone", async () => {
+    mocks.dictationSupported.mockReturnValue(true);
+    mocks.startDictation.mockReturnValue({ ready: Promise.reject(new Error("refused")), result: new Promise(() => {}), stop: vi.fn() });
+    mocks.startRecording.mockResolvedValue({ stop: vi.fn(), result: Promise.resolve("UklGRg==") });
+    responses.transcribe = { ok: true, text: "Fallback words", source: "workers-ai" };
+    q<HTMLButtonElement>(".ask-mic").click();
+    await flush();
+    await flush();
+    expect(q<HTMLTextAreaElement>(".ask-composer textarea").value).toBe("Fallback words");
+    mocks.startDictation.mockReturnValue({ ready: Promise.reject(new DOMException("no", "NotAllowedError")), result: new Promise(() => {}), stop: vi.fn() });
+    mocks.startRecording.mockClear();
+    q<HTMLButtonElement>(".ask-mic").click();
+    await flush();
+    expect(q(".ask-notice").textContent).toContain("Microphone access was blocked");
+    expect(mocks.startRecording).not.toHaveBeenCalled();
+  });
+
   it("streams spoken parts into the player and stops on a second click", async () => {
     const player = { add: vi.fn(), finish: vi.fn(), stop: vi.fn() };
     mocks.startSpeech.mockReturnValue(player);
@@ -214,5 +265,48 @@ describe("voice", () => {
     await flush();
     expect(player.stop).toHaveBeenCalled();
     expect(q(".ask-notice").textContent).toBe("Voice is busy.");
+  });
+});
+
+describe("launcher", () => {
+  const mountLauncher = () => {
+    document.body.innerHTML = `<a href="#ask" id="link">Ask</a><div data-ask-launcher data-avatar="/me.jpg" data-label="Ask about my work" data-intro="AI answers" data-questions='["One?"]'></div>`;
+    mocks.clients.length = 0;
+    widget.mountAll();
+    return { fab: q<HTMLButtonElement>(".ask-fab"), panel: q<HTMLElement>(".ask-panel") };
+  };
+
+  it("connects only when the button is approached, then opens and closes with focus handled", async () => {
+    const { fab, panel } = mountLauncher();
+    expect(mocks.clients).toHaveLength(0);
+    expect(panel.hidden).toBe(true);
+    expect(fab.getAttribute("aria-controls")).toBe(panel.id);
+    expect(q<HTMLImageElement>(".ask-fab img").getAttribute("src")).toBe("/me.jpg");
+    fab.dispatchEvent(new Event("pointerenter"));
+    expect(mocks.clients).toHaveLength(1);
+    fab.click();
+    expect(panel.hidden).toBe(false);
+    expect(fab.getAttribute("aria-expanded")).toBe("true");
+    expect(panel.getAttribute("role")).toBe("dialog");
+    expect(mocks.clients).toHaveLength(1);
+    panel.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(panel.hidden).toBe(true);
+    expect(fab.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(fab);
+    expect(mocks.stopPlayback).toHaveBeenCalled();
+  });
+
+  it("opens from #ask links and the close button, and reopens after a reload in the same tab", async () => {
+    const { panel } = mountLauncher();
+    q<HTMLAnchorElement>("#link").click();
+    expect(panel.hidden).toBe(false);
+    expect(sessionStorage.getItem(widget.LAUNCHER_OPEN_KEY)).toBe("1");
+    q<HTMLButtonElement>(".ask-close").click();
+    expect(panel.hidden).toBe(true);
+    expect(sessionStorage.getItem(widget.LAUNCHER_OPEN_KEY)).toBeNull();
+    sessionStorage.setItem(widget.LAUNCHER_OPEN_KEY, "1");
+    const reopened = mountLauncher();
+    expect(reopened.panel.hidden).toBe(false);
+    sessionStorage.clear();
   });
 });

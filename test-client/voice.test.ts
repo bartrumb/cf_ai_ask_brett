@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_RECORDING_MS, startRecording, startSpeech, stopPlayback } from "../client/voice";
+import { dictationSupported, MAX_RECORDING_MS, startDictation, startRecording, startSpeech, stopPlayback } from "../client/voice";
 
 class FakeRecorder extends EventTarget {
   state = "inactive";
@@ -60,6 +60,147 @@ describe("recording", () => {
     vi.advanceTimersByTime(MAX_RECORDING_MS);
     vi.useRealTimers();
     await expect(recording.result).resolves.toBeTruthy();
+  });
+});
+
+describe("live dictation", () => {
+  class FakeSocket extends EventTarget {
+    static OPEN = 1;
+    static last: FakeSocket;
+    readyState = 0;
+    binaryType = "blob";
+    sent: unknown[] = [];
+    closed = false;
+    constructor(public url: string) {
+      super();
+      FakeSocket.last = this;
+    }
+    send(data: unknown) {
+      this.sent.push(data);
+    }
+    close() {
+      this.closed = true;
+      this.readyState = 3;
+    }
+    open() {
+      this.readyState = 1;
+      this.dispatchEvent(new Event("open"));
+    }
+    say(data: unknown) {
+      this.dispatchEvent(Object.assign(new Event("message"), { data }));
+    }
+  }
+  class FakeNode {
+    static last: FakeNode;
+    port = { onmessage: null as ((event: { data: ArrayBuffer }) => void) | null, postMessage: vi.fn() };
+    connect = vi.fn();
+    disconnect = vi.fn();
+    constructor() {
+      FakeNode.last = this;
+    }
+  }
+
+  function installDictationFakes(options: { connect?: "open" | "error" | "close" } = {}) {
+    const stopTrack = vi.fn();
+    const contexts: { resume: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }[] = [];
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack }] })) } });
+    vi.stubGlobal("AudioContext", class {
+      state = "suspended";
+      destination = {};
+      audioWorklet = { addModule: vi.fn(async () => {}) };
+      resume = vi.fn(async () => { this.state = "running"; });
+      close = vi.fn(async () => {});
+      createMediaStreamSource = () => ({ connect: vi.fn() });
+      constructor() {
+        contexts.push(this);
+      }
+    });
+    vi.stubGlobal("AudioWorkletNode", FakeNode);
+    vi.stubGlobal("WebSocket", class extends FakeSocket {
+      constructor(url: string) {
+        super(url);
+        const outcome = options.connect ?? "open";
+        queueMicrotask(() => {
+          if (outcome === "open") this.open();
+          else this.dispatchEvent(new Event(outcome));
+        });
+      }
+    });
+    return { stopTrack, contexts };
+  }
+
+  const settle = async () => {
+    for (let index = 0; index < 10; index += 1) await Promise.resolve();
+  };
+
+  it("reports support only where every piece exists", () => {
+    vi.stubGlobal("isSecureContext", true);
+    installDictationFakes();
+    expect(dictationSupported()).toBe(true);
+    vi.stubGlobal("AudioWorkletNode", undefined);
+    expect(dictationSupported()).toBe(false);
+  });
+
+  it("creates the audio context inside the gesture, streams chunks and keeps live text", async () => {
+    const { stopTrack, contexts } = installDictationFakes();
+    const texts: string[] = [];
+    const live = startDictation("wss://site/agents/dictation", "/js/capture-processor.js", (text) => texts.push(text));
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0]?.resume).toHaveBeenCalled();
+    await live.ready;
+    const socket = FakeSocket.last;
+    expect(socket.binaryType).toBe("arraybuffer");
+    const chunk = new Int16Array([1, 2]).buffer;
+    FakeNode.last.port.onmessage?.({ data: chunk });
+    expect(socket.sent).toEqual([chunk]);
+    socket.say("not json");
+    socket.say(new ArrayBuffer(2));
+    socket.say(JSON.stringify({ event: "Update", transcript: "Tell me" }));
+    socket.say(JSON.stringify({ event: "EndOfTurn", transcript: "Tell me about Shepherd " }));
+    await expect(live.result).resolves.toBe("Tell me about Shepherd");
+    expect(texts).toEqual(["Tell me", "Tell me about Shepherd "]);
+    expect(stopTrack).toHaveBeenCalled();
+    expect(socket.closed).toBe(true);
+    live.stop();
+  });
+
+  it("on stop, flushes audio, asks for the final words and keeps what it has", async () => {
+    installDictationFakes();
+    vi.useFakeTimers();
+    const live = startDictation("wss://site/agents/dictation", "/w.js", () => {});
+    await vi.waitFor(() => expect(FakeSocket.last.readyState).toBe(1));
+    await settle();
+    FakeSocket.last.say(JSON.stringify({ event: "Update", transcript: "Half a thought" }));
+    live.stop();
+    expect(FakeNode.last.port.postMessage).toHaveBeenCalledWith("stop");
+    expect(FakeSocket.last.sent).toContain("stop");
+    vi.advanceTimersByTime(1_500);
+    await expect(live.result).resolves.toBe("Half a thought");
+  });
+
+  it("rejects ready when the socket is refused, and ends early if stopped before connecting", async () => {
+    installDictationFakes({ connect: "close" });
+    const refused = startDictation("wss://site/agents/dictation", "/w.js", () => {});
+    await expect(refused.ready).rejects.toThrow("refused");
+    installDictationFakes({ connect: "error" });
+    const failed = startDictation("wss://site/agents/dictation", "/w.js", () => {});
+    await expect(failed.ready).rejects.toThrow("did not connect");
+
+    const { stopTrack } = installDictationFakes();
+    const early = startDictation("wss://site/agents/dictation", "/w.js", () => {});
+    early.stop();
+    await expect(early.result).resolves.toBe("");
+    await early.ready;
+    expect(stopTrack).toHaveBeenCalled();
+  });
+
+  it("keeps the transcript when the server closes the session", async () => {
+    installDictationFakes();
+    const live = startDictation("wss://site/agents/dictation", "/w.js", () => {});
+    await live.ready;
+    FakeSocket.last.say(JSON.stringify({ event: "Update", transcript: "Cut off" }));
+    FakeSocket.last.dispatchEvent(new Event("close"));
+    await expect(live.result).resolves.toBe("Cut off");
   });
 });
 

@@ -97,6 +97,125 @@ export async function startRecording(): Promise<Recording> {
   return { stop, result };
 }
 
+/** How long to wait for the dictation socket to open before falling back to recording. */
+const DICTATION_CONNECT_MS = 6_000;
+/** After the visitor stops, how long to wait for the transcriber's final words. */
+const DICTATION_SETTLE_MS = 1_500;
+
+/** A live dictation. Text arrives through `onText` while the visitor speaks. */
+export interface Dictation {
+  /** Settles once audio is flowing. Rejects when live dictation cannot start, so the caller can fall back. */
+  ready: Promise<void>;
+  /** The final transcript. Settles when the speaker finishes a turn, on `stop`, or at the time limit. */
+  result: Promise<string>;
+  /** Ends dictation and keeps the text so far. Safe to call more than once. */
+  stop: () => void;
+}
+
+/** True when this browser can stream microphone audio through an AudioWorklet. */
+export function dictationSupported(): boolean {
+  return typeof AudioWorkletNode !== "undefined" && typeof WebSocket !== "undefined" && Boolean(navigator.mediaDevices?.getUserMedia) && window.isSecureContext;
+}
+
+/**
+ * Starts live dictation. Call it directly from the click handler: the AudioContext is created and
+ * resumed before any await, because iOS Safari only lets audio start inside the user's gesture.
+ *
+ * @param url - The dictation WebSocket URL.
+ * @param workletUrl - Where `capture-processor.js` is served.
+ * @param onText - Receives the transcript so far, replacing the previous value.
+ */
+export function startDictation(url: string, workletUrl: string, onText: (text: string) => void): Dictation {
+  const context = new AudioContext();
+  void context.resume();
+  let socket: WebSocket | null = null;
+  let stream: MediaStream | null = null;
+  let node: AudioWorkletNode | null = null;
+  let text = "";
+  let finished = false;
+  let settle: (value: string) => void = () => {};
+  let fail: (error: unknown) => void = () => {};
+  const result = new Promise<string>((resolve, reject) => {
+    settle = resolve;
+    fail = reject;
+  });
+  // Callers that fall back on `ready` never read `result`; that must not surface as an unhandled rejection.
+  result.catch(() => {});
+
+  const cleanUp = () => {
+    stream?.getTracks().forEach((track) => track.stop());
+    node?.port.postMessage("stop");
+    node?.disconnect();
+    if (socket && socket.readyState <= WebSocket.OPEN) socket.close(1000, "Done");
+    void context.close().catch(() => {});
+  };
+  const finish = (value = text) => {
+    if (finished) return;
+    finished = true;
+    cleanUp();
+    settle(value.trim());
+  };
+
+  const ready = (async () => {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    // Stopped while the permission prompt was open: release the microphone at once.
+    if (finished) return cleanUp();
+    await context.audioWorklet.addModule(workletUrl);
+    const opened = new WebSocket(url);
+    socket = opened;
+    opened.binaryType = "arraybuffer";
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Dictation did not connect.")), DICTATION_CONNECT_MS);
+      opened.addEventListener("open", () => (clearTimeout(timer), resolve()), { once: true });
+      opened.addEventListener("error", () => (clearTimeout(timer), reject(new Error("Dictation did not connect."))), { once: true });
+      opened.addEventListener("close", () => (clearTimeout(timer), reject(new Error("Dictation was refused."))), { once: true });
+    });
+    if (finished) return cleanUp();
+    opened.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") return;
+      let message: { event?: string; transcript?: string };
+      try {
+        message = JSON.parse(event.data) as typeof message;
+      } catch {
+        return;
+      }
+      if (typeof message.transcript === "string" && message.transcript) {
+        text = message.transcript;
+        onText(text);
+      }
+      if (message.event === "EndOfTurn") finish();
+    });
+    // Covers the server's time limit and any drop: keep what was heard.
+    opened.addEventListener("close", () => finish());
+    const source = context.createMediaStreamSource(stream);
+    node = new AudioWorkletNode(context, "capture-processor");
+    node.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+      if (opened.readyState === WebSocket.OPEN) opened.send(event.data);
+    };
+    source.connect(node);
+    // Some browsers only run a worklet that reaches the destination. It outputs silence.
+    node.connect(context.destination);
+    if (context.state !== "running") await context.resume();
+  })();
+  ready.catch((error: unknown) => {
+    if (finished) return;
+    finished = true;
+    cleanUp();
+    fail(error);
+  });
+
+  const stop = () => {
+    if (finished) return;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return finish();
+    // Flush the last audio, ask the transcriber to finish, and keep whatever arrives in time.
+    node?.port.postMessage("stop");
+    stream?.getTracks().forEach((track) => track.stop());
+    socket.send("stop");
+    setTimeout(() => finish(), DICTATION_SETTLE_MS);
+  };
+  return { ready, result, stop };
+}
+
 /** Plays streamed parts of one answer back to back. */
 export interface SpeechPlayer {
   /** Queues one part. Parts must arrive in playback order. */

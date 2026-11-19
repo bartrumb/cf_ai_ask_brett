@@ -10,8 +10,8 @@
 
 [![Live site](https://img.shields.io/badge/live-ask--brett.shopdawg.workers.dev-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](https://ask-brett.shopdawg.workers.dev)
 [![CI](https://img.shields.io/github/actions/workflow/status/bartrumb/cf_ai_ask_brett/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/bartrumb/cf_ai_ask_brett/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-95.7%25-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
-[![Tests](https://img.shields.io/badge/tests-347%20passing-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
+[![Coverage](https://img.shields.io/badge/coverage-95.5%25-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
+[![Tests](https://img.shields.io/badge/tests-365%20passing-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
 
 [![Lighthouse mobile](https://img.shields.io/badge/Lighthouse%20mobile-99%20%C2%B7%20100%20%C2%B7%20100%20%C2%B7%20100-0CCE6B?logo=lighthouse&logoColor=white)](#quality)
 [![Lighthouse desktop](https://img.shields.io/badge/Lighthouse%20desktop-100%20%C2%B7%20100%20%C2%B7%20100%20%C2%B7%20100-0CCE6B?logo=lighthouse&logoColor=white)](#quality)
@@ -171,6 +171,7 @@ flowchart LR
 | Purpose | Live today | Fallback | Optional |
 | --- | --- | --- | --- |
 | Language | `@cf/deepseek-ai/deepseek-v4.1-flash-1017` | `@cf/thinkingmachines/inkling-2-small` | |
+| Live dictation (embedded widget) | `@cf/deepgram/flux`, streamed over a WebSocket | Recording, then Whisper | |
 | Speech to text | `@cf/openai/whisper-large-v3-turbo` | | `@cf/deepgram/nova-3` with `AI_GATEWAY_TOKEN` |
 | Text to speech | ElevenLabs `eleven_v4`, Jarnathan voice | `@cf/deepgram/aura-1`, Orion voice | Deepgram `aura-2-aries-en` with `DEEPGRAM_API_KEY` |
 
@@ -243,16 +244,18 @@ npm run deploy -- --var ACCESS_TEAM_DOMAIN:your-team --var ACCESS_AUD:your-audie
 | Question length | 500 characters |
 | Voice recording | 30 seconds |
 
-A question or transcription costs one unit, Listen costs five, and fixed replies cost nothing but are limited to 30 per conversation per hour.
+A question, transcription or live dictation session costs one unit, Listen costs five, and fixed replies cost nothing but are limited to 30 per conversation per hour. A dictation session ends after 60 seconds. Every refusal is logged as `budget refused` with the limit that fired, so you can see whether real visitors hit one.
+
+For testing, the optional `BUDGET_EXEMPT_IPS` secret lists addresses (an IPv6 entry covers its /64) that skip the hourly and daily budgets and do not count toward them. The per-minute ceiling and the gateway spend limit still apply. It is a secret so the address stays out of the repository.
 
 ## Quality
 
 | Check | Result |
 | --- | --- |
-| Tests | 347 passing across 15 files, in the Workers runtime and a simulated DOM |
-| Statements | 95.7% |
-| Branches | 87.1% |
-| Functions | 97.1% |
+| Tests | 365 passing across 16 files, in the Workers runtime and a simulated DOM |
+| Statements | 95.5% |
+| Branches | 85.9% |
+| Functions | 96.0% |
 | Lines | 97.8% |
 | Coverage gate | `npm run check` fails below 80% on any measure |
 | Lighthouse mobile | Performance 99, Accessibility 100, Best Practices 100, SEO 100 |

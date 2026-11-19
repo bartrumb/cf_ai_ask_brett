@@ -11,6 +11,8 @@ export const MODELS = {
     secondary: "@cf/thinkingmachines/inkling-2-small",
   },
   stt: {
+    /** Live dictation: audio streams in while the visitor speaks. Called over a binding WebSocket, outside AI Gateway. */
+    streaming: "@cf/deepgram/flux",
     primary: "@cf/deepgram/nova-3",
     secondary: "@cf/openai/whisper-large-v3-turbo",
   },

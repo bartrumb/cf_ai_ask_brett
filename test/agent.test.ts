@@ -4,7 +4,7 @@ import { getAgentByName } from "agents";
 import { describe, expect, it, vi } from "vitest";
 import type { ShowcaseAgent } from "../src/agent";
 import { KNOWLEDGE_SECTIONS, PROFILE } from "../src/generated/knowledge";
-import worker, { networkKey } from "../src/index";
+import worker, { isBudgetExempt, networkKey } from "../src/index";
 import { createOfflineModel } from "../src/offline-model";
 import { conversationId, FAKE_SECRET, until, wavBase64 } from "./fixtures";
 
@@ -292,6 +292,35 @@ describe("spend limits", () => {
       expect((await instance.transcribe({ audio })).ok).toBe(false);
     });
     expect(await used()).toBe(before + 5);
+  });
+
+  it("matches the owner's testing networks by address or IPv6 /64", () => {
+    expect(isBudgetExempt("203.0.113.7", "198.51.100.1, 203.0.113.7")).toBe(true);
+    expect(isBudgetExempt("203.0.113.8", "203.0.113.7")).toBe(false);
+    expect(isBudgetExempt("2001:db8:1:2::99", "2001:db8:1:2::1")).toBe(true);
+    expect(isBudgetExempt("2001:db8:1:3::1", "2001:db8:1:2::1")).toBe(false);
+    expect(isBudgetExempt("203.0.113.7", undefined)).toBe(false);
+    expect(isBudgetExempt("203.0.113.7", " , ")).toBe(false);
+    expect(isBudgetExempt(null, "203.0.113.7")).toBe(false);
+  });
+
+  it("lets the owner's network past the hourly and daily budgets without counting toward them", async () => {
+    const agent = await newAgent();
+    const budget = await newAgent("_daily-budget");
+    const used = () => runInDurableObject(budget, (_budget, budgetState) => budgetState.storage.sql.exec<{ total: number }>("SELECT COALESCE(SUM(used), 0) AS total FROM daily_budget").one().total);
+    const before = await used();
+    await runInDurableObject(agent, async (instance, state) => {
+      for (let index = 0; index < 60; index += 1) state.storage.sql.exec("INSERT INTO ai_actions (created_at) VALUES (?)", Date.now());
+      setEnv(instance, { AI_MODE: "workers-ai", DAILY_AI_ACTION_LIMIT: "1", DAILY_CLIENT_AI_ACTION_LIMIT: "1" });
+      const reserve = (instance as unknown as { reserveAiAction: (units: number, exempt: boolean) => Promise<boolean> }).reserveAiAction.bind(instance);
+      expect(await reserve(5, true)).toBe(true);
+      expect(await reserve(1, false)).toBe(false);
+      const limit = vi.fn(async () => ({ success: false }));
+      setEnv(instance, { AI_ACTION_LIMIT: { limit } as never });
+      expect(await reserve(1, true)).toBe(false);
+      expect(limit).toHaveBeenCalled();
+    });
+    expect(await used()).toBe(before);
   });
 
   it("does not exceed the hourly conversation limit or touch shared budget at the limit", async () => {

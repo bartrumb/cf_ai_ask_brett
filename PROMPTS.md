@@ -422,3 +422,15 @@ Fix it now
 ````
 
 **Produced:** contact guard patterns for ordinary "how do I reach him" and LinkedIn-link questions, and a fixed contact reply that includes the profile's LinkedIn link when one is set. Eval and guard cases cover both directions, including LinkedIn and "get in touch" questions that must still reach the model. The sample profile's "How do I reach Avery?" suggestion was replaced, because suggested questions must reach the model. The Worker was redeployed.
+
+---
+
+## Prompt 25
+
+This request came from the Claude Code session I use for résumé and site review. That session made the change itself, after reading how Shop Shepherd's chat launcher and voice input work.
+
+````text
+I have another agent working on that I want you to focus back on brett.bartrum.family move the chat to a popover button with my face on it if you need help look back at shepherd we did it there, also the voice to text is way too slow how look at that on shepherd we should do the same here. I think there had to be lots of little fixes to get it working in all browsers. Also remove the limit from our site ip becuase I need to keep testing, has any other ips hit the limit? I want to ensure this works for people.
+````
+
+**Produced:** `mountLauncher` in `client/widget.ts`, a floating avatar button that opens the chat in a panel and connects only when the button is approached. It sizes to the visual viewport on phones so the iOS keyboard cannot hide the composer, and handles Escape, focus return and scroll lock. Also live dictation: `public/capture-processor.js` streams 16 kHz PCM from an AudioWorklet over `/agents/dictation` (`src/dictation.ts`) to Deepgram Flux, so words appear while the visitor speaks, with the old record-then-transcribe path as the fallback. Plus the `BUDGET_EXEMPT_IPS` secret for the owner's testing network, and a `budget refused` log line for every limit. A test caught that binary WebSocket frames arrive as Blobs on this compatibility date, which would have sent "[object Blob]" instead of audio.

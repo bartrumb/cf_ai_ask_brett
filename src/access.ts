@@ -15,6 +15,8 @@ const KEY_REFRESH_MIN_AGE_MS = 60 * 1000;
 export const ACCESS_EXPIRES_HEADER = "x-ask-brett-access-expires";
 /** Carries the Worker's hashed daily visitor key to the agent. */
 export const CLIENT_KEY_HEADER = "x-ask-brett-client";
+/** Set to "1" by the Worker when the visitor's network is listed in `BUDGET_EXEMPT_IPS`. */
+export const BUDGET_EXEMPT_HEADER = "x-ask-brett-budget-exempt";
 
 const jwtHeaderSchema = z.object({ alg: z.literal("RS256"), kid: z.string().min(1).max(200) });
 const jwtPayloadSchema = z.object({

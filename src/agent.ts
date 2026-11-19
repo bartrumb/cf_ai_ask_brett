@@ -6,7 +6,7 @@
  */
 import { Think, type ChatResponseResult, type TurnConfig, type TurnContext } from "@cloudflare/think";
 import { callable, getAgentByName, getCurrentAgent, type Connection, type ConnectionContext, type StreamingResponse, type WSMessage } from "agents";
-import { ACCESS_EXPIRES_HEADER, CLIENT_KEY_HEADER } from "./access";
+import { ACCESS_EXPIRES_HEADER, BUDGET_EXEMPT_HEADER, CLIENT_KEY_HEADER } from "./access";
 import { decodeWav, toSpokenText } from "./domain/audio";
 import { classifyQuestion, guardedAnswer } from "./domain/guards";
 import { buildTurnPrompt, dropUnfinishedSentence, MAX_HISTORY_EXCHANGES, offlineAnswer, type Exchange } from "./domain/prompt";
@@ -36,7 +36,7 @@ const IDLE_RETENTION_MS = 30 * 24 * HOUR_MS;
 /** How often a conversation with data checks whether it has gone idle. */
 const IDLE_CHECK_SECONDS = 24 * 60 * 60;
 /** Internal instance holding the daily budget. Its name can never pass the route check. */
-const BUDGET_INSTANCE = "_daily-budget";
+export const BUDGET_INSTANCE = "_daily-budget";
 /** Longest over-budget frame that is parsed in order to send an error reply. */
 const MAX_REJECTED_FRAME_CHARS = 1_024;
 /** Conversation rows kept and returned. */
@@ -63,6 +63,13 @@ const BUSY_MESSAGE = "This site has reached its limit for now. Please try again 
 interface ConnectionIdentity {
   accessExpiresAt?: number;
   clientKey?: string | null;
+  /** The owner's testing network: skips the hourly and daily budgets, not the per-minute ceiling. */
+  budgetExempt?: boolean;
+}
+
+/** Identity of the connection making the current call, if the call came over a socket. */
+function currentIdentity(): ConnectionIdentity | null {
+  return (getCurrentAgent().connection?.state as ConnectionIdentity | null | undefined) ?? null;
 }
 
 /** Untyped SQLite row, narrowed by `toMessage`. */
@@ -133,6 +140,7 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
       connection.setState({
         ...(expires > 0 ? { accessExpiresAt: expires } : {}),
         clientKey: context.request.headers.get(CLIENT_KEY_HEADER),
+        budgetExempt: context.request.headers.get(BUDGET_EXEMPT_HEADER) === "1",
       });
       return handleConnect(connection, context);
     };
@@ -324,7 +332,10 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
         const now = Date.now();
         const [recent] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM messages
           WHERE source = 'guarded' AND created_at > ${now - HOUR_MS}`;
-        if ((recent?.count ?? 0) >= MAX_GUARDED_REPLIES_PER_HOUR) return { ok: false, error: BUSY_MESSAGE };
+        if ((recent?.count ?? 0) >= MAX_GUARDED_REPLIES_PER_HOUR && currentIdentity()?.budgetExempt !== true) {
+          console.warn("budget refused", { limit: "guarded-hourly" });
+          return { ok: false, error: BUSY_MESSAGE };
+        }
         // No await separates these writes, so the pair commits together and stays adjacent.
         this.sql`INSERT INTO messages (dedupe_key, role, text, created_at) VALUES (${key}, 'user', ${text}, ${now})`;
         this.sql`INSERT INTO messages (dedupe_key, role, text, source, created_at)
@@ -421,10 +432,17 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
     this.sql`DELETE FROM daily_budget WHERE day <> ${day}`;
     this.sql`DELETE FROM daily_client_budget WHERE day <> ${day}`;
     const [row] = this.sql<{ used: number }>`SELECT used FROM daily_budget WHERE day = ${day}`;
-    if ((row?.used ?? 0) + units > limit) return false;
+    if ((row?.used ?? 0) + units > limit) {
+      console.warn("budget refused", { limit: "site-daily", used: row?.used ?? 0 });
+      return false;
+    }
     if (client) {
       const [visitor] = this.sql<{ used: number }>`SELECT used FROM daily_client_budget WHERE day = ${day} AND client = ${client}`;
-      if ((visitor?.used ?? 0) + units > clientLimit) return false;
+      if ((visitor?.used ?? 0) + units > clientLimit) {
+        // The client key is a daily hash, so this log can count visitors without identifying them.
+        console.warn("budget refused", { limit: "visitor-daily", visitor: client.slice(0, 8), used: visitor?.used ?? 0 });
+        return false;
+      }
       this.sql`INSERT INTO daily_client_budget (day, client, used) VALUES (${day}, ${client}, ${units})
         ON CONFLICT (day, client) DO UPDATE SET used = used + ${units}`;
     }
@@ -501,13 +519,18 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
    * Applies shared limits across every conversation: a per-minute ceiling always, and daily budgets
    * for real model calls. Budget failures deny the action.
    */
-  private async allowSharedAiSpend(units: number): Promise<boolean> {
-    if (!(await this.env.AI_ACTION_LIMIT.limit({ key: "global" })).success) return false;
-    if (isOffline(this.env)) return true;
+  private async allowSharedAiSpend(units: number, exempt: boolean): Promise<boolean> {
+    if (!(await this.env.AI_ACTION_LIMIT.limit({ key: "global" })).success) {
+      console.warn("budget refused", { limit: "per-minute" });
+      return false;
+    }
+    // The owner's testing network neither uses nor counts toward the daily budgets, so testing
+    // cannot use up the site-wide budget that real visitors share.
+    if (isOffline(this.env) || exempt) return true;
     const limit = Number(this.env.DAILY_AI_ACTION_LIMIT);
     const clientLimit = Number(this.env.DAILY_CLIENT_AI_ACTION_LIMIT);
     if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(clientLimit) || clientLimit <= 0) return false;
-    const client = (getCurrentAgent().connection?.state as ConnectionIdentity | null | undefined)?.clientKey ?? null;
+    const client = currentIdentity()?.clientKey ?? null;
     try {
       const namespace = this.env.ShowcaseAgent as unknown as DurableObjectNamespace<ShowcaseAgent>;
       const budget = await getAgentByName<Env, ShowcaseAgent>(namespace, BUDGET_INSTANCE);
@@ -541,14 +564,17 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
    *
    * @returns False when any budget is used up. A claimed slot is released only on refusal.
    */
-  private async reserveAiAction(units = 1): Promise<boolean> {
+  private async reserveAiAction(units = 1, exempt = currentIdentity()?.budgetExempt === true): Promise<boolean> {
     const hourAgo = Date.now() - HOUR_MS;
     this.sql`DELETE FROM ai_actions WHERE created_at <= ${hourAgo}`;
     const [used] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM ai_actions`;
-    if ((used?.count ?? 0) >= MAX_AI_ACTIONS_PER_HOUR) return false;
+    if (!exempt && (used?.count ?? 0) >= MAX_AI_ACTIONS_PER_HOUR) {
+      console.warn("budget refused", { limit: "conversation-hourly" });
+      return false;
+    }
     // The slot is held before the await, so concurrent calls cannot pass the hourly limit.
     const [slot] = this.sql<{ rowid: number }>`INSERT INTO ai_actions (created_at) VALUES (${Date.now()}) RETURNING rowid`;
-    if (await this.allowSharedAiSpend(units)) return true;
+    if (await this.allowSharedAiSpend(units, exempt)) return true;
     this.sql`DELETE FROM ai_actions WHERE rowid = ${slot?.rowid ?? -1}`;
     return false;
   }
