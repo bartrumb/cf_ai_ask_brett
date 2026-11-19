@@ -12,6 +12,7 @@ import type {
   StepStatus,
 } from "../src/domain/types";
 import { SAMPLES } from "./samples";
+import { playAudio, startRecording, stopPlayback, type Recording } from "./voice";
 
 const MAX_INPUT_CHARS = 40_000;
 const DEFAULT_REPO = "sample-payments-api";
@@ -52,6 +53,8 @@ const ui = {
   samples: byId<HTMLElement>("samples"),
   review: byId<HTMLButtonElement>("review-button"),
   ask: byId<HTMLButtonElement>("ask-button"),
+  mic: byId<HTMLButtonElement>("mic-button"),
+  routing: byId<HTMLElement>("routing"),
   notice: byId<HTMLElement>("notice"),
   status: byId<HTMLElement>("connection"),
   repoForm: byId<HTMLFormElement>("repo-form"),
@@ -76,7 +79,21 @@ let guardState: GuardState | null = null;
 let seenRevision = -1;
 let pendingAnswer: { question: string; text: string } | null = null;
 let exceptionTarget: { reviewId: string; finding: Finding } | null = null;
+let recording: Recording | null = null;
+let transcribing = false;
+let speakingKey: string | null = null;
 const liveCommentary = new Map<string, string>();
+
+interface SpeechResult {
+  audio: string;
+  mimeType: string;
+  source: CommentarySource;
+}
+
+interface TranscriptResult {
+  text: string;
+  source: CommentarySource;
+}
 
 function toSlug(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 64);
@@ -118,12 +135,26 @@ function updateComposer(): void {
   const blocked = !client || isBusy() || !hasText || length > MAX_INPUT_CHARS;
   ui.review.disabled = blocked;
   ui.ask.disabled = blocked || length > 2_000;
+  ui.mic.disabled = !client || transcribing;
+  ui.mic.textContent = recording ? "Stop recording" : transcribing ? "Transcribing…" : "Speak";
+  ui.mic.classList.toggle("recording", Boolean(recording));
+  ui.mic.setAttribute("aria-pressed", String(Boolean(recording)));
 }
 
-function sourceLabel(source: CommentarySource | null): string {
+function sourceLabel(source: CommentarySource | null, model: string | null): string {
   if (source === "offline") return "Offline template, no model called";
   if (source === "unavailable") return "Unavailable";
-  return snapshot?.modelLabel ?? "Workers AI";
+  const gateway = snapshot?.routing.gatewayId;
+  return `${model ?? "Workers AI"}${gateway ? ` via AI Gateway ${gateway}` : ""}`;
+}
+
+function listenButton(kind: "review" | "message", id: string | number): HTMLElement {
+  const key = `${kind}:${id}`;
+  return h(
+    "button",
+    { class: "link-button listen", type: "button", onClick: () => void toggleSpeech(kind, id) },
+    speakingKey === key ? "Stop" : "Listen",
+  );
 }
 
 /** Renders the commentary format as text nodes, with headings for readability. */
@@ -229,7 +260,12 @@ function aiPanel(review: ReviewRecord): HTMLElement | null {
     h("header", {}, h("span", { class: "panel-label" }, "AI commentary"), h("span", { class: "panel-tag" }, "Advisory · cannot change the result")),
     body,
     ...review.commentaryWarnings.map((warning) => h("p", { class: "warning" }, `Check: ${warning}`)),
-    h("p", { class: "checked" }, sourceLabel(review.commentarySource)),
+    h(
+      "div",
+      { class: "panel-foot" },
+      h("p", { class: "checked" }, sourceLabel(review.commentarySource, review.commentaryModel)),
+      review.status === "complete" && listenButton("review", review.id),
+    ),
   );
 }
 
@@ -253,7 +289,15 @@ function messageNode(message: ChatMessage, reviews: Map<string, ReviewRecord>): 
   if (message.role === "user") return [h("div", { class: "bubble user" }, message.text)];
   const body = h("div", { class: "commentary" });
   renderCommentary(body, message.text);
-  return [h("div", { class: "bubble assistant" }, h("span", { class: "bubble-label" }, `AI answer · ${sourceLabel(message.source)}`), body)];
+  return [
+    h(
+      "div",
+      { class: "bubble assistant" },
+      h("span", { class: "bubble-label" }, `AI answer · ${sourceLabel(message.source, message.model)}`),
+      body,
+      listenButton("message", message.id),
+    ),
+  ];
 }
 
 function emptyState(): HTMLElement {
@@ -287,6 +331,19 @@ function render(): void {
 
 function renderSidebar(): void {
   if (!snapshot) return;
+  const { routing } = snapshot;
+  ui.routing.replaceChildren(
+    h("li", { class: "muted" }, routing.offline ? "Offline mode: no model or gateway is called." : `All calls use AI Gateway: ${routing.gatewayId}`),
+    ...routing.models.map((model) =>
+      h(
+        "li",
+        { class: "route" },
+        h("strong", {}, model.label),
+        h("code", {}, model.primary.replace("@cf/", "")),
+        h("code", { class: "muted" }, `fallback ${model.secondary.replace("@cf/", "")}`),
+      ),
+    ),
+  );
   const enabled = snapshot.standards.filter((standard) => standard.enabled).length;
   ui.standardCount.textContent = `${enabled}/${snapshot.standards.length}`;
   ui.standards.replaceChildren(
@@ -404,6 +461,69 @@ function submitQuestion(): void {
     .catch(reportFailure);
 }
 
+async function toggleRecording(): Promise<void> {
+  if (recording) {
+    recording.stop();
+    return;
+  }
+  setNotice("");
+  try {
+    const active = await startRecording();
+    recording = active;
+    updateComposer();
+    const audio = await active.result;
+    recording = null;
+    transcribing = true;
+    updateComposer();
+    if (!client) return;
+    const result = (await client.call("transcribe", [audio])) as unknown as ActionResult<TranscriptResult>;
+    if (!result.ok) {
+      setNotice(result.error);
+    } else if (!result.text) {
+      setNotice("No speech was detected.");
+    } else {
+      ui.input.value = [ui.input.value.trim(), result.text].filter(Boolean).join("\n");
+      ui.input.focus();
+      if (result.source === "offline") setNotice("Offline mode returned a sample transcript, not your words.");
+    }
+  } catch (error) {
+    const denied = error instanceof DOMException && error.name === "NotAllowedError";
+    setNotice(denied ? "Microphone access was blocked." : "The recording could not be processed.");
+  } finally {
+    recording = null;
+    transcribing = false;
+    updateComposer();
+  }
+}
+
+async function toggleSpeech(kind: "review" | "message", id: string | number): Promise<void> {
+  const key = `${kind}:${id}`;
+  stopPlayback();
+  if (speakingKey === key) {
+    speakingKey = null;
+    render();
+    return;
+  }
+  if (!client) return;
+  setNotice("");
+  speakingKey = key;
+  render();
+  try {
+    const result = (await client.call("speak", [kind, id])) as unknown as ActionResult<SpeechResult>;
+    if (speakingKey !== key) return;
+    if (!result.ok) throw new Error(result.error);
+    if (result.source === "offline") setNotice("Offline mode plays a test tone instead of speech.");
+    await playAudio(result.audio, result.mimeType, () => {
+      if (speakingKey === key) speakingKey = null;
+      render();
+    });
+  } catch (error) {
+    if (speakingKey === key) speakingKey = null;
+    reportFailure(error);
+    render();
+  }
+}
+
 function openExceptionDialog(reviewId: string, finding: Finding): void {
   exceptionTarget = { reviewId, finding };
   ui.dialogTarget.textContent = `${finding.standardId} on ${finding.path}`;
@@ -459,6 +579,9 @@ function setConnection(label: string, state: string): void {
 
 function connect(repository: string): void {
   client?.close();
+  recording?.stop();
+  stopPlayback();
+  speakingKey = null;
   snapshot = null;
   guardState = null;
   seenRevision = -1;
@@ -537,6 +660,7 @@ ui.input.addEventListener("keydown", (event) => {
 });
 ui.review.addEventListener("click", () => void submitReview());
 ui.ask.addEventListener("click", submitQuestion);
+ui.mic.addEventListener("click", () => void toggleRecording());
 ui.repoForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const repository = toSlug(ui.repoInput.value);

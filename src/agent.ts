@@ -1,10 +1,12 @@
 import { Agent, callable, type StreamingResponse } from "agents";
+import { buildSpokenReview, decodeWavInput, toSpokenText } from "./domain/audio";
 import { normalizeText, parseChange, validateChangeInput, validateQuestion, validateReason } from "./domain/input";
 import { buildQuestionPrompt, offlineAnswer } from "./domain/prompt";
-import { describeChange, redactSecrets } from "./domain/rules";
+import { containsInjectionLanguage, describeChange, redactSecrets } from "./domain/rules";
 import { findStandard, SAMPLE_STANDARDS } from "./domain/standards";
 import type {
   ActionResult,
+  AiRouting,
   ChatMessage,
   CommentarySource,
   ExceptionRecord,
@@ -16,10 +18,13 @@ import type {
   StepName,
   StepStatus,
 } from "./domain/types";
-import { generateText, isOffline, MODEL_ID } from "./llm";
+import { generateText, isOffline } from "./llm";
+import { MODELS } from "./models";
+import { synthesizeSpeech, transcribeAudio, type SpokenAudio, type Transcript } from "./speech";
 
 const MAX_STORED_REVIEWS = 50;
 const MAX_REVIEWS_PER_HOUR = 30;
+const MAX_AI_ACTIONS_PER_HOUR = 60;
 const STALE_REVIEW_MS = 10 * 60 * 1000;
 const STEP_NAMES: readonly StepName[] = ["intake", "rules", "commentary", "save"];
 
@@ -38,6 +43,7 @@ function toReview(row: Row): ReviewRecord {
     result: row.result_json ? (JSON.parse(String(row.result_json)) as RuleResult) : null,
     commentary: String(row.commentary ?? ""),
     commentarySource: (row.commentary_source as CommentarySource | null) ?? null,
+    commentaryModel: (row.model as string | null) ?? null,
     commentaryWarnings: JSON.parse(String(row.warnings_json ?? "[]")) as string[],
     error: (row.error as string | null) ?? null,
   };
@@ -73,6 +79,13 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
     this.sql`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
       review_id TEXT, source TEXT, created_at INTEGER NOT NULL)`;
+    this.sql`CREATE TABLE IF NOT EXISTS ai_actions (created_at INTEGER NOT NULL)`;
+    if (!this.sql`SELECT name FROM pragma_table_info('reviews') WHERE name = 'model'`.length) {
+      this.sql`ALTER TABLE reviews ADD COLUMN model TEXT`;
+    }
+    if (!this.sql`SELECT name FROM pragma_table_info('messages') WHERE name = 'model'`.length) {
+      this.sql`ALTER TABLE messages ADD COLUMN model TEXT`;
+    }
   }
 
   // Called from the browser ---------------------------------------------------
@@ -84,7 +97,7 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
     const messages = this.sql<Row>`SELECT * FROM messages ORDER BY id DESC LIMIT 200`;
     return {
       repository: this.name,
-      modelLabel: isOffline(this.env) ? "Offline template (no model called)" : MODEL_ID,
+      routing: this.readRouting(),
       standards: this.readStandards(),
       exceptions: this.readExceptions(),
       reviews: reviews.map(toReview),
@@ -96,6 +109,7 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
           text: String(row.text),
           reviewId: (row.review_id as string | null) ?? null,
           source: (row.source as CommentarySource | null) ?? null,
+          model: (row.model as string | null) ?? null,
           createdAt: Number(row.created_at),
         }),
       ),
@@ -130,7 +144,7 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
     this.publish({ reviewId, steps: initialSteps() });
 
     try {
-      await this.runWorkflow("REVIEW_WORKFLOW", { reviewId }, { id: reviewId });
+      await this.runWorkflow("REVIEW_WORKFLOW", { reviewId, repository: this.name }, { id: reviewId });
     } catch (error) {
       console.error("workflow start failed", error instanceof Error ? error.message : "unknown error");
       this.markFailed(reviewId, "The review could not start. Try again.");
@@ -202,6 +216,10 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
       stream.error(question.error);
       return;
     }
+    if (!this.reserveAiAction()) {
+      stream.error("This repository reached its hourly AI limit. Try again later.");
+      return;
+    }
     const now = Date.now();
     const shown = redactSecrets(normalizeText(question.text));
     this.sql`INSERT INTO messages (role, kind, text, created_at) VALUES ('user', 'text', ${shown}, ${now})`;
@@ -214,18 +232,60 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
         messages: buildQuestionPrompt(question.text, result, crypto.randomUUID().replaceAll("-", "")),
         offlineText: offlineAnswer(result),
         maxOutputTokens: 700,
+        gateway: {
+          repository: this.name,
+          feature: "question",
+          ruleFlaggedInjection: containsInjectionLanguage(question.text),
+        },
         onDelta: (delta) => {
           stream.send({ delta });
         },
       });
       const text = redactSecrets(answer.text);
-      this.sql`INSERT INTO messages (role, kind, text, source, created_at)
-        VALUES ('assistant', 'text', ${text}, ${answer.source}, ${Date.now()})`;
+      this.sql`INSERT INTO messages (role, kind, text, source, model, created_at)
+        VALUES ('assistant', 'text', ${text}, ${answer.source}, ${answer.model}, ${Date.now()})`;
       this.publish();
       stream.end({ source: answer.source });
     } catch (error) {
       console.error("question failed", error instanceof Error ? error.message : "unknown error");
       stream.error("The model is unavailable right now. Rule results are unaffected.");
+    }
+  }
+
+  /** The transcript returns to the composer, so the user can check it first. */
+  @callable()
+  async transcribe(raw: unknown): Promise<ActionResult<Transcript>> {
+    const audio = decodeWavInput(raw);
+    if (!audio.ok) return audio;
+    if (!this.reserveAiAction()) return { ok: false, error: "This repository reached its hourly AI limit." };
+    try {
+      const transcript = await transcribeAudio(this.env, audio.bytes, {
+        repository: this.name,
+        feature: "transcription",
+      });
+      return { ok: true, ...transcript, text: redactSecrets(normalizeText(transcript.text)) };
+    } catch (error) {
+      console.error("transcription failed", error instanceof Error ? error.message : "unknown error");
+      return { ok: false, error: "Speech recognition is unavailable right now." };
+    }
+  }
+
+  /** Speaks stored content only, so this cannot become a general speech API. */
+  @callable()
+  async speak(kind: unknown, id: unknown): Promise<ActionResult<SpokenAudio>> {
+    const target = this.readSpokenTarget(kind, id);
+    if (!target) return { ok: false, error: "There is nothing to read aloud yet." };
+    if (!this.reserveAiAction()) return { ok: false, error: "This repository reached its hourly AI limit." };
+    try {
+      const speech = await synthesizeSpeech(this.env, target.text, {
+        repository: this.name,
+        feature: "speech",
+        reviewId: target.reviewId,
+      });
+      return { ok: true, ...speech };
+    } catch (error) {
+      console.error("speech failed", error instanceof Error ? error.message : "unknown error");
+      return { ok: false, error: "Speech is unavailable right now." };
     }
   }
 
@@ -243,10 +303,14 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
     this.publish();
   }
 
-  finishReview(reviewId: string, commentary: { text: string; source: CommentarySource; warnings: string[] }): void {
+  finishReview(
+    reviewId: string,
+    commentary: { text: string; source: CommentarySource; model: string | null; warnings: string[] },
+  ): void {
     const warnings = JSON.stringify(commentary.warnings);
     this.sql`UPDATE reviews SET status = 'complete', commentary = ${commentary.text},
-      commentary_source = ${commentary.source}, warnings_json = ${warnings} WHERE id = ${reviewId}`;
+      commentary_source = ${commentary.source}, model = ${commentary.model},
+      warnings_json = ${warnings} WHERE id = ${reviewId}`;
     // Kept until now so a retried rules step can read it again.
     this.sql`DELETE FROM pending_inputs WHERE review_id = ${reviewId}`;
     this.prune();
@@ -275,6 +339,42 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
       revision: this.state.revision + 1,
       active: active === undefined ? this.state.active : active,
     });
+  }
+
+  private readRouting(): AiRouting {
+    return {
+      offline: isOffline(this.env),
+      gatewayId: this.env.AI_GATEWAY_ID,
+      models: [
+        { label: "Language model", ...MODELS.llm },
+        { label: "Speech to text", ...MODELS.stt },
+        { label: "Text to speech", ...MODELS.tts },
+      ],
+    };
+  }
+
+  private readSpokenTarget(kind: unknown, id: unknown): { text: string; reviewId?: string } | null {
+    if (kind === "review" && typeof id === "string") {
+      const [row] = this.sql<Row>`SELECT * FROM reviews WHERE id = ${id}`;
+      const review = row ? toReview(row) : null;
+      return review?.result ? { text: buildSpokenReview(review.result, review.commentary), reviewId: id } : null;
+    }
+    if (kind === "message" && typeof id === "number") {
+      const [row] = this.sql<{ text: string }>`SELECT text FROM messages WHERE id = ${id} AND role = 'assistant'`;
+      const text = row ? toSpokenText(row.text) : "";
+      return text ? { text } : null;
+    }
+    return null;
+  }
+
+  /** A per-repository brake. AI Gateway limits are the account-level control. */
+  private reserveAiAction(): boolean {
+    const hourAgo = Date.now() - 60 * 60 * 1000;
+    this.sql`DELETE FROM ai_actions WHERE created_at <= ${hourAgo}`;
+    const [used] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM ai_actions`;
+    if ((used?.count ?? 0) >= MAX_AI_ACTIONS_PER_HOUR) return false;
+    this.sql`INSERT INTO ai_actions (created_at) VALUES (${Date.now()})`;
+    return true;
   }
 
   private readStandards(): StandardSetting[] {

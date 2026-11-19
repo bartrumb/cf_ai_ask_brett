@@ -6,11 +6,13 @@ import { parseChange } from "./domain/input";
 import { auditCommentary, buildReviewPrompt, offlineCommentary } from "./domain/prompt";
 import { buildExcerpt, evaluateChange, redactSecrets } from "./domain/rules";
 import type { CommentarySource, LiveMessage, RuleResult, StepName, StepStatus } from "./domain/types";
+import { isGuardrailBlock } from "./gateway";
 import { generateText } from "./llm";
 
-/** Only an ID: Workflow params and step results are stored, so raw input stays out. */
+/** IDs only: Workflow params and step results are stored, so raw input stays out. */
 export interface ReviewParams {
   reviewId: string;
+  repository: string;
 }
 
 export interface ReviewProgress {
@@ -22,6 +24,7 @@ export interface ReviewProgress {
 interface Commentary {
   text: string;
   source: CommentarySource;
+  model: string | null;
   warnings: string[];
 }
 
@@ -29,7 +32,7 @@ const FLUSH_INTERVAL_MS = 80;
 
 export class ReviewWorkflow extends AgentWorkflow<CodexGuardAgent, ReviewParams, ReviewProgress, Env> {
   override async run(event: AgentWorkflowEvent<ReviewParams>, step: AgentWorkflowStep) {
-    const { reviewId } = event.payload;
+    const { reviewId, repository } = event.payload;
 
     await this.reportProgress({ step: "intake", status: "complete" });
     await this.reportProgress({ step: "rules", status: "running" });
@@ -53,11 +56,12 @@ export class ReviewWorkflow extends AgentWorkflow<CodexGuardAgent, ReviewParams,
       commentary = await step.do(
         "write-ai-commentary",
         { retries: { limit: 2, delay: "2 seconds", backoff: "exponential" }, timeout: "3 minutes" },
-        () => this.writeCommentary(reviewId, result, rules.excerpt),
+        () => this.writeCommentary(reviewId, repository, result, rules.excerpt),
       );
     } catch (error) {
       console.error("commentary failed", error instanceof Error ? error.message : "unknown error");
-      commentary = { text: "", source: "unavailable", warnings: [] };
+      const warnings = isGuardrailBlock(error) ? ["AI Gateway Guardrails blocked this commentary."] : [];
+      commentary = { text: "", source: "unavailable", model: null, warnings };
     }
 
     await this.reportProgress({
@@ -75,7 +79,12 @@ export class ReviewWorkflow extends AgentWorkflow<CodexGuardAgent, ReviewParams,
     return { reviewId, risk: result.risk };
   }
 
-  private async writeCommentary(reviewId: string, result: RuleResult, excerpt: string): Promise<Commentary> {
+  private async writeCommentary(
+    reviewId: string,
+    repository: string,
+    result: RuleResult,
+    excerpt: string,
+  ): Promise<Commentary> {
     const send = (message: LiveMessage) => this.broadcastToClients(message);
     await send({ type: "commentary-reset", reviewId });
 
@@ -93,6 +102,12 @@ export class ReviewWorkflow extends AgentWorkflow<CodexGuardAgent, ReviewParams,
       messages: buildReviewPrompt(result, excerpt, reviewId.replaceAll("-", "")),
       offlineText: offlineCommentary(result),
       maxOutputTokens: 1_800,
+      gateway: {
+        repository,
+        feature: "review",
+        reviewId,
+        ruleFlaggedInjection: result.findings.some((finding) => finding.standardId === "STD-AGT-01"),
+      },
       onDelta: async (delta) => {
         pending += delta;
         if (Date.now() - lastFlush >= FLUSH_INTERVAL_MS) await flush();
@@ -101,6 +116,6 @@ export class ReviewWorkflow extends AgentWorkflow<CodexGuardAgent, ReviewParams,
     await flush();
 
     const text = redactSecrets(generated.text);
-    return { text, source: generated.source, warnings: auditCommentary(text, result) };
+    return { text, source: generated.source, model: generated.model, warnings: auditCommentary(text, result) };
   }
 }

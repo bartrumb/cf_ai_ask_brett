@@ -37,9 +37,10 @@
             <div id="samples" class="samples"></div>
           </div>
           <label class="sr-only" for="change-input">Change summary, unified diff or question</label>
-          <textarea id="change-input" rows="5" spellcheck="false" placeholder="Paste a unified diff or describe the change. Ask a question about the latest review."></textarea>
+          <textarea id="change-input" rows="5" spellcheck="false" placeholder="Paste a unified diff, describe the change, or choose Speak. Ask a question about the latest review."></textarea>
           <div class="composer-actions">
             <span id="char-count" class="count">0 / 40,000</span>
+            <button id="mic-button" class="secondary" type="button" aria-pressed="false" disabled>Speak</button>
             <button id="ask-button" class="secondary" type="button" disabled>Ask a question</button>
             <button id="review-button" class="primary" type="button" disabled>Review change</button>
           </div>
@@ -59,6 +60,10 @@
         <details open>
           <summary>Sample standards <span id="standard-count" class="pill">0</span></summary>
           <ul id="standards" class="plain-list"></ul>
+        </details>
+        <details>
+          <summary>AI routing</summary>
+          <ul id="routing" class="plain-list"></ul>
         </details>
       </aside>
     </div>

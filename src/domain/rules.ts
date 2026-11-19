@@ -86,7 +86,7 @@ const LINE_RULES: readonly LineRule[] = [
     patterns: [/\bdrop\s+(?:table|column|database|schema)\b/i, /\btruncate\s+(?:table\s+)?\w+/i, /\balter\s+table\s+\S+\s+drop\b/i],
     summaryPatterns: [
       /\bdrop\s+(?:table|column|database|schema)\b/i,
-      /\bdrop(?:s|ping)?\s+(?:the\s+)?[\w-]+\s+(?:table|column|database)\b/i,
+      /\bdrop(?:s|ping)?\s+(?:[\w-]+\s+){0,4}(?:table|column|database)\b/i,
       /\btruncat(?:e|es|ing)\b[^\n]{0,20}\btable\b/i,
     ],
   },
@@ -116,6 +116,11 @@ const LINE_RULES: readonly LineRule[] = [
     scanContext: true,
   },
 ];
+
+export function containsInjectionLanguage(text: string): boolean {
+  const normalized = normalizeText(text);
+  return INJECTION_PATTERNS.some((pattern) => pattern.test(normalized));
+}
 
 export function redactSecrets(text: string): string {
   return text

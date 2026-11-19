@@ -110,6 +110,55 @@ describe("exception memory", () => {
   });
 });
 
+describe("voice", () => {
+  const wav = () => {
+    const bytes = new Uint8Array(60);
+    bytes.set(new TextEncoder().encode("RIFF"), 0);
+    bytes.set(new TextEncoder().encode("WAVE"), 8);
+    return btoa(String.fromCharCode(...bytes));
+  };
+
+  it("returns an offline transcript without storing or submitting it", async () => {
+    const agent = await newAgent();
+    expect(await agent.transcribe(wav())).toMatchObject({ ok: true, source: "offline", model: null });
+    const snapshot = await agent.getSnapshot();
+    expect(snapshot.reviews).toEqual([]);
+    expect(snapshot.messages).toEqual([]);
+  });
+
+  it("rejects audio that is not a WAV recording", async () => {
+    const agent = await newAgent();
+    expect((await agent.transcribe("AAAA")).ok).toBe(false);
+  });
+
+  it("speaks only stored content", async () => {
+    const agent = await newAgent();
+    const review = await reviewToCompletion(agent, OPEN_INGRESS);
+    expect(await agent.speak("review", review.id)).toMatchObject({ ok: true, source: "offline", mimeType: "audio/wav" });
+    expect((await agent.speak("review", "missing")).ok).toBe(false);
+    expect((await agent.speak("text", "Say anything")).ok).toBe(false);
+  });
+
+  it("limits AI actions per repository", async () => {
+    const agent = await newAgent();
+    const results = [];
+    for (let index = 0; index < 61; index += 1) results.push(await agent.transcribe(wav()));
+    expect(results.at(59)?.ok).toBe(true);
+    expect(results.at(60)).toMatchObject({ ok: false });
+  });
+
+  it("reports gateway routing for every model type", async () => {
+    const agent = await newAgent();
+    const { routing } = await agent.getSnapshot();
+    expect(routing).toMatchObject({ offline: true, gatewayId: "codex-guard" });
+    expect(routing.models.map((model) => model.primary)).toEqual([
+      "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+      "@cf/deepgram/nova-3",
+      "@cf/deepgram/aura-2-en",
+    ]);
+  });
+});
+
 describe("worker routing", () => {
   const upgrade = { Upgrade: "websocket" };
   const fetchWorker = (path: string, headers: Record<string, string> = {}) =>

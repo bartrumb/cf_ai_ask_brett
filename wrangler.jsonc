@@ -15,7 +15,7 @@
   // Workers AI always runs on Cloudflare. `npm run dev` passes --local and
   // AI_MODE=offline so local work never reaches an account or incurs charges.
   "ai": { "binding": "AI", "remote": true },
-  "vars": { "AI_MODE": "workers-ai" },
+  "vars": { "AI_MODE": "workers-ai", "AI_GATEWAY_ID": "codex-guard" },
   "durable_objects": {
     "bindings": [{ "name": "CodexGuardAgent", "class_name": "CodexGuardAgent" }]
   },

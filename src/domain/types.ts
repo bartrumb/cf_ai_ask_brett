@@ -70,6 +70,7 @@ export interface ReviewRecord {
   result: RuleResult | null;
   commentary: string;
   commentarySource: CommentarySource | null;
+  commentaryModel: string | null;
   commentaryWarnings: string[];
   error: string | null;
 }
@@ -81,12 +82,19 @@ export interface ChatMessage {
   text: string;
   reviewId: string | null;
   source: CommentarySource | null;
+  model: string | null;
   createdAt: number;
+}
+
+export interface AiRouting {
+  offline: boolean;
+  gatewayId: string;
+  models: { label: string; primary: string; secondary: string }[];
 }
 
 export interface Snapshot {
   repository: string;
-  modelLabel: string;
+  routing: AiRouting;
   standards: StandardSetting[];
   exceptions: ExceptionRecord[];
   reviews: ReviewRecord[];

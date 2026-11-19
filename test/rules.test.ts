@@ -58,6 +58,11 @@ describe("rule detection", () => {
     expect(result.notes[0]).toContain("Summary only");
   });
 
+  it("recognizes natural spoken phrasing in summaries", () => {
+    const result = evaluate("Drop the legacy orders table and skip the integration tests in CI.");
+    expect(result.findings.map((finding) => finding.standardId).sort()).toEqual(["STD-DB-01", "STD-REL-01"]);
+  });
+
   it("is deterministic", () => {
     expect(evaluate(OPEN_INGRESS)).toEqual(evaluate(OPEN_INGRESS));
   });
