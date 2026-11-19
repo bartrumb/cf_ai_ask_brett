@@ -80,7 +80,7 @@ Secondary SST: @cf/openai/whisper-large-v3-turbo
 Swap these out then
 ````
 
-**Produced:** AI Gateway routing for every language, speech-to-text and text-to-speech model, with primary and fallback models, request metadata, a gateway setup script that flags prompt injection, voice input, spoken results, tests and documentation.
+**Produced:** the requested language-model and speech-to-text swaps, AI Gateway routing for every model with fallbacks and request metadata, a gateway setup script that flags prompt injection, voice input, spoken results, tests and documentation.
 
 ---
 
@@ -91,4 +91,4 @@ I recently wrote a post about always-on-agents reference this https://github.com
 As I need this agent to be durable so utilize the Think Harness, use zod for input schemas, also be sure to document all of your code for future engineers, ensure 80% test coverage, look for security risks. Since we are windows give me back secure commands to set these tokens proper. Yes replace MeloTTS with aura-1 if that is the better fit but be sure to see when it expires as we may need to a pick a third party option instead
 ````
 
-**Produced:** in progress.
+**Produced:** migration to the Think harness with a durable question inbox, zod schemas for inputs, source documentation, an 80% coverage gate across server and browser code, an independent security review with fixes, Cloudflare Access enforcement, `aura-1` as the speech fallback, and secure Windows commands for setting tokens. The assistant delegated the documentation pass and the security review to subagents. It gave them no additional user prompts.
