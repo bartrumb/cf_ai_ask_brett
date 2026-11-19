@@ -109,13 +109,13 @@ describe("model failure paths", () => {
     await expect(generateText(env, request)).rejects.toThrow();
   });
 
-  it("falls back when transcription returns an unexpected shape", async () => {
-    const env = envWith((model) => (model === MODELS.stt.primary ? {} : { text: " done " }));
-    await expect(transcribeAudio(env, new Uint8Array(50), gateway)).resolves.toMatchObject({ text: "done", model: MODELS.stt.secondary });
+  it("fails when transcription returns an unexpected shape", async () => {
+    await expect(transcribeAudio(envWith(() => ({})), new Uint8Array(50), gateway)).rejects.toThrow("Unexpected");
   });
 
-  it("fails when both transcription models return unexpected shapes", async () => {
-    await expect(transcribeAudio(envWith(() => ({})), new Uint8Array(50), gateway)).rejects.toThrow("Unexpected");
+  it("reports non-Error Nova failures through the fallback", async () => {
+    const env = { ...envWith(() => ({ text: "done" })), AI_GATEWAY_TOKEN: "token" };
+    await expect(transcribeAudio(env, new Uint8Array(50), gateway)).resolves.toMatchObject({ model: MODELS.stt.secondary });
   });
 
   it("accepts raw audio streams and reports non-Error speech failures", async () => {

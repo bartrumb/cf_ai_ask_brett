@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildSpokenReview, decodeWav, MAX_SPOKEN_CHARS, toSpokenText } from "../src/domain/audio";
 import { applyGateway, desiredGateway } from "../src/domain/gateway-config";
 import { MAX_AUDIO_BYTES, parseInput, transcribeSchema } from "../src/domain/schemas";
@@ -20,6 +20,7 @@ interface Call {
 function fakeEnv(handler: (call: Call) => unknown) {
   const calls: Call[] = [];
   const AI = {
+    gateway: () => ({ getUrl: async () => "https://gateway.example/v1/account/test-gateway/workers-ai/" }),
     run: async (model: string, input: Record<string, unknown>, options: Call["options"]) => {
       const call = { model, input, options };
       calls.push(call);
@@ -32,23 +33,32 @@ function fakeEnv(handler: (call: Call) => unknown) {
 const wav = new Uint8Array(Buffer.from(wavBase64(), "base64"));
 
 describe("speech to text", () => {
-  it("uses the primary model through the gateway", async () => {
-    const { calls, env } = fakeEnv(() => ({ results: { channels: [{ alternatives: [{ transcript: "hello there" }] }] } }));
+  afterEach(() => vi.restoreAllMocks());
+
+  it("uses Whisper through the gateway when Nova has no gateway token", async () => {
+    const { calls, env } = fakeEnv(() => ({ text: " hello there " }));
     const result = await transcribeAudio(env, wav, { ...context, feature: "transcription" });
-    expect(result).toEqual({ text: "hello there", source: "workers-ai", model: MODELS.stt.primary });
+    expect(result).toEqual({ text: "hello there", source: "workers-ai", model: MODELS.stt.secondary });
+    expect(calls.map((call) => call.model)).toEqual([MODELS.stt.secondary]);
     expect(calls[0]?.options.gateway?.id).toBe("test-gateway");
-    expect(calls[0]?.options.gateway?.metadata?.feature).toBe("transcription");
+    expect(typeof calls[0]?.input.audio).toBe("string");
   });
 
-  it("falls back to the secondary model on the same gateway", async () => {
-    const { calls, env } = fakeEnv(({ model }) => {
-      if (model === MODELS.stt.primary) throw new Error("unavailable");
-      return { text: "from fallback" };
-    });
-    const result = await transcribeAudio(env, wav, context);
-    expect(result).toMatchObject({ text: "from fallback", model: MODELS.stt.secondary });
-    expect(calls.map((call) => call.options.gateway?.id)).toEqual(["test-gateway", "test-gateway"]);
-    expect(typeof calls[1]?.input.audio).toBe("string");
+  it("sends Nova audio to the gateway HTTP endpoint when a token is configured", async () => {
+    const { calls, env } = fakeEnv(() => ({ text: "unused" }));
+    const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ result: { results: { channels: [{ alternatives: [{ transcript: " from nova " }] }] } } }));
+    const result = await transcribeAudio({ ...env, AI_GATEWAY_TOKEN: "test-token" }, wav, context);
+    expect(result).toMatchObject({ text: "from nova", model: MODELS.stt.primary });
+    expect(calls).toEqual([]);
+    const [url, init] = fetcher.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`https://gateway.example/v1/account/test-gateway/workers-ai/${MODELS.stt.primary}?smart_format=true&punctuate=true`);
+    expect(new Headers(init.headers).get("cf-aig-authorization")).toBe("Bearer test-token");
+  });
+
+  it("falls back to Whisper when the Nova request fails", async () => {
+    const { env } = fakeEnv(() => ({ text: "from fallback" }));
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("no", { status: 401 }));
+    await expect(transcribeAudio({ ...env, AI_GATEWAY_TOKEN: "test-token" }, wav, context)).resolves.toMatchObject({ text: "from fallback", model: MODELS.stt.secondary });
   });
 });
 
@@ -68,6 +78,14 @@ describe("text to speech", () => {
     expect(calls.map((call) => call.model)).toEqual([MODELS.tts.primary, MODELS.tts.secondary]);
     expect(calls[1]?.input).toEqual(calls[0]?.input);
     expect(calls[1]?.options.gateway?.id).toBe("test-gateway");
+  });
+
+  it("falls back when the primary model stalls", async () => {
+    const { calls, env } = fakeEnv(({ model }) =>
+      model === MODELS.tts.primary ? new Promise(() => {}) : new Response(new Uint8Array([1, 2, 3])),
+    );
+    await expect(synthesizeSpeech(env, "Hello.", context, 5)).resolves.toMatchObject({ audio: "AQID", model: MODELS.tts.secondary });
+    expect(calls).toHaveLength(2);
   });
 
   it("reports an empty speech response as a failure", async () => {

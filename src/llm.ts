@@ -86,7 +86,9 @@ export async function generateText(env: LlmEnv, options: GenerateOptions): Promi
   let streamError: unknown;
   const result = streamText({
     model: createLanguageModel(env, options.gateway),
-    messages: options.messages,
+    // AI SDK 7 accepts system text only through `instructions`.
+    instructions: options.messages.filter((message) => message.role === "system").map((message) => message.content).join("\n\n"),
+    messages: options.messages.filter((message) => message.role !== "system"),
     temperature: 0.2,
     maxOutputTokens: options.maxOutputTokens,
     onError: ({ error }) => {

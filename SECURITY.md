@@ -29,4 +29,4 @@ Codex Guard treats every submitted change, transcript and model response as untr
 
 ## Handling tokens
 
-The application needs no API token at runtime. A token is used only to configure AI Gateway. Follow the PowerShell steps in the README, scope it to AI Gateway, set a short expiry, and revoke it after setup.
+The application needs no API token at runtime unless Nova-3 is enabled, which uses the optional `AI_GATEWAY_TOKEN` Worker secret. A separate token is used only to configure AI Gateway. Follow the PowerShell steps in the README, scope it to AI Gateway, set a short expiry, and revoke it after setup.

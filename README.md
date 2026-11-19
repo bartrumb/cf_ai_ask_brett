@@ -76,6 +76,8 @@ As of 2026-11-18, Cloudflare's model pages and its November deprecation notice l
 
 The language models require the Workers Paid plan or prepaid AI Gateway credits.
 
+AI Gateway rejects the streamed audio that Nova-3 requires on the Workers AI binding. Nova therefore runs through the gateway's HTTP endpoint only when the `AI_GATEWAY_TOKEN` Worker secret is set. Without that secret, speech goes to Whisper through the gateway, so audio does not bypass monitoring.
+
 ### AI Gateway monitoring
 
 - **Spend:** Analytics shows requests, tokens and estimated cost. Add a budget under **AI > AI Gateway > Settings > Spend limits**. Cost tracking is token-based, so also check speech usage in the Workers AI dashboard.

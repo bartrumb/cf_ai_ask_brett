@@ -4,15 +4,18 @@
  */
 import { Buffer } from "node:buffer";
 import type { CommentarySource } from "./domain/types";
-import { gatewayOptions, type GatewayContext } from "./gateway";
+import { gatewayMetadata, gatewayOptions, type GatewayContext } from "./gateway";
 import { isOffline } from "./llm";
 import { MODELS } from "./models";
 
 /** Fixed transcript returned in offline mode. It triggers rules, so the voice flow can be tried. */
 export const OFFLINE_TRANSCRIPT = "Drop the legacy orders table and skip the integration tests in CI.";
 
+/** Time allowed for each speech model, so both attempts fit inside the browser's 30-second call limit. */
+const SPEECH_TIMEOUT_MS = 12_000;
+
 /** Bindings needed for speech calls. */
-type SpeechEnv = Pick<Env, "AI" | "AI_MODE" | "AI_GATEWAY_ID">;
+type SpeechEnv = Pick<Env, "AI" | "AI_MODE" | "AI_GATEWAY_ID"> & { AI_GATEWAY_TOKEN?: string };
 /** Where a successful speech result came from. */
 type Source = Exclude<CommentarySource, "unavailable">;
 /** Loose signature for `env.AI.run`, which is called here with model-specific input shapes. */
@@ -62,32 +65,56 @@ function readWhisperTranscript(output: unknown): string {
 }
 
 /**
- * Transcribes a validated WAV file, trying the secondary model after any primary failure.
+ * Sends audio to Nova through the gateway's HTTP endpoint. The Workers AI binding cannot do this,
+ * because AI Gateway rejects the streamed audio body Nova requires on that path.
+ *
+ * @throws Error when the gateway refuses the request or returns an unexpected response.
+ */
+async function transcribeWithNova(env: SpeechEnv, token: string, wav: Uint8Array, context: GatewayContext): Promise<string> {
+  const base = (await env.AI.gateway(env.AI_GATEWAY_ID).getUrl("workers-ai")).replace(/\/$/, "");
+  const response = await fetch(`${base}/${MODELS.stt.primary}?smart_format=true&punctuate=true`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "cf-aig-authorization": `Bearer ${token}`,
+      "cf-aig-collect-log-payload": "false",
+      "cf-aig-metadata": JSON.stringify(gatewayMetadata(context)),
+      "cf-aig-skip-cache": "true",
+      "Content-Type": "audio/wav",
+    },
+    body: wav,
+  });
+  if (!response.ok) throw new Error(`Nova request failed with status ${response.status}.`);
+  const output = (await response.json()) as { result?: unknown };
+  return readNovaTranscript(output.result ?? output);
+}
+
+/**
+ * Transcribes a validated WAV file. Nova runs only when a gateway token is configured, so audio
+ * never bypasses AI Gateway. Whisper handles every other case and any Nova failure.
  *
  * @param wav - Bytes already checked by `decodeWav`.
  * @param context - Gateway metadata for the request.
- * @throws The secondary model's error when both models fail.
+ * @throws The Whisper error when no model can produce a transcript.
  */
 export async function transcribeAudio(env: SpeechEnv, wav: Uint8Array, context: GatewayContext): Promise<Transcript> {
   if (isOffline(env)) return { text: OFFLINE_TRANSCRIPT, source: "offline", model: null };
 
+  if (env.AI_GATEWAY_TOKEN) {
+    try {
+      const text = await transcribeWithNova(env, env.AI_GATEWAY_TOKEN, wav, context);
+      return { text, source: "workers-ai", model: MODELS.stt.primary };
+    } catch (error) {
+      console.warn("primary transcription failed", error instanceof Error ? error.message : "unknown error");
+    }
+  }
   const run = runner(env);
   // Recordings are not needed to monitor spend, so ask the gateway not to log them.
   const options = {
     gateway: gatewayOptions(env, context),
     extraHeaders: { "cf-aig-collect-log-payload": "false" },
   };
-  try {
-    const output = await run(
-      MODELS.stt.primary,
-      { audio: { body: new Response(wav).body, contentType: "audio/wav" }, smart_format: true, punctuate: true },
-      options,
-    );
-    return { text: readNovaTranscript(output), source: "workers-ai", model: MODELS.stt.primary };
-  } catch (error) {
-    console.warn("primary transcription failed", error instanceof Error ? error.message : "unknown error");
-  }
-  // Whisper takes base64 audio, unlike the streamed body sent to Nova.
+  // Whisper accepts base64 audio, which AI Gateway can carry through the binding.
   const output = await run(
     MODELS.stt.secondary,
     { audio: Buffer.from(wav).toString("base64"), task: "transcribe", language: "en", vad_filter: true },
@@ -139,18 +166,35 @@ function offlineTone(): string {
  * @param context - Gateway metadata for the request.
  * @throws The secondary model's error when both models fail.
  */
-export async function synthesizeSpeech(env: SpeechEnv, text: string, context: GatewayContext): Promise<SpokenAudio> {
+export async function synthesizeSpeech(
+  env: SpeechEnv,
+  text: string,
+  context: GatewayContext,
+  timeoutMs = SPEECH_TIMEOUT_MS,
+): Promise<SpokenAudio> {
   if (isOffline(env)) return { audio: offlineTone(), mimeType: "audio/wav", source: "offline", model: null };
 
   const run = runner(env);
   const options = { gateway: gatewayOptions(env, context), returnRawResponse: true };
   const input = { text, speaker: "luna", encoding: "mp3" };
-  const speak = async (model: string): Promise<SpokenAudio> => ({
-    audio: await readAudioResponse(await run(model, input, options)),
-    mimeType: "audio/mpeg",
-    source: "workers-ai",
-    model,
-  });
+  // The limit covers the whole download, because a slow stream can start promptly and then stall.
+  const speak = async (model: string): Promise<SpokenAudio> => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error("Speech request timed out."));
+      }, timeoutMs);
+    });
+    try {
+      const request = (async () => readAudioResponse(await run(model, input, { ...options, signal: controller.signal })))();
+      const audio = await Promise.race([request, timeout]);
+      return { audio, mimeType: "audio/mpeg", source: "workers-ai", model };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   try {
     return await speak(MODELS.tts.primary);
   } catch (error) {

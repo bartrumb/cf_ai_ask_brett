@@ -64,7 +64,7 @@ describe("model adapter", () => {
   ].join("");
   const sse = () => new Response(frames, { headers: { "content-type": "text/event-stream" } });
   const request = (onDelta: (delta: string) => void) => ({
-    messages: [{ role: "user" as const, content: "Explain." }],
+    messages: [{ role: "system" as const, content: "Follow the rules." }, { role: "user" as const, content: "Explain." }],
     offlineText: "unused",
     maxOutputTokens: 50,
     gateway,
@@ -83,10 +83,10 @@ describe("model adapter", () => {
   });
 
   it("sends the primary model through the configured gateway with metadata", async () => {
-    const calls: { model: string; options: { gateway?: Record<string, unknown> } }[] = [];
+    const calls: { model: string; input: unknown; options: { gateway?: Record<string, unknown> } }[] = [];
     const ai = {
-      run: async (model: string, _input: unknown, options: { gateway?: Record<string, unknown> }) => {
-        calls.push({ model, options });
+      run: async (model: string, input: unknown, options: { gateway?: Record<string, unknown> }) => {
+        calls.push({ model, input, options });
         return sse();
       },
     } as unknown as Ai;
@@ -97,6 +97,7 @@ describe("model adapter", () => {
     );
     expect(calls).toHaveLength(1);
     expect(calls[0]?.model).toBe(MODELS.llm.primary);
+    expect(JSON.stringify(calls[0])).toContain("Follow the rules.");
     expect(calls[0]?.options.gateway).toMatchObject({
       id: "test-gateway",
       metadata: { app: "codex-guard", repository: "sample-repo", feature: "review", rule_flagged_injection: true },

@@ -130,3 +130,13 @@ Since the other session could read my claude code sessions can you see if you ca
 ````
 
 **Produced:** work outside this repository on a private personal knowledge base. It did not change the application.
+
+---
+
+## Prompt 7
+
+````text
+It succeeded
+````
+
+**Produced:** a live model test through AI Gateway, a fix for system prompts under AI SDK 7, and a gateway-safe speech-to-text path.
