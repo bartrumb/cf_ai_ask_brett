@@ -1,36 +1,39 @@
 # Security
 
-Codex Guard treats every submitted change, transcript and model response as untrusted.
+Ask about Brett is a public site. Every question, transcript and model response is treated as untrusted.
 
 ## Controls
 
 | Risk | Control |
 | --- | --- |
-| Unauthorized access or spend | Real-model mode requires Cloudflare Access, and the Worker verifies the token's signature, issuer, audience and time limits |
-| Direct use of agent protocols | The socket accepts only named RPC methods, each validated by zod. Chat, state, tool and approval frames are dropped |
+| Private content in the repository | The real knowledge base, site content and generated files are gitignored. Only invented examples are committed |
+| Private instructions reaching a model | The build removes the title block and instruction section, and fails if a removed line survives |
+| Sensitive figures in answers | Money figures and phone numbers are withheld from model context and masked again in streamed, stored and spoken answers |
+| Sensitive topics | Deterministic guards answer compensation, financial, private contact, personal, job-search, government and instruction-probing questions with fixed text and no model call. Patterns describe categories and reveal nothing about the profile |
+| Prompt injection | Turns have no tools and one step. Profile facts stay in the system prompt, and visitor text, including earlier exchanges, stays in an unpredictable per-turn delimiter |
+| Direct use of agent protocols | The socket accepts only `getSnapshot`, `ask`, `transcribe` and `speak`, each validated by zod. Chat, state, tool and other frames are dropped |
+| Conversation access | Routes accept only 128-bit random IDs, so there is no shared or guessable conversation, and the budget instance cannot be routed to |
+| Spoofed identity | The Worker strips internal and SDK headers. Visitor keys and Access expiry come only from the Worker. Clients cannot write agent state |
 | Cross-site socket use | Browser connections must come from the same host |
-| Prompt injection | Risk is decided before model use. Turns have no tools and no prior model text. Submitted text and paths stay in a per-request untrusted block |
-| Misleading model output | Stored commentary is checked for unknown citations, skipped findings and contradictory risk claims. The spoken verdict comes from rules |
-| Secret exposure | One shared pattern set drives detection and redaction for stored data, prompts, evidence, titles, live text and speech |
-| Raw input retention | Workflow parameters hold only IDs, and pending input is deleted when a review ends |
-| Expensive input | Input, line, path, question and audio sizes are capped. Audio must be 30 seconds or less of 16 kHz mono PCM |
-| Cost abuse | Connection, per-connection, per-repository, shared per-minute and shared daily limits apply, with AI Gateway limits above them |
-| Stale authorization and data | Sockets close when their Access token expires. Exceptions record the verified user, expire after 90 days, and cannot target whole-change or summary findings. Repository data is deleted after 30 idle days |
-| Script injection | The UI renders text nodes only, under a restrictive Content Security Policy |
-
-## Public demo
-
-`npm run deploy:public` allows anonymous use of real models. Browsers receive unguessable workspace names, visitors see a notice not to submit private code or secrets, and shared daily and per-visitor limits apply. Anyone given a workspace link can use that workspace.
+| Cost abuse | Connection, per-connection, per-conversation, shared per-minute, daily global and daily per-visitor limits apply. Speech costs five units. Questions are capped at 500 characters and audio at 30 seconds |
+| Duplicate spend | Request IDs are idempotent through Think's submission records |
+| Secret exposure | One redactor covers stored questions, prompts, live text, answers and speech |
+| Data retention | Think's transcript is cleared after each turn. Conversations are deleted after 30 idle days |
+| Script injection | All dynamic text is added as text nodes under a strict Content Security Policy, with no external scripts or fonts |
+| Optional private deployment | Cloudflare Access tokens are verified for signature, issuer, audience and time, and sockets close when a token expires |
 
 ## Remaining risks
 
-- People admitted by Access share all repositories. Add per-repository authorization before using this for separate teams.
-- AI Gateway logs contain redacted prompts. Pattern-based redaction can miss an unfamiliar secret format, so do not submit real credentials.
-- Guardrails is set to flag prompt injection. It does not enforce responses on streamed requests.
-- Set an AI Gateway spend limit. The daily application limit counts actions, while one action can call a primary and fallback model.
-- Access revocation takes effect on open sockets when the token expires, so keep Access sessions short.
-- Speech-to-text requests ask the gateway not to store audio payloads. Confirm this in gateway logs before handling sensitive audio.
+- A model can still misstate facts. The page says answers are AI-generated and should be verified.
+- Guards use patterns. An unusual phrasing can get past them and reach the model, which then has only sanitized facts. Harmless questions can occasionally get a fixed reply.
+- The full sanitized knowledge base is sent to AI Gateway and Workers AI each turn, and gateway logs may contain it. Review it as content you are willing to send there, and set log retention to suit.
+- Output masking covers money and phone formats only. Anything else in the knowledge base can appear in an answer, so remove it from the source if it must stay private.
+- The visitor key is an unsalted daily hash of an IP network. It limits spend and is not strong anonymity. Shared networks share a limit, and rotating addresses can get around it. The global limits still apply.
+- The conversation ID in `localStorage` is a bearer value for that conversation. Anyone with it can read that conversation.
+- Set an AI Gateway spend limit. Application limits count actions, and one action can call a primary and a fallback model.
+- Guardrails does not enforce responses on streamed requests.
+- Speech-to-text requests ask the gateway not to store audio payloads. Confirm this in gateway logs.
 
 ## Handling tokens
 
-The application needs no API token at runtime unless Nova-3 is enabled, which uses the optional `AI_GATEWAY_TOKEN` Worker secret. A separate token is used only to configure AI Gateway. Follow the PowerShell steps in the README, scope it to AI Gateway, set a short expiry, and revoke it after setup.
+The application needs no API token at runtime unless Nova-3 is enabled through the optional `AI_GATEWAY_TOKEN` Worker secret. A separate token is used only to configure AI Gateway. Scope it to AI Gateway, give it a short expiry, keep it out of files and command history, and revoke it after setup.

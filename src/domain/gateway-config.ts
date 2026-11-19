@@ -46,8 +46,8 @@ export const gatewayEnvironmentSchema = z.object({
 const READ_ONLY_FIELDS = ["id", "account_id", "account_tag", "internal_id", "created_at", "modified_at"];
 
 /**
- * Prompt injection (P1) is flagged, not blocked. This app reviews hostile diffs
- * on purpose, and blocking them would remove commentary where it helps most.
+ * Prompt injection (P1) is flagged, not blocked. Topic guards answer obvious attempts
+ * before any model call, and a false block here would fail an ordinary visitor question.
  * The update API replaces settings, so anything already configured is carried over.
  * Log collection is always forced on. Existing guardrail choices win, including one for P1.
  *

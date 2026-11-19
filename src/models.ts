@@ -1,6 +1,5 @@
 /*
- * Single list of model IDs. Primary and secondary roles are applied in `llm.ts` and `speech.ts`,
- * and `CodexGuardAgent` shows this list in the UI.
+ * Single list of model IDs. Primary and secondary roles are applied in `llm.ts` and `speech.ts`.
  */
 /** Every model the app calls. Each one is routed through AI Gateway. */
 export const MODELS = {

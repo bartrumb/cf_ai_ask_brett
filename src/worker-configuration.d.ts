@@ -11,13 +11,12 @@ interface __BaseEnv_Env {
 	ALLOW_UNAUTHENTICATED_AI: string;
 	DAILY_AI_ACTION_LIMIT: string;
 	DAILY_CLIENT_AI_ACTION_LIMIT: string;
-	CodexGuardAgent: DurableObjectNamespace<import("./index").CodexGuardAgent>;
-	REVIEW_WORKFLOW: Workflow<Parameters<import("./index").ReviewWorkflow['run']>[0]['payload']>;
+	ShowcaseAgent: DurableObjectNamespace<import("./index").ShowcaseAgent>;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
 		mainModule: typeof import("./index");
-		durableNamespaces: "CodexGuardAgent";
+		durableNamespaces: "ShowcaseAgent";
 	}
 	interface Env extends __BaseEnv_Env {}
 }

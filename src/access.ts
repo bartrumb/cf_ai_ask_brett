@@ -12,11 +12,9 @@ const KEY_FAILURE_CACHE_MS = 30 * 1000;
 const KEY_REFRESH_MIN_AGE_MS = 60 * 1000;
 
 /** Set by the Worker for the agent. Client-supplied values are always removed first. */
-export const ACCESS_EXPIRES_HEADER = "x-codex-guard-access-expires";
-/** Carries the verified Access email to the agent. */
-export const ACCESS_EMAIL_HEADER = "x-codex-guard-access-email";
+export const ACCESS_EXPIRES_HEADER = "x-ask-brett-access-expires";
 /** Carries the Worker's hashed daily visitor key to the agent. */
-export const CLIENT_KEY_HEADER = "x-codex-guard-client";
+export const CLIENT_KEY_HEADER = "x-ask-brett-client";
 
 const jwtHeaderSchema = z.object({ alg: z.literal("RS256"), kid: z.string().min(1).max(200) });
 const jwtPayloadSchema = z.object({

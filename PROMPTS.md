@@ -223,3 +223,23 @@ Listen
 ````
 
 **Produced:** display fixes, private public-demo workspaces, visitor and daily AI limits, and a deployment.
+
+---
+
+## Prompt 9
+
+````text
+I think we must have made a a wrong turn some where. I don't need a codex-guard-agent chat I need the UI and prompts config to showcase me. See if there are any error traces in cloudflare observability for this project.
+````
+
+**Produced:** a telemetry access check. The Cloudflare observability connector needs authorization, so no traces were read.
+
+---
+
+## Prompt 10
+
+````text
+Yes, convert it
+````
+
+**Produced:** conversion of the application into a public AI showcase site.

@@ -1,6 +1,5 @@
 /*
- * AI SDK model used for Think question turns in offline mode. Review commentary has its own offline
- * path in `llm.ts`.
+ * AI SDK model used for Think turns in offline mode.
  */
 import type { LanguageModelV4, LanguageModelV4StreamPart } from "@ai-sdk/provider";
 
@@ -20,7 +19,7 @@ const FINISH = { unified: "stop" as const, raw: "stop" };
 export function createOfflineModel(text: string): LanguageModelV4 {
   return {
     specificationVersion: "v4",
-    provider: "codex-guard-offline",
+    provider: "ask-brett-offline",
     modelId: "offline-template",
     supportedUrls: {},
     doGenerate: async () => ({

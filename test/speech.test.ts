@@ -1,15 +1,14 @@
 import { Buffer } from "node:buffer";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildSpokenReview, decodeWav, MAX_SPOKEN_CHARS, toSpokenText } from "../src/domain/audio";
+import { decodeWav, MAX_SPOKEN_CHARS, toSpokenText } from "../src/domain/audio";
 import { applyGateway, desiredGateway } from "../src/domain/gateway-config";
 import { MAX_AUDIO_BYTES, parseInput, transcribeSchema } from "../src/domain/schemas";
-import { evaluateChange } from "../src/domain/rules";
-import { gatewayMetadata, isGuardrailBlock } from "../src/gateway";
+import { gatewayMetadata } from "../src/gateway";
 import { MODELS } from "../src/models";
 import { synthesizeSpeech, transcribeAudio } from "../src/speech";
-import { allStandards, FAKE_SECRET, OPEN_INGRESS, parsed, wavBase64 } from "./fixtures";
+import { FAKE_SECRET, wavBase64 } from "./fixtures";
 
-const context = { repository: "sample-repo", feature: "speech" } as const;
+const context = { conversation: "sample-conversation", feature: "speech" } as const;
 
 interface Call {
   model: string;
@@ -121,25 +120,20 @@ describe("audio input", () => {
 });
 
 describe("spoken text", () => {
-  const result = evaluateChange(parsed(OPEN_INGRESS), { standards: allStandards(), exceptions: [] });
-
-  it("takes the verdict from the rule result, not the commentary", () => {
-    const spoken = buildSpokenReview(result, "### F1 · STD-SEC-02\nThe risk is low.");
-    expect(spoken.startsWith("Rule engine result: high risk, with 1 open finding.")).toBe(true);
-    expect(spoken).toContain("Finding F1, standard STD-SEC-02.");
-  });
-
-  it("removes code, redacts secrets and caps length", () => {
-    const spoken = toSpokenText(`token = "${FAKE_SECRET}"\n\`\`\`\ncode\n\`\`\`\n${"Sentence one. ".repeat(300)}`);
+  it("removes markup, masks private values and caps length", () => {
+    const spoken = toSpokenText('**Result** `code` token = "' + FAKE_SECRET + '" saved $40K\n' + "Sentence one. ".repeat(300));
     expect(spoken).not.toContain(FAKE_SECRET);
-    expect(spoken).not.toContain("```");
+    expect(spoken).not.toContain("$40K");
+    expect(spoken).not.toMatch(/[*`]/);
     expect(spoken.length).toBeLessThanOrEqual(MAX_SPOKEN_CHARS);
   });
 });
 
 describe("gateway configuration", () => {
-  it("keeps metadata within the gateway's five-entry limit", () => {
-    expect(Object.keys(gatewayMetadata({ repository: "r", feature: "review", reviewId: "1" }))).toHaveLength(5);
+  it("labels requests for this app within the gateway's five-entry limit", () => {
+    const metadata = gatewayMetadata({ conversation: "c", feature: "question" });
+    expect(metadata.app).toBe("ask-brett");
+    expect(Object.keys(metadata).length).toBeLessThanOrEqual(5);
   });
 
   it("flags prompt injection and keeps logs on for a new gateway", () => {
@@ -185,7 +179,7 @@ describe("gateway configuration", () => {
       const bodies: string[] = [];
       const fetcher = (async (_url: string, init?: RequestInit) => {
         if (init?.body) bodies.push(String(init.body));
-        return reply(200, { success: true, result: { id: "codex-guard", cache_ttl: 9 } });
+        return reply(200, { success: true, result: { id: "existing", cache_ttl: 9 } });
       }) as unknown as typeof fetch;
       await expect(applyGateway(environment, fetcher)).resolves.toBe("updated");
       expect(JSON.parse(bodies[0] ?? "{}")).toMatchObject({ cache_ttl: 9, guardrails: { prompt: { P1: "FLAG" } } });
@@ -207,8 +201,4 @@ describe("gateway configuration", () => {
     });
   });
 
-  it("recognizes Guardrails block errors", () => {
-    expect(isGuardrailBlock(new Error("2016: Prompt blocked due to security configurations"))).toBe(true);
-    expect(isGuardrailBlock(new Error("Model unavailable"))).toBe(false);
-  });
 });

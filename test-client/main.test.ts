@@ -1,17 +1,16 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import html from "../public/index.html?raw";
-import type { GuardState, ReviewRecord, RuleResult, Snapshot } from "../src/domain/types";
+import site from "../content/site.example.json";
+import type { ChatMessage, ShowcaseState, Snapshot } from "../src/domain/types";
 
 interface FakeClient extends EventTarget {
-  options: { name: string; onStateUpdate: (state: GuardState) => void };
+  options: { agent: string; name: string; onStateUpdate: (state: ShowcaseState) => void };
   call: ReturnType<typeof vi.fn>;
-  close: ReturnType<typeof vi.fn>;
 }
 
 const mocks = vi.hoisted(() => ({
   clients: [] as unknown[],
   respond: (_method: string, _args: unknown[]): unknown => undefined,
-  recording: { stop: () => {}, result: Promise.resolve("audio") },
   startRecording: vi.fn(),
   playAudio: vi.fn(),
   stopPlayback: vi.fn(),
@@ -27,284 +26,271 @@ vi.mock("agents/client", () => ({
     }
   },
 }));
+vi.mock("../client/voice", () => ({ startRecording: mocks.startRecording, playAudio: mocks.playAudio, stopPlayback: mocks.stopPlayback }));
 
-vi.mock("../client/voice", () => ({
-  startRecording: mocks.startRecording,
-  playAudio: mocks.playAudio,
-  stopPlayback: mocks.stopPlayback,
-}));
-
-const REVIEW_ID = "11111111-1111-4111-8111-111111111111";
-const result: RuleResult = {
-  kind: "diff",
-  risk: "high",
-  riskBeforeExceptions: "high",
-  applicableStandards: ["STD-SEC-02"],
-  stats: { files: 1, additions: 1, deletions: 0 },
-  notes: ["A rule note"],
-  findings: [
-    { id: "F1", standardId: "STD-SEC-02", standardTitle: "No open ingress", severity: "high", path: "infra/n.tf", line: 3, evidence: "<img src=x onerror=alert(1)>", occurrences: 2, waivable: true, status: "open", exceptionId: null },
-    { id: "F2", standardId: "STD-SEC-01", standardTitle: "No credentials", severity: "critical", path: "a.yml", line: null, evidence: "", occurrences: 1, waivable: false, status: "open", exceptionId: null },
-    { id: "F3", standardId: "STD-OBS-01", standardTitle: "No debug", severity: "low", path: "b.ts", line: 1, evidence: "x", occurrences: 1, waivable: true, status: "excepted", exceptionId: "e1" },
-  ],
-};
-const review: ReviewRecord = {
-  id: REVIEW_ID, createdAt: 1, status: "complete", title: "infra/n.tf", result,
-  commentary: "### F1 · STD-SEC-02\nWhy it matters: Open.\nSuggested fix: Close it.\n```\ncode\n```\nPlain line",
-  commentarySource: "workers-ai", commentaryModel: "@cf/test/model", commentaryWarnings: ["Check this"], error: null,
-};
-const snapshot = (): Snapshot => ({
-  repository: "repo",
-  routing: { offline: false, gatewayId: "gw", models: [{ label: "Language model", primary: "@cf/a", secondary: "@cf/b" }] },
-  standards: [
-    { id: "STD-SEC-02", title: "No open ingress", summary: "s", guidance: "g", severity: "high", waivable: true, enabled: true },
-    { id: "STD-SEC-01", title: "No credentials", summary: "s", guidance: "g", severity: "critical", waivable: false, enabled: true },
-  ],
-  exceptions: [{ id: "e1", standardId: "STD-OBS-01", path: "b.ts", reason: "Approved reason", reviewId: REVIEW_ID, createdAt: 1 }],
-  reviews: [review, { ...review, id: "pending", status: "running", title: "running", result: null, commentary: "", commentarySource: null, commentaryWarnings: [] }, { ...review, id: "failed", status: "failed", title: "failed", result: null, error: "It failed" }],
-  messages: [
-    { id: 1, role: "user", kind: "review", text: "diff", reviewId: REVIEW_ID, source: null, model: null, createdAt: 1 },
-    { id: 2, role: "user", kind: "review", text: "running", reviewId: "pending", source: null, model: null, createdAt: 1 },
-    { id: 3, role: "user", kind: "review", text: "failed", reviewId: "failed", source: null, model: null, createdAt: 1 },
-    { id: 4, role: "user", kind: "text", text: "Question?", reviewId: null, source: null, model: null, createdAt: 2 },
-    { id: 5, role: "assistant", kind: "text", text: "Answer **bold** and `code`", reviewId: null, source: "offline", model: null, createdAt: 3 },
-  ],
-});
-
+const HOSTILE = '<img src=x onerror="alert(1)"> **bold** and `code`';
 const byId = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const flush = async () => { for (let index = 0; index < 8; index += 1) await Promise.resolve(); await new Promise((resolve) => setTimeout(resolve, 0)); };
-const latest = () => mocks.clients.at(-1) as FakeClient;
-const emit = (data: unknown) => latest().dispatchEvent(Object.assign(new Event("message"), { data: typeof data === "string" ? data : JSON.stringify(data) }));
+const client = () => mocks.clients.at(-1) as FakeClient;
+const callsTo = (method: string) => client().call.mock.calls.filter(([name]) => name === method);
+const emit = (data: unknown) => client().dispatchEvent(Object.assign(new Event("message"), { data: typeof data === "string" ? data : JSON.stringify(data) }));
 const setInput = (value: string) => {
-  const input = byId<HTMLTextAreaElement>("change-input");
+  const input = byId<HTMLTextAreaElement>("question");
   input.value = value;
   input.dispatchEvent(new Event("input"));
 };
-const idle: GuardState = { revision: 1, active: null, activeQuestion: null };
+const submit = async () => { byId("ask-form").dispatchEvent(new Event("submit", { cancelable: true })); await flush(); };
+const notice = () => byId("notice").textContent;
 let responses: Record<string, unknown>;
+let messages: ChatMessage[];
+let revision = 10;
+let offline = false;
+const publish = async (activeQuestion: ShowcaseState["activeQuestion"] = null) => {
+  revision += 1;
+  client().options.onStateUpdate({ revision, activeQuestion });
+  await flush();
+};
+const answer = (id: number, source: ChatMessage["source"] = "workers-ai", text = HOSTILE): ChatMessage => ({ id, role: "assistant", text, source, createdAt: 1 });
 
 beforeAll(async () => {
   document.documentElement.innerHTML = html.replace(/<script[\s\S]*?<\/script>|<link[^>]*>/g, "");
-  HTMLDialogElement.prototype.showModal ??= function (this: HTMLDialogElement) { this.setAttribute("open", ""); };
-  HTMLDialogElement.prototype.close ??= function (this: HTMLDialogElement) { this.removeAttribute("open"); };
-  Element.prototype.scrollIntoView ??= () => {};
-  mocks.respond = (method) => (method === "getSnapshot" ? snapshot() : responses[method]);
-  history.replaceState(null, "", "/?repo=Sample%20Repo");
+  const stored = new Map<string, string>([["ask-brett-conversation", "not-valid"]]);
+  vi.stubGlobal("localStorage", { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => void stored.set(key, value) });
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json(site)));
+  mocks.respond = (method) => {
+    if (method === "getSnapshot") return { offline, messages } satisfies Snapshot;
+    const value = responses[method];
+    if (value instanceof Error) throw value;
+    return value;
+  };
+  messages = [];
+  responses = {};
   await import("../client/main");
+  await flush();
+  client().dispatchEvent(new Event("open"));
+  await flush();
 });
 
 beforeEach(async () => {
   responses = {};
+  messages = [];
+  offline = false;
   mocks.startRecording.mockReset();
   mocks.playAudio.mockReset();
-  byId("repo-input");
+  client().call.mockClear();
   setInput("");
-  byId<HTMLInputElement>("repo-input").value = "repo";
-  byId<HTMLFormElement>("repo-form").dispatchEvent(new Event("submit", { cancelable: true }));
-  latest().dispatchEvent(new Event("open"));
-  latest().options.onStateUpdate(idle);
-  await flush();
+  await publish();
+  byId("notice").hidden = true;
+  byId("notice").textContent = "";
 });
 
-describe("chat page", () => {
-  it("normalizes the repository name and shows a connected state", () => {
-    expect((mocks.clients[0] as FakeClient).options.name).toBe("sample-repo");
-    expect(byId("connection").textContent).toBe("Connected");
-    latest().dispatchEvent(new Event("close"));
-    expect(byId("connection").textContent).toBe("Reconnecting");
+describe("profile", () => {
+  it("renders site content as text with no repository or admin controls", () => {
+    expect(byId("name").textContent).toBe(site.name);
+    expect(document.title).toBe("Ask about Avery");
+    expect(byId("stats").querySelectorAll("div")).toHaveLength(4);
+    expect(byId("proof-list").children).toHaveLength(site.proof.length);
+    expect(byId("project-list").children).toHaveLength(site.projects.length);
+    expect(byId("skill-list").children).toHaveLength(site.skills.length);
+    expect(byId("suggestions").querySelectorAll("button")).toHaveLength(8);
+    expect(byId<HTMLAnchorElement>("contact-email").href).toBe(`mailto:${site.links.email}`);
+    expect(document.body.textContent).not.toMatch(/repository|gateway|workers ai|standards/i);
   });
 
-  it("renders rule results and commentary separately, with submitted text inert", () => {
-    expect(document.querySelector(".panel.rules .risk")?.textContent).toBe("high risk");
-    expect(document.querySelector(".panel.ai")?.textContent).toContain("via AI Gateway gw");
-    expect(document.querySelector(".evidence")?.textContent).toContain("<img");
-    expect(document.querySelector(".evidence img")).toBeNull();
-    expect(document.querySelector(".bubble.assistant strong")?.textContent).toBe("bold");
-    expect(document.querySelector(".bubble.assistant .commentary code")?.textContent).toBe("code");
-    expect(document.querySelector(".commentary pre")?.textContent).toContain("code");
-    expect(document.body.textContent).toContain("Cannot be waived");
-    expect(document.body.textContent).toContain("Exception applied: Approved reason");
-    expect(document.body.textContent).toContain("It failed");
-    expect(byId("routing").textContent).toContain("All calls use AI Gateway: gw");
+  it("uses a new private conversation ID when the stored one is invalid", () => {
+    expect(client().options.agent).toBe("ShowcaseAgent");
+    expect(client().options.name).toMatch(/^[a-f0-9]{32}$/);
+    expect(localStorage.getItem("ask-brett-conversation")).toBe(client().options.name);
   });
 
-  it("submits a review with an idempotent request ID", async () => {
-    responses.startReview = { ok: true, reviewId: REVIEW_ID };
-    (document.querySelector(".chip") as HTMLButtonElement).click();
-    byId("review-button").click();
-    await flush();
-    const [, args] = latest().call.mock.calls.find(([method]) => method === "startReview") as [string, [{ text: string; requestId: string }]];
-    expect(args[0].text).toContain("infra/network.tf");
-    expect(args[0].requestId).toMatch(/^[0-9a-f-]{36}$/);
-    expect(byId<HTMLTextAreaElement>("change-input").value).toBe("");
+  it("switches and remembers the theme", () => {
+    const start = document.documentElement.dataset.theme;
+    byId("theme-toggle").click();
+    expect(document.documentElement.dataset.theme).not.toBe(start);
+    expect(localStorage.getItem("ask-brett-theme")).toBe(document.documentElement.dataset.theme);
+    byId("theme-toggle").click();
+    expect(document.documentElement.dataset.theme).toBe(start);
+  });
+});
+
+describe("conversation", () => {
+  it("renders hostile answer text without creating markup", async () => {
+    messages = [{ id: 1, role: "user", text: HOSTILE, source: null, createdAt: 1 }, answer(2)];
+    await publish();
+    const log = byId("conversation");
+    expect(log.querySelector("img")).toBeNull();
+    expect(log.querySelector("strong")?.textContent).toBe("bold");
+    expect(log.querySelector("code")?.textContent).toBe("code");
+    expect(log.querySelector(".message.user")?.textContent).toBe(HOSTILE);
+    expect(log.textContent).toContain("AI-generated");
   });
 
-  it("shows server errors and blocks oversized input", async () => {
-    responses.startReview = { ok: false, error: "Malformed diff" };
-    setInput("change");
-    byId("change-input").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true }));
-    await flush();
-    expect(byId("notice").textContent).toBe("Malformed diff");
-    setInput("x".repeat(40_001));
-    expect(byId<HTMLButtonElement>("review-button").disabled).toBe(true);
-    expect(byId("char-count").classList.contains("over")).toBe(true);
+  it("labels offline, fixed and failed answers", async () => {
+    offline = true;
+    messages = [answer(1, "offline"), answer(2, "guarded"), answer(3, "unavailable")];
+    await publish();
+    const text = byId("conversation").textContent;
+    expect(text).toContain("Offline preview");
+    expect(text).toContain("Standard reply");
+    expect(text).toContain("Not answered");
+    expect(byId("conversation").querySelectorAll(".listen")).toHaveLength(2);
+    expect(byId("disclaimer").textContent).toContain("no AI model");
   });
 
-  it("reports failed calls", async () => {
-    latest().call.mockRejectedValueOnce(new Error("Socket closed"));
-    setInput("change");
-    byId("review-button").click();
-    await flush();
-    expect(byId("notice").textContent).toBe("Socket closed");
+  it("sends a question, clears the composer and sends an ID", async () => {
+    responses.ask = { ok: true, submissionId: "s", accepted: true };
+    setInput("  What was built?  ");
+    expect(byId<HTMLButtonElement>("send").disabled).toBe(false);
+    await submit();
+    const [, [payload]] = callsTo("ask")[0] as [string, [{ question: string; requestId: string }]];
+    expect(payload.question).toBe("What was built?");
+    expect(payload.requestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(byId<HTMLTextAreaElement>("question").value).toBe("");
   });
 
-  it("shows live review progress and streamed commentary", async () => {
-    latest().options.onStateUpdate({ revision: 1, activeQuestion: null, active: { reviewId: "pending", steps: { intake: "complete", rules: "complete", commentary: "running", save: "pending" } } });
+  it("sends suggested questions and Enter, but not Shift+Enter", async () => {
+    responses.ask = { ok: true, submissionId: "s", accepted: true };
+    byId("suggestions").querySelector("button")?.click();
     await flush();
-    expect(document.querySelector(".step.running")?.textContent).toBe("AI commentary");
-    emit({ type: "commentary-reset", reviewId: "pending" });
-    emit({ type: "commentary-delta", reviewId: REVIEW_ID, delta: "Streaming" });
-    expect(document.querySelector(`[data-commentary="${REVIEW_ID}"]`)?.textContent).toBe("Streaming");
-    emit("not json commentary-delta");
-    emit('{"type":"commentary-delta"');
+    expect((callsTo("ask")[0]?.[1] as [{ question: string }])[0].question).toBe(site.questions[0]);
+    setInput("Line");
+    byId("question").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", shiftKey: true }));
+    await flush();
+    expect(callsTo("ask")).toHaveLength(1);
+    byId("question").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", cancelable: true }));
+    await flush();
+    expect(callsTo("ask")).toHaveLength(2);
   });
 
-  it("submits durable questions and shows the streaming answer", async () => {
-    responses.ask = { ok: true, submissionId: "s1", accepted: true };
-    setInput("  What is open?  ");
-    byId("ask-button").click();
-    await flush();
-    const [, args] = latest().call.mock.calls.find(([method]) => method === "ask") as [string, [{ question: string }]];
-    expect(args[0].question).toBe("What is open?");
-    latest().options.onStateUpdate({ ...idle, revision: 2, activeQuestion: { submissionId: "s1" } });
-    await flush();
-    expect(byId("pending-answer").textContent).toContain("Thinking");
+  it("shows server errors and keeps the question", async () => {
+    responses.ask = { ok: false, error: "Limit reached." };
+    setInput("Keep me");
+    await submit();
+    expect(notice()).toBe("Limit reached.");
+    expect(byId<HTMLTextAreaElement>("question").value).toBe("Keep me");
+  });
+
+  it("reuses the request ID when retrying after a dropped connection", async () => {
+    responses.ask = new Error("socket closed");
+    setInput("Retry me");
+    await submit();
+    expect(notice()).toContain("connection dropped");
+    responses.ask = { ok: true, submissionId: "s", accepted: false };
+    await submit();
+    const ids = callsTo("ask").map(([, args]) => (args as [{ requestId: string }])[0].requestId);
+    expect(ids[0]).toBe(ids[1]);
+  });
+
+  it("shows loading, streams safely, ignores other frames and blocks a second question", async () => {
+    await publish({ submissionId: "s" });
+    expect(byId("conversation").querySelector(".thinking")).not.toBeNull();
+    expect(byId<HTMLButtonElement>("send").textContent).toBe("Answering");
+    setInput("Another");
+    await submit();
+    expect(callsTo("ask")).toHaveLength(0);
+    emit({ type: "answer-delta", delta: "Hello <b>there</b> **now**" });
+    emit("{not json answer-delta");
+    emit({ type: "other", text: "answer-delta" });
+    expect(byId("pending-answer").querySelector("b")).toBeNull();
+    expect(byId("pending-answer").querySelector("strong")?.textContent).toBe("now");
     emit({ type: "answer-reset" });
-    emit({ type: "answer-delta", delta: "Two findings" });
-    expect(byId("pending-answer").textContent).toContain("Two findings");
-    expect(byId<HTMLButtonElement>("review-button").disabled).toBe(true);
+    client().options.onStateUpdate({ revision, activeQuestion: { submissionId: "s" } });
+    expect(byId("pending-answer").textContent).toContain("Thinking");
   });
 
-  it("shows question errors", async () => {
-    responses.ask = { ok: false, error: "Busy" };
-    setInput("Question");
-    byId("ask-button").click();
+  it("disables asking while disconnected and recovers on reconnect", async () => {
+    setInput("Hello");
+    client().dispatchEvent(new Event("close"));
+    expect(byId("connection").textContent).toBe("Reconnecting");
+    expect(byId<HTMLButtonElement>("send").disabled).toBe(true);
+    client().dispatchEvent(new Event("open"));
     await flush();
-    expect(byId("notice").textContent).toBe("Busy");
-    latest().call.mockRejectedValueOnce("offline");
-    setInput("Question");
-    byId("ask-button").click();
-    await flush();
-    expect(byId("notice").textContent).toBe("Something went wrong.");
+    expect(byId<HTMLButtonElement>("send").disabled).toBe(false);
   });
 
-  it("records an exception through the dialog", async () => {
-    responses.acceptException = { ok: false, error: "Too short" };
-    (document.querySelector(".finding-action .link-button") as HTMLButtonElement).click();
-    expect(byId("exception-target").textContent).toBe("STD-SEC-02 on infra/n.tf");
-    byId<HTMLTextAreaElement>("exception-reason").value = "short";
-    byId("exception-form").dispatchEvent(new Event("submit", { cancelable: true }));
-    await flush();
-    expect(byId("exception-error").textContent).toBe("Too short");
-    latest().call.mockRejectedValueOnce(new Error("Lost connection"));
-    byId("exception-form").dispatchEvent(new Event("submit", { cancelable: true }));
-    await flush();
-    expect(byId("exception-error").textContent).toBe("Lost connection");
-    responses.acceptException = { ok: true };
-    byId("exception-form").dispatchEvent(new Event("submit", { cancelable: true }));
-    await flush();
-    expect(byId<HTMLDialogElement>("exception-dialog").hasAttribute("open")).toBe(false);
-    byId("exception-cancel").click();
-  });
-
-  it("updates standards and exceptions and navigates history", async () => {
-    responses.setStandardEnabled = { ok: false, error: "Mandatory" };
-    responses.revokeException = { ok: true };
-    const checkbox = document.querySelector<HTMLInputElement>(".standard input") as HTMLInputElement;
-    checkbox.checked = false;
-    checkbox.dispatchEvent(new Event("change"));
-    await flush();
-    expect(byId("notice").textContent).toBe("Mandatory");
-    (document.querySelector(".exception .link-button") as HTMLButtonElement).click();
-    await flush();
-    expect(latest().call).toHaveBeenCalledWith("revokeException", [{ id: "e1" }]);
-    latest().call.mockRejectedValueOnce(new Error("Failed action"));
-    (document.querySelector(".exception .link-button") as HTMLButtonElement).click();
-    await flush();
-    expect(byId("notice").textContent).toBe("Failed action");
-    (document.querySelector(".history-item") as HTMLButtonElement).click();
-  });
-
-  it("refetches on a new revision and rejects an empty repository name", async () => {
-    const calls = latest().call.mock.calls.length;
-    latest().options.onStateUpdate({ ...idle, revision: 5 });
-    await flush();
-    expect(latest().call.mock.calls.length).toBeGreaterThan(calls);
-    byId<HTMLInputElement>("repo-input").value = "///";
-    byId("repo-form").dispatchEvent(new Event("submit", { cancelable: true }));
-    expect(byId("notice").textContent).toContain("Enter a repository name");
+  it("reports snapshot failures", async () => {
+    const original = mocks.respond;
+    mocks.respond = () => { throw new Error("internal detail"); };
+    await publish();
+    mocks.respond = original;
+    expect(notice()).toBe("Something went wrong. Please try again.");
   });
 });
 
-describe("voice controls", () => {
-  it("adds a transcript to the composer", async () => {
-    responses.transcribe = { ok: true, text: "Spoken change", source: "offline" };
-    let finish: (value: string) => void = () => {};
-    const stop = vi.fn(() => finish("audio"));
-    mocks.startRecording.mockResolvedValue({ stop, result: new Promise<string>((resolve) => { finish = resolve; }) });
-    setInput("Typed");
-    byId("mic-button").click();
+describe("voice", () => {
+  const recordingWith = (audio = "AAAA") => ({ stop: vi.fn(), result: Promise.resolve(audio) });
+
+  it("places a transcript in the composer for checking", async () => {
+    mocks.startRecording.mockResolvedValue(recordingWith());
+    responses.transcribe = { ok: true, text: "Spoken words", source: "offline" };
+    setInput("Start");
+    byId("mic").click();
     await flush();
-    expect(byId("mic-button").textContent).toBe("Stop recording");
-    byId("mic-button").click();
+    expect(byId<HTMLTextAreaElement>("question").value).toBe("Start Spoken words");
+    expect(notice()).toContain("sample transcript");
+    expect(callsTo("ask")).toHaveLength(0);
+  });
+
+  it("stops an active recording on the second press", async () => {
+    let finish = (_value: string) => {};
+    const recording = { stop: vi.fn(() => finish("AAAA")), result: new Promise<string>((resolve) => { finish = resolve; }) };
+    mocks.startRecording.mockResolvedValue(recording);
+    responses.transcribe = { ok: true, text: "", source: "workers-ai" };
+    byId("mic").click();
     await flush();
-    expect(stop).toHaveBeenCalled();
-    expect(byId<HTMLTextAreaElement>("change-input").value).toBe("Typed\nSpoken change");
-    expect(byId("notice").textContent).toContain("sample transcript");
+    expect(byId("mic").getAttribute("aria-pressed")).toBe("true");
+    byId("mic").click();
+    await flush();
+    expect(recording.stop).toHaveBeenCalled();
+    expect(notice()).toBe("No speech was detected.");
   });
 
   it.each([
-    [{ ok: false, error: "Limit reached" }, "Limit reached"],
-    [{ ok: true, text: "", source: "workers-ai" }, "No speech was detected."],
-  ])("handles transcription result %#", async (response, message) => {
-    responses.transcribe = response;
-    mocks.startRecording.mockResolvedValue({ stop: () => {}, result: Promise.resolve("audio") });
-    byId("mic-button").click();
+    ["blocked microphones", () => mocks.startRecording.mockRejectedValue(new DOMException("no", "NotAllowedError")), "Microphone access was blocked."],
+    ["recording failures", () => mocks.startRecording.mockRejectedValue(new Error("x")), "The recording could not be processed."],
+    ["server errors", () => { mocks.startRecording.mockResolvedValue(recordingWith()); responses.transcribe = { ok: false, error: "Unavailable." }; }, "Unavailable."],
+  ])("reports %s", async (_name, arrange, expected) => {
+    arrange();
+    byId("mic").click();
     await flush();
-    expect(byId("notice").textContent).toBe(message);
+    expect(notice()).toBe(expected);
   });
 
-  it("explains microphone failures", async () => {
-    mocks.startRecording.mockRejectedValueOnce(new DOMException("no", "NotAllowedError"));
-    byId("mic-button").click();
+  const listen = async () => {
+    messages = [answer(7)];
+    await publish();
+    (byId("conversation").querySelector(".listen") as HTMLElement).click();
     await flush();
-    expect(byId("notice").textContent).toBe("Microphone access was blocked.");
-    mocks.startRecording.mockRejectedValueOnce(new Error("bad"));
-    byId("mic-button").click();
+  };
+
+  it("plays a stored answer and can stop it", async () => {
+    responses.speak = { ok: true, audio: "AAAA", mimeType: "audio/wav", source: "offline" };
+    mocks.playAudio.mockResolvedValue(undefined);
+    await listen();
+    expect(callsTo("speak")[0]?.[1]).toEqual([{ messageId: 7 }]);
+    expect(notice()).toContain("test tone");
+    const button = () => byId("conversation").querySelector(".listen") as HTMLElement;
+    expect(button().textContent).toBe("Stop");
+    button().click();
     await flush();
-    expect(byId("notice").textContent).toBe("The recording could not be processed.");
+    expect(mocks.stopPlayback).toHaveBeenCalled();
+    expect(button().textContent).toBe("Listen");
   });
 
-  it("plays stored content and can stop it", async () => {
-    responses.speak = { ok: true, audio: "AAAA", mimeType: "audio/mpeg", source: "offline" };
-    let ended: () => void = () => {};
-    mocks.playAudio.mockImplementation(async (_audio: string, _type: string, onEnd: () => void) => { ended = onEnd; });
-    (document.querySelector(".panel.ai .listen") as HTMLButtonElement).click();
-    await flush();
-    expect(latest().call).toHaveBeenCalledWith("speak", [{ kind: "review", id: REVIEW_ID }]);
-    expect(byId("notice").textContent).toContain("test tone");
-    expect(document.querySelector(".panel.ai .listen")?.textContent).toBe("Stop");
-    (document.querySelector(".panel.ai .listen") as HTMLButtonElement).click();
-    await flush();
-    expect(document.querySelector(".panel.ai .listen")?.textContent).toBe("Listen");
-    ended();
+  it("resets when playback ends", async () => {
+    responses.speak = { ok: true, audio: "AAAA", mimeType: "audio/mpeg", source: "workers-ai" };
+    mocks.playAudio.mockImplementation(async (_audio: string, _type: string, onEnd: () => void) => onEnd());
+    await listen();
+    expect(byId("conversation").querySelector(".listen")?.textContent).toBe("Listen");
   });
 
-  it("shows speech failures", async () => {
-    responses.speak = { ok: false, error: "No speech" };
-    (document.querySelector(".bubble.assistant .listen") as HTMLButtonElement).click();
-    await flush();
-    expect(byId("notice").textContent).toBe("No speech");
-    expect(mocks.playAudio).not.toHaveBeenCalled();
+  it("reports speech errors and playback failures", async () => {
+    responses.speak = { ok: false, error: "Speech is unavailable right now." };
+    await listen();
+    expect(notice()).toBe("Speech is unavailable right now.");
+    responses.speak = { ok: true, audio: "AAAA", mimeType: "audio/mpeg", source: "workers-ai" };
+    mocks.playAudio.mockRejectedValue(new Error("blocked"));
+    await listen();
+    expect(notice()).toBe("Audio could not be played.");
   });
 });

@@ -8,3 +8,9 @@ public/app.js
 public/app.js.map
 coverage/
 *.log
+
+# Private profile content and everything generated from it
+content/knowledge-base.md
+content/site.json
+src/generated/
+public/site.json

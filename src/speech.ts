@@ -1,15 +1,15 @@
 /*
  * Speech-to-text and text-to-speech calls through AI Gateway, each with a fallback model and an
- * offline path. `CodexGuardAgent` handles validation, rate limits and redaction around these calls.
+ * offline path. `ShowcaseAgent` handles validation, rate limits and redaction around these calls.
  */
 import { Buffer } from "node:buffer";
-import type { CommentarySource } from "./domain/types";
+import type { AnswerSource } from "./domain/types";
 import { gatewayMetadata, gatewayOptions, type GatewayContext } from "./gateway";
 import { isOffline } from "./llm";
 import { MODELS } from "./models";
 
-/** Fixed transcript returned in offline mode. It triggers rules, so the voice flow can be tried. */
-export const OFFLINE_TRANSCRIPT = "Drop the legacy orders table and skip the integration tests in CI.";
+/** Fixed transcript returned in offline mode, so the voice flow can be tried for free. */
+export const OFFLINE_TRANSCRIPT = "What is the strongest proof of this work?";
 
 /** Time allowed for each speech model, so both attempts fit inside the browser's 30-second call limit. */
 const SPEECH_TIMEOUT_MS = 12_000;
@@ -17,7 +17,7 @@ const SPEECH_TIMEOUT_MS = 12_000;
 /** Bindings needed for speech calls. */
 type SpeechEnv = Pick<Env, "AI" | "AI_MODE" | "AI_GATEWAY_ID"> & { AI_GATEWAY_TOKEN?: string };
 /** Where a successful speech result came from. */
-type Source = Exclude<CommentarySource, "unavailable">;
+type Source = Extract<AnswerSource, "workers-ai" | "offline">;
 /** Loose signature for `env.AI.run`, which is called here with model-specific input shapes. */
 type RunModel = (model: string, input: unknown, options: unknown) => Promise<unknown>;
 

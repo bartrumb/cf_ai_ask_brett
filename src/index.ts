@@ -1,17 +1,16 @@
 /*
- * Worker entry point. It guards WebSocket access to the agent and exports the classes that
- * Wrangler binds. Static assets are served by the platform; only `/agents/*` reaches this code.
+ * Worker entry point. It guards WebSocket access to the agent and exports the Durable Object class.
+ * Static assets are served by the platform; only `/agents/*` reaches this code.
  */
 import { routeAgentRequest } from "agents";
-import { ACCESS_EMAIL_HEADER, ACCESS_EXPIRES_HEADER, CLIENT_KEY_HEADER, verifyAccessToken, type AccessIdentity } from "./access";
-import { repositoryNameSchema } from "./domain/schemas";
+import { ACCESS_EXPIRES_HEADER, CLIENT_KEY_HEADER, verifyAccessToken, type AccessIdentity } from "./access";
+import { conversationIdSchema } from "./domain/schemas";
 import { isOffline } from "./llm";
 
-export { CodexGuardAgent } from "./agent";
-export { ReviewWorkflow } from "./workflow";
+export { ShowcaseAgent } from "./agent";
 
-/** URL prefix for the one agent class. The remaining path is the repository name. */
-const AGENT_PREFIX = "/agents/codex-guard-agent/";
+/** URL prefix for the one agent class. The remaining path is the conversation ID. */
+const AGENT_PREFIX = "/agents/showcase-agent/";
 
 /**
  * Blocks cross-site WebSocket connections from browsers. Requests with no `Origin` are allowed
@@ -31,8 +30,8 @@ function hasAllowedOrigin(request: Request, url: URL): boolean {
 
 /**
  * Applies the access policy. A configured Access application is always enforced. Without one, only
- * offline mode or an explicit local override may connect, so a deployment that can spend money and
- * expose repository memory fails closed.
+ * offline mode or the deliberate public deployment may connect, so a misconfigured deployment that
+ * can spend money fails closed.
  */
 async function authorize(request: Request, env: Env): Promise<{ denied: Response } | { identity: AccessIdentity | null }> {
   if (env.ACCESS_TEAM_DOMAIN && env.ACCESS_AUD) {
@@ -44,9 +43,7 @@ async function authorize(request: Request, env: Env): Promise<{ denied: Response
   return { denied: new Response("Cloudflare Access is not configured", { status: 503 }) };
 }
 
-/**
- * Creates a non-reversible daily visitor key for spend limits. IPv6 clients are grouped by /64.
- */
+/** Creates a non-reversible daily visitor key for spend limits. IPv6 clients are grouped by /64. */
 async function clientKey(request: Request): Promise<string> {
   const address = request.headers.get("CF-Connecting-IP") ?? "local";
   const network = address.includes(":") ? address.split(":").slice(0, 4).join(":") : address;
@@ -62,11 +59,10 @@ async function clientKey(request: Request): Promise<string> {
 async function forwardRequest(request: Request, identity: AccessIdentity | null): Promise<Request> {
   const headers = new Headers(request.headers);
   for (const name of [...headers.keys()]) {
-    if (name === ACCESS_EXPIRES_HEADER || name === ACCESS_EMAIL_HEADER || name === CLIENT_KEY_HEADER || /^x-(?:cf-)?agents-/.test(name)) headers.delete(name);
+    if (name.startsWith("x-ask-brett-") || /^x-(?:cf-)?agents-/.test(name)) headers.delete(name);
   }
   headers.set(CLIENT_KEY_HEADER, await clientKey(request));
   if (identity) headers.set(ACCESS_EXPIRES_HEADER, String(identity.expiresAt));
-  if (identity?.email) headers.set(ACCESS_EMAIL_HEADER, identity.email);
   return new Request(request, { headers });
 }
 
@@ -79,9 +75,9 @@ export default {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/agents/")) return new Response("Not found", { status: 404 });
 
-    const repository = url.pathname.startsWith(AGENT_PREFIX) ? url.pathname.slice(AGENT_PREFIX.length) : "";
-    if (!repositoryNameSchema.safeParse(repository).success) {
-      return new Response("Invalid repository name", { status: 400 });
+    const conversation = url.pathname.startsWith(AGENT_PREFIX) ? url.pathname.slice(AGENT_PREFIX.length) : "";
+    if (!conversationIdSchema.safeParse(conversation).success) {
+      return new Response("Invalid conversation", { status: 400 });
     }
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("WebSocket required", { status: 426 });

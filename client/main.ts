@@ -1,57 +1,41 @@
 /*
- * Browser application: connects to one repository's agent, renders its snapshot and sends user
- * actions. The server validates everything, so limits checked here only improve feedback.
- *
- * Rendering is a full rebuild from `snapshot` and `guardState`. Streaming text is the exception: it
- * is patched into the existing DOM. Voice capture and playback live in `voice.ts`.
+ * Browser application: renders the public profile from `/site.json`, connects this browser's private
+ * conversation and handles questions, voice and playback. The server validates everything, so limits
+ * here only improve feedback. All dynamic text is added as text nodes.
  */
 import { AgentClient } from "agents/client";
-import type {
-  ActionResult,
-  ChatMessage,
-  CommentarySource,
-  Finding,
-  GuardState,
-  LiveMessage,
-  ReviewRecord,
-  Snapshot,
-  StepName,
-  StepStatus,
-} from "../src/domain/types";
-import { SAMPLES } from "./samples";
+import type { SiteContent } from "../src/domain/content";
+import type { ActionResult, AnswerSource, ChatMessage, LiveMessage, ShowcaseState, Snapshot } from "../src/domain/types";
+import { renderRichText } from "./rich-text";
 import { playAudio, startRecording, stopPlayback, type Recording } from "./voice";
 
 /** Mirrors the server limit so the composer can warn before submitting. */
-const MAX_INPUT_CHARS = 40_000;
-/** Display order and text for review progress. */
-const STEP_LABELS: Record<StepName, string> = {
-  intake: "Input accepted",
-  rules: "Rules evaluated",
-  commentary: "AI commentary",
-  save: "Saved to memory",
+const MAX_QUESTION_CHARS = 500;
+/** localStorage key for this browser's conversation. */
+const CONVERSATION_KEY = "ask-brett-conversation";
+/** localStorage key for an explicit theme choice. */
+const THEME_KEY = "ask-brett-theme";
+/** Labels shown under answers. */
+const SOURCE_LABELS: Record<AnswerSource, string> = {
+  "workers-ai": "AI-generated",
+  offline: "Offline preview",
+  guarded: "Standard reply",
+  unavailable: "Not answered",
 };
 
 /** Values accepted as children by `h`. Falsy values render nothing. */
 type Child = Node | string | null | undefined | false;
-/** Attributes for `h`. Function values whose keys start with `on` become event listeners. */
+/** Attributes for `h`. Function values become listeners for the event named after `on`. */
 type Props = Record<string, string | boolean | EventListener | undefined>;
 
-/**
- * Creates an element. `true` sets an empty attribute; `false` and `undefined` omit it.
- *
- * @param tag - Element name.
- * @param props - Attributes and `onEvent` listeners.
- * @param children - Nodes or strings. Strings become text nodes.
- */
+/** Creates an element whose string children become text nodes. */
 function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Props = {}, ...children: Child[]): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
     if (value === undefined || value === false) continue;
     if (typeof value === "function") element.addEventListener(key.slice(2).toLowerCase(), value);
-    else if (value === true) element.setAttribute(key, "");
-    else element.setAttribute(key, value);
+    else element.setAttribute(key, value === true ? "" : value);
   }
-  // Text is always added as text nodes. Submitted content never becomes HTML.
   for (const child of children) if (child) element.append(child);
   return element;
 }
@@ -59,7 +43,7 @@ function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Props = {}, ...
 /**
  * Finds a required element.
  *
- * @throws Error when the element is missing.
+ * @throws Error when the page and this script do not match.
  */
 function byId<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
@@ -67,97 +51,64 @@ function byId<T extends HTMLElement>(id: string): T {
   return element as T;
 }
 
-/** Static page elements. Resolving them at load makes a page mismatch fail immediately. */
 const ui = {
-  timeline: byId<HTMLElement>("timeline"),
-  scroller: byId<HTMLElement>("chat-scroll"),
-  input: byId<HTMLTextAreaElement>("change-input"),
-  count: byId<HTMLElement>("char-count"),
-  samples: byId<HTMLElement>("samples"),
-  review: byId<HTMLButtonElement>("review-button"),
-  ask: byId<HTMLButtonElement>("ask-button"),
-  mic: byId<HTMLButtonElement>("mic-button"),
-  routing: byId<HTMLElement>("routing"),
-  notice: byId<HTMLElement>("notice"),
-  status: byId<HTMLElement>("connection"),
-  repoForm: byId<HTMLFormElement>("repo-form"),
-  repoInput: byId<HTMLInputElement>("repo-input"),
-  standards: byId<HTMLElement>("standards"),
-  standardCount: byId<HTMLElement>("standard-count"),
-  exceptions: byId<HTMLElement>("exceptions"),
-  exceptionCount: byId<HTMLElement>("exception-count"),
-  history: byId<HTMLElement>("history"),
-  historyCount: byId<HTMLElement>("history-count"),
-  dialog: byId<HTMLDialogElement>("exception-dialog"),
-  dialogForm: byId<HTMLFormElement>("exception-form"),
-  dialogTarget: byId<HTMLElement>("exception-target"),
-  dialogReason: byId<HTMLTextAreaElement>("exception-reason"),
-  dialogError: byId<HTMLElement>("exception-error"),
-  dialogCancel: byId<HTMLButtonElement>("exception-cancel"),
+  conversation: byId("conversation"),
+  notice: byId("notice"),
+  status: byId("connection"),
+  form: byId<HTMLFormElement>("ask-form"),
+  input: byId<HTMLTextAreaElement>("question"),
+  count: byId("count"),
+  mic: byId<HTMLButtonElement>("mic"),
+  send: byId<HTMLButtonElement>("send"),
+  suggestions: byId("suggestions"),
+  theme: byId<HTMLButtonElement>("theme-toggle"),
+  disclaimer: byId("disclaimer"),
 };
 
-/**
- * Current connection. Async work compares against this to discard results for an old repository.
- */
-let client: AgentClient<unknown, GuardState> | null = null;
-/** Latest stored data from `getSnapshot`. */
+let client: AgentClient<unknown, ShowcaseState> | null = null;
+let connected = false;
+let site: SiteContent | null = null;
 let snapshot: Snapshot | null = null;
-/** Latest synced progress state. */
-let guardState: GuardState | null = null;
-/** Revision of the last state that triggered a refetch. */
+let state: ShowcaseState | null = null;
 let seenRevision = -1;
-/** Streamed text of the question being answered. */
 let liveAnswer = "";
-/** True between sending a question and the server accepting it. */
-let submittingQuestion = false;
-/** Finding the exception dialog is editing. */
-let exceptionTarget: { reviewId: string; finding: Finding } | null = null;
-/** Active microphone capture. */
-let refreshInFlight = false;
+let submitting = false;
+let refreshing = false;
 let refreshQueued = false;
 let recording: Recording | null = null;
-/** True while a recording is being transcribed. */
 let transcribing = false;
-/** `kind:id` of the item being fetched or played as speech. */
-let speakingKey: string | null = null;
+/** Answer being fetched or played as speech. */
+let speakingId: number | null = null;
 let speechLoading = false;
-/** Streamed commentary by review ID, kept until the stored version arrives. */
-const liveCommentary = new Map<string, string>();
+/** A send whose outcome is unknown. Retrying the same text reuses its ID, so it is not charged twice. */
+let unconfirmed: { question: string; requestId: string } | null = null;
 
-/** Successful response from `speak`. */
-interface SpeechResult {
-  audio: string;
-  mimeType: string;
-  source: CommentarySource;
-}
-
-/** Successful response from `transcribe`. */
-interface TranscriptResult {
-  text: string;
-  source: CommentarySource;
-}
-
-/** Converts free text to a name accepted by `repositoryNameSchema`, or an empty string. */
-function toSlug(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 64);
-}
-
-/**
- * Chooses the first repository. Storage access can throw, for example under strict privacy settings.
- */
-function initialRepository(): string {
-  const fromUrl = toSlug(new URLSearchParams(location.search).get("repo") ?? "");
-  if (fromUrl) return fromUrl;
-  const random = crypto.getRandomValues(new Uint8Array(12));
-  const privateName = `demo-${[...random].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+/** Reads storage, which can throw under strict privacy settings. */
+function readStored(key: string): string | null {
   try {
-    const saved = toSlug(localStorage.getItem("codex-guard-repo") ?? "");
-    if (saved && saved !== "sample-payments-api") return saved;
-    localStorage.setItem("codex-guard-repo", privateName);
+    return localStorage.getItem(key);
   } catch {
-    // Without storage, the visitor still gets a private workspace for this page load.
+    return null;
   }
-  return privateName;
+}
+
+/** Writes storage. The page works for this visit if it cannot. */
+function writeStored(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Nothing to do: the value simply lasts until the page closes.
+  }
+}
+
+/** Returns this browser's unguessable conversation ID, creating one on first use. */
+export function conversationId(): string {
+  const saved = readStored(CONVERSATION_KEY);
+  if (saved && /^[a-f0-9]{32}$/.test(saved)) return saved;
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const id = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  writeStored(CONVERSATION_KEY, id);
+  return id;
 }
 
 /** Shows a message in the notice area. An empty message hides it. */
@@ -166,402 +117,133 @@ function setNotice(message: string): void {
   ui.notice.hidden = !message;
 }
 
-/** True when the reader is following the end of the timeline. */
-function isNearBottom(): boolean {
-  const { scrollHeight, scrollTop, clientHeight } = ui.scroller;
-  return scrollHeight - scrollTop - clientHeight < 120;
+/** Shows an unexpected failure without exposing internal details. */
+function reportFailure(): void {
+  setNotice("Something went wrong. Please try again.");
 }
 
-/** Scrolls the timeline to its newest content. */
-function scrollToEnd(): void {
-  ui.scroller.scrollTop = ui.scroller.scrollHeight;
-}
-
-/** True while a review or question prevents another submission. */
+/** True while a question prevents another submission. */
 function isBusy(): boolean {
-  return Boolean(guardState?.active || guardState?.activeQuestion) || submittingQuestion;
+  return Boolean(state?.activeQuestion) || submitting;
 }
 
-/** Synchronizes the character count, submit buttons and microphone control with current state. */
+/** Synchronizes composer controls and suggestions with current state. */
 function updateComposer(): void {
   const length = ui.input.value.length;
-  const hasText = ui.input.value.trim().length > 0;
-  ui.count.textContent = `${length.toLocaleString("en-US")} / ${MAX_INPUT_CHARS.toLocaleString("en-US")}`;
-  ui.count.classList.toggle("over", length > MAX_INPUT_CHARS);
-  const blocked = !client || isBusy() || !hasText || length > MAX_INPUT_CHARS;
-  ui.review.disabled = blocked;
-  // Mirrors `MAX_QUESTION_CHARS`.
-  ui.ask.disabled = blocked || length > 2_000;
-  ui.mic.disabled = !client || transcribing;
-  ui.mic.textContent = recording ? "Stop recording" : transcribing ? "Transcribing…" : "Speak";
-  ui.mic.classList.toggle("recording", Boolean(recording));
+  ui.count.textContent = `${length} / ${MAX_QUESTION_CHARS}`;
+  ui.count.classList.toggle("over", length >= MAX_QUESTION_CHARS);
+  ui.send.disabled = !connected || isBusy() || !ui.input.value.trim() || length > MAX_QUESTION_CHARS;
+  ui.send.textContent = isBusy() ? "Answering" : "Ask";
+  ui.mic.disabled = !connected || transcribing;
+  ui.mic.textContent = recording ? "Stop" : transcribing ? "Transcribing" : "Speak";
   ui.mic.setAttribute("aria-pressed", String(Boolean(recording)));
+  for (const button of ui.suggestions.querySelectorAll("button")) button.disabled = !connected || isBusy();
 }
 
-/** Describes where AI text came from. */
-function sourceLabel(source: CommentarySource | null, model: string | null): string {
-  if (source === "offline") return "Offline template, no model called";
-  if (source === "unavailable") return "Unavailable";
-  const gateway = snapshot?.routing.gatewayId;
-  return `${model ?? "Workers AI"}${gateway ? ` via AI Gateway ${gateway}` : ""}`;
+/** Builds the control that starts or stops speech for an answer. */
+function listenButton(id: number): HTMLElement {
+  const label = speakingId === id ? (speechLoading ? "Preparing audio" : "Stop") : "Listen";
+  return h("button", { class: "listen", type: "button", onClick: () => void toggleSpeech(id) }, label);
 }
 
-/** Builds the control that starts or stops speech for a review or message. */
-function listenButton(kind: "review" | "message", id: string | number): HTMLElement {
-  const key = `${kind}:${id}`;
-  return h(
-    "button",
-    { class: "link-button listen", type: "button", onClick: () => void toggleSpeech(kind, id) },
-    speakingKey === key ? (speechLoading ? "Preparing audio…" : "Stop") : "Listen",
-  );
-}
-
-/** Turns the small inline Markdown subset used by models into safe DOM nodes. */
-function inlineText(text: string): Child[] {
-  return text.split(/(\*\*[^*\n]+\*\*|`[^`\n]+`)/).map((part) => {
-    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) return h("strong", {}, part.slice(2, -2));
-    if (part.startsWith("`") && part.endsWith("`") && part.length > 2) return h("code", {}, part.slice(1, -1));
-    return part;
-  });
-}
-
-/**
- * Renders the commentary format as text nodes, with headings for readability.
- * This is not a Markdown parser: model output never becomes HTML.
- */
-function renderCommentary(target: HTMLElement, text: string): void {
-  target.replaceChildren();
-  let code: HTMLElement | null = null;
-  for (const line of text.split("\n")) {
-    if (line.trim().startsWith("```")) {
-      code = code ? null : target.appendChild(h("pre"));
-      continue;
-    }
-    if (code) code.append(`${line}\n`);
-    else if (line.startsWith("### ")) target.append(h("h4", {}, line.slice(4).replaceAll("**", "")));
-    else if (line.trim()) {
-      const label = /^\**(Why it matters|Suggested fix):\**\s*(.*)$/.exec(line);
-      if (label) target.append(h("p", {}, h("strong", {}, `${label[1]}: `), ...inlineText(label[2] ?? "")));
-      else target.append(h("p", {}, ...inlineText(line)));
-    }
-  }
-}
-
-/** Renders review progress. */
-function stepper(steps: Record<StepName, StepStatus>): HTMLElement {
-  const names = Object.keys(STEP_LABELS) as StepName[];
-  return h(
-    "ol",
-    { class: "steps", "aria-label": "Review progress" },
-    ...names.map((name) => h("li", { class: `step ${steps[name]}` }, h("span", { class: "dot" }), STEP_LABELS[name])),
-  );
-}
-
-/** True when an exception now covers this finding, even if this older result predates it. */
-function hasExceptionOnFile(finding: Finding): boolean {
-  return Boolean(snapshot?.exceptions.some((e) => e.standardId === finding.standardId && e.path === finding.path));
-}
-
-/** Renders one finding with the action its waiver state allows. */
-function findingRow(review: ReviewRecord, finding: Finding): HTMLElement {
-  const location = finding.line ? `${finding.path}:${finding.line}` : finding.path;
-  let action: Child;
-  if (finding.status === "excepted") {
-    const reason = snapshot?.exceptions.find((e) => e.id === finding.exceptionId)?.reason;
-    action = h("span", { class: "finding-state" }, reason ? `Exception applied: ${reason}` : "Exception applied");
-  } else if (!finding.waivable) {
-    action = h("span", { class: "finding-state" }, "Cannot be waived");
-  } else if (finding.path.startsWith("(") || finding.path.includes("[REDACTED")) {
-    action = h("span", { class: "finding-state" }, "Fix the change to resolve this finding.");
-  } else if (hasExceptionOnFile(finding)) {
-    action = h("span", { class: "finding-state" }, "Exception recorded. It applies from the next review.");
-  } else {
-    action = h("button", { class: "link-button", type: "button", onClick: () => openExceptionDialog(review.id, finding) }, "Accept as exception");
-  }
-  return h(
-    "li",
-    { class: `finding ${finding.status}` },
-    h("span", { class: `severity ${finding.severity}` }, finding.severity),
-    h(
-      "div",
-      { class: "finding-body" },
-      h("p", { class: "finding-title" }, h("code", {}, finding.standardId), ` ${finding.standardTitle}`),
-      h("p", { class: "finding-location" }, `${finding.id} · ${location}`, finding.occurrences > 1 && ` · ${finding.occurrences} matches`),
-      finding.evidence && h("code", { class: "evidence" }, finding.evidence),
-      h("div", { class: "finding-action" }, action),
-    ),
-  );
-}
-
-/** Renders rule results, or a progress or failure message before results exist. */
-function rulePanel(review: ReviewRecord): HTMLElement {
-  const result = review.result;
-  if (!result) {
-    return h(
-      "section",
-      { class: "panel rules" },
-      h("header", {}, h("span", { class: "panel-label" }, "Rule engine"), h("span", { class: "panel-tag" }, "Deterministic")),
-      h("p", { class: "muted" }, review.status === "failed" ? (review.error ?? "The review failed.") : "Evaluating rules…"),
-    );
-  }
-  const lowered = result.risk !== result.riskBeforeExceptions;
-  const stats = result.kind === "diff" ? `${result.stats.files} file${result.stats.files === 1 ? "" : "s"}, +${result.stats.additions} −${result.stats.deletions}` : "Change summary";
-  return h(
-    "section",
-    { class: "panel rules" },
-    h("header", {}, h("span", { class: "panel-label" }, "Rule engine"), h("span", { class: "panel-tag" }, "Deterministic · final")),
-    h(
-      "div",
-      { class: "risk-row" },
-      h("span", { class: `risk ${result.risk}` }, `${result.risk} risk`),
-      h("span", { class: "muted" }, stats, lowered && ` · ${result.riskBeforeExceptions} before exceptions`),
-    ),
-    ...result.notes.map((note) => h("p", { class: "note" }, note)),
-    result.findings.length
-      ? h("ul", { class: "findings" }, ...result.findings.map((finding) => findingRow(review, finding)))
-      : h("p", { class: "muted" }, "No rule matched this change."),
-    h("p", { class: "checked" }, `Checked against: ${result.applicableStandards.join(", ") || "no applicable standards"}`),
-  );
-}
-
-/**
- * Renders commentary, preferring stored text over streamed text. Returns null before rules finish.
- */
-function aiPanel(review: ReviewRecord): HTMLElement | null {
-  if (!review.result) return null;
-  const text = review.commentary || liveCommentary.get(review.id) || "";
-  const body = h("div", { class: "commentary", "data-commentary": review.id });
-  if (text) renderCommentary(body, text);
-  else if (review.commentarySource === "unavailable") body.append(h("p", { class: "muted" }, "The model was unavailable. The rule results above are complete."));
-  else if (review.status === "running") body.append(h("p", { class: "muted cursor" }, "Writing an explanation"));
-  return h(
-    "section",
-    { class: "panel ai" },
-    h("header", {}, h("span", { class: "panel-label" }, "AI commentary"), h("span", { class: "panel-tag" }, "Advisory · cannot change the result")),
-    body,
-    ...review.commentaryWarnings.map((warning) => h("p", { class: "warning" }, `Check: ${warning}`)),
-    h(
-      "div",
-      { class: "panel-foot" },
-      h("p", { class: "checked" }, sourceLabel(review.commentarySource, review.commentaryModel)),
-      review.status === "complete" && listenButton("review", review.id),
-    ),
-  );
-}
-
-/** Renders a review, with live progress when it is the active one. */
-function reviewCard(review: ReviewRecord): HTMLElement {
-  const active = guardState?.active?.reviewId === review.id ? guardState.active : null;
+/** Renders one stored message. */
+function messageNode(message: ChatMessage): HTMLElement {
+  if (message.role === "user") return h("div", { class: "message user" }, message.text);
+  const body = h("div", { class: "message-body" });
+  renderRichText(body, message.text);
   return h(
     "article",
-    { class: "review", id: `review-${review.id}` },
-    h("h3", {}, review.title || "Change review"),
-    active && stepper(active.steps),
-    rulePanel(review),
-    aiPanel(review),
-  );
-}
-
-/** Renders one chat entry. A review entry also renders its review card. */
-function messageNode(message: ChatMessage, reviews: Map<string, ReviewRecord>): Child[] {
-  if (message.kind === "review") {
-    const review = message.reviewId ? reviews.get(message.reviewId) : undefined;
-    return [h("div", { class: "bubble user" }, h("pre", {}, message.text)), review && reviewCard(review)];
-  }
-  if (message.role === "user") return [h("div", { class: "bubble user" }, message.text)];
-  const body = h("div", { class: "commentary" });
-  renderCommentary(body, message.text);
-  return [
+    { class: "message assistant" },
+    body,
     h(
       "div",
-      { class: "bubble assistant" },
-      h("span", { class: "bubble-label" }, `AI answer · ${sourceLabel(message.source, message.model)}`),
-      body,
-      listenButton("message", message.id),
+      { class: "message-foot" },
+      message.source && SOURCE_LABELS[message.source],
+      message.source !== "unavailable" && listenButton(message.id),
     ),
-  ];
-}
-
-/** Renders the introduction for a repository with no messages. */
-function emptyState(): HTMLElement {
-  return h(
-    "div",
-    { class: "empty" },
-    h("h2", {}, "Check a change before you open the pull request"),
-    h("p", {}, "Paste a unified diff or describe the change. Fixed rules set the risk and pick the standards. The model explains the findings and suggests fixes, and it cannot change the result."),
-    h("p", { class: "muted" }, "Pick a sample below to see it work."),
   );
 }
 
-/** Rebuilds the timeline and sidebar, keeping the reader at the end if they were already there. */
+/** Renders the answer in progress. */
+function pendingNode(): HTMLElement {
+  const body = h("div", { class: "message-body", id: "pending-answer" });
+  if (liveAnswer) renderRichText(body, liveAnswer);
+  else body.append(h("p", { class: "thinking" }, "Thinking"));
+  return h("article", { class: "message assistant", "aria-busy": "true" }, body);
+}
+
+/** Rebuilds the conversation, following the end when the reader is already there. */
 function render(): void {
-  if (!snapshot) return;
-  const follow = isNearBottom();
-  const reviews = new Map(snapshot.reviews.map((review) => [review.id, review]));
-  const nodes = snapshot.messages.flatMap((message) => messageNode(message, reviews)).filter((node): node is Node | string => Boolean(node));
-  if (guardState?.activeQuestion) {
-    const body = h("div", { class: "commentary" });
-    renderCommentary(body, liveAnswer || "Thinking…");
-    nodes.push(h("div", { class: "bubble assistant", id: "pending-answer" }, h("span", { class: "bubble-label" }, "AI answer"), body));
+  const { conversation } = ui;
+  const follow = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight < 120;
+  const nodes: Node[] = (snapshot?.messages ?? []).map(messageNode);
+  if (state?.activeQuestion || submitting) nodes.push(pendingNode());
+  if (nodes.length === 0) {
+    const name = site?.name.split(" ")[0] ?? "this person";
+    nodes.push(h("p", { class: "empty" }, `Pick a question, or ask your own about ${name}'s work.`));
   }
-  ui.timeline.replaceChildren(...(nodes.length ? nodes : [emptyState()]));
-  renderSidebar();
+  conversation.replaceChildren(...nodes);
+  if (follow) conversation.scrollTop = conversation.scrollHeight;
+  ui.disclaimer.textContent = snapshot?.offline
+    ? "Offline preview: answers are matched from the written profile, and no AI model is used."
+    : `Answers are AI-generated from a written profile and can be wrong. Please verify anything important with ${site?.links.email ?? "the source"}.`;
   updateComposer();
-  if (follow) scrollToEnd();
 }
 
-/** Rebuilds routing, standards, exceptions and review history. */
-function renderSidebar(): void {
-  if (!snapshot) return;
-  const { routing } = snapshot;
-  ui.routing.replaceChildren(
-    h("li", { class: "muted" }, routing.offline ? "Offline mode: no model or gateway is called." : `All calls use AI Gateway: ${routing.gatewayId}`),
-    ...routing.models.map((model) =>
-      h(
-        "li",
-        { class: "route" },
-        h("strong", {}, model.label),
-        h("code", {}, model.primary.replace("@cf/", "")),
-        h("code", { class: "muted" }, `fallback ${model.secondary.replace("@cf/", "")}`),
-      ),
-    ),
-  );
-  const enabled = snapshot.standards.filter((standard) => standard.enabled).length;
-  ui.standardCount.textContent = `${enabled}/${snapshot.standards.length}`;
-  ui.standards.replaceChildren(
-    ...snapshot.standards.map((standard) =>
-      h(
-        "li",
-        { class: "standard" },
-        h(
-          "label",
-          { title: standard.summary },
-          h("input", {
-            type: "checkbox",
-            checked: standard.enabled,
-            disabled: !standard.waivable,
-            onChange: (event: Event) => toggleStandard(standard.id, (event.target as HTMLInputElement).checked),
-          }),
-          h("span", {}, h("code", {}, standard.id), h("span", { class: "standard-title" }, standard.title)),
-          h("span", { class: `severity small ${standard.severity}` }, standard.waivable ? standard.severity : "required"),
-        ),
-      ),
-    ),
-  );
-
-  ui.exceptionCount.textContent = String(snapshot.exceptions.length);
-  ui.exceptions.replaceChildren(
-    ...(snapshot.exceptions.length
-      ? snapshot.exceptions.map((exception) =>
-          h(
-            "li",
-            { class: "exception" },
-            h("p", {}, h("code", {}, exception.standardId), ` ${exception.path}`),
-            h("p", { class: "muted" }, exception.reason),
-            h("button", { class: "link-button", type: "button", onClick: () => revokeException(exception.id) }, "Revoke"),
-          ),
-        )
-      : [h("li", { class: "muted" }, "None recorded.")]),
-  );
-
-  ui.historyCount.textContent = String(snapshot.reviews.length);
-  ui.history.replaceChildren(
-    ...(snapshot.reviews.length
-      ? snapshot.reviews.slice(0, 12).map((review) =>
-          h(
-            "li",
-            {},
-            h(
-              "button",
-              { class: "history-item", type: "button", onClick: () => document.getElementById(`review-${review.id}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) },
-              h("span", { class: `severity small ${review.result?.risk ?? "pending"}` }, review.result?.risk ?? review.status),
-              h("span", { class: "history-title" }, review.title),
-            ),
-          ),
-        )
-      : [h("li", { class: "muted" }, "No reviews yet.")]),
-  );
-}
-
-/**
- * Fetches and renders the snapshot. Calls made during a fetch collapse into one follow-up fetch, so
- * bursts of revisions cannot multiply requests. A response for a replaced connection is dropped.
- *
- * @throws The RPC error, which callers report.
- */
+/** Fetches stored messages. Calls during a fetch collapse into one follow-up. */
 async function refresh(): Promise<void> {
   if (!client) return;
-  if (refreshInFlight) {
+  if (refreshing) {
     refreshQueued = true;
     return;
   }
-  refreshInFlight = true;
+  refreshing = true;
   const current = client;
   try {
     const next = (await current.call("getSnapshot")) as unknown as Snapshot;
     if (current !== client) return;
     snapshot = next;
-    for (const review of next.reviews) if (review.status !== "running") liveCommentary.delete(review.id);
+    if (!state?.activeQuestion) liveAnswer = "";
     render();
   } finally {
-    refreshInFlight = false;
+    refreshing = false;
     if (refreshQueued) {
       refreshQueued = false;
-      // Bursts of changes are limited to about four refreshes each second.
-      setTimeout(() => void refresh().catch(reportFailure), 250);
+      void refresh().catch(reportFailure);
     }
   }
 }
 
-/** Shows an unexpected failure in the notice area. */
-function reportFailure(error: unknown): void {
-  setNotice(error instanceof Error ? error.message : "Something went wrong.");
-}
-
-/** Starts a review. The input is cleared only after the server accepts it. */
-async function submitReview(): Promise<void> {
-  if (!client || ui.review.disabled) return;
-  setNotice("");
-  ui.review.disabled = true;
-  try {
-    const request = { text: ui.input.value, requestId: crypto.randomUUID() };
-    const result = (await client.call("startReview", [request])) as ActionResult;
-    if (!result.ok) setNotice(result.error);
-    else ui.input.value = "";
-  } catch (error) {
-    reportFailure(error);
+/** Sends a question. Its answer arrives through live messages and a later snapshot. */
+async function ask(question: string): Promise<void> {
+  const text = question.trim();
+  if (!client || !connected || isBusy() || !text) return;
+  if (text.length > MAX_QUESTION_CHARS) {
+    setNotice(`Questions can be up to ${MAX_QUESTION_CHARS} characters.`);
+    return;
   }
-  updateComposer();
-}
-
-/**
- * Sends the composer text as a question. Questions enter the agent's durable inbox, so they finish
- * if this tab closes. The answer arrives through live messages and a later snapshot.
- */
-async function submitQuestion(): Promise<void> {
-  if (!client || ui.ask.disabled) return;
   setNotice("");
-  submittingQuestion = true;
+  submitting = true;
   liveAnswer = "";
-  updateComposer();
+  render();
+  const requestId = unconfirmed?.question === text ? unconfirmed.requestId : crypto.randomUUID();
+  unconfirmed = { question: text, requestId };
   try {
-    const request = { question: ui.input.value.trim(), requestId: crypto.randomUUID() };
-    const result = (await client.call("ask", [request])) as ActionResult;
-    if (!result.ok) setNotice(result.error);
-    else ui.input.value = "";
-  } catch (error) {
-    reportFailure(error);
+    const result = (await client.call("ask", [{ question: text, requestId }])) as ActionResult;
+    unconfirmed = null;
+    if (result.ok) ui.input.value = "";
+    else setNotice(result.error);
+  } catch {
+    setNotice("The connection dropped. Your question was kept, so you can send it again.");
+    ui.input.value = text;
   } finally {
-    submittingQuestion = false;
-    updateComposer();
+    submitting = false;
+    render();
+    void refresh().catch(reportFailure);
   }
 }
 
-/**
- * Starts recording, or stops the active recording. The starting call stays pending until
- * transcription ends, then appends the transcript to the composer for review. A recording is
- * discarded if the repository changes, so it is never sent to a different repository.
- */
+/** Starts recording, or stops it. The transcript goes to the composer for checking. */
 async function toggleRecording(): Promise<void> {
   if (recording) {
     recording.stop();
@@ -570,23 +252,20 @@ async function toggleRecording(): Promise<void> {
   setNotice("");
   const owner = client;
   try {
-    const active = await startRecording();
-    recording = active;
+    recording = await startRecording();
     updateComposer();
-    const audio = await active.result;
+    const audio = await recording.result;
     recording = null;
     transcribing = true;
     updateComposer();
-    if (!client || client !== owner) return;
-    const result = (await client.call("transcribe", [{ audio }])) as unknown as ActionResult<TranscriptResult>;
-    if (!result.ok) {
-      setNotice(result.error);
-    } else if (!result.text) {
-      setNotice("No speech was detected.");
-    } else {
-      ui.input.value = [ui.input.value.trim(), result.text].filter(Boolean).join("\n");
+    if (!owner) return;
+    const result = (await owner.call("transcribe", [{ audio }])) as unknown as ActionResult<{ text: string; source: AnswerSource }>;
+    if (!result.ok) setNotice(result.error);
+    else if (!result.text) setNotice("No speech was detected.");
+    else {
+      ui.input.value = [ui.input.value.trim(), result.text].filter(Boolean).join(" ").slice(0, MAX_QUESTION_CHARS);
       ui.input.focus();
-      if (result.source === "offline") setNotice("Offline mode returned a sample transcript, not your words.");
+      if (result.source === "offline") setNotice("Offline preview: this is a sample transcript, not your words.");
     }
   } catch (error) {
     const denied = error instanceof DOMException && error.name === "NotAllowedError";
@@ -598,219 +277,186 @@ async function toggleRecording(): Promise<void> {
   }
 }
 
-/**
- * Plays an item, or stops it when it is already selected. `speakingKey` is rechecked after the
- * request so a late response cannot play over a newer choice.
- */
-async function toggleSpeech(kind: "review" | "message", id: string | number): Promise<void> {
-  const key = `${kind}:${id}`;
+/** Plays an answer, or stops it when already selected. Late responses cannot override a newer choice. */
+async function toggleSpeech(id: number): Promise<void> {
   stopPlayback();
-  if (speakingKey === key) {
-    speakingKey = null;
+  if (speakingId === id) {
+    speakingId = null;
     render();
     return;
   }
   if (!client) return;
   setNotice("");
-  speakingKey = key;
+  speakingId = id;
   speechLoading = true;
   render();
   try {
-    const result = (await client.call("speak", [{ kind, id }])) as unknown as ActionResult<SpeechResult>;
-    if (speakingKey !== key) return;
-    if (!result.ok) throw new Error(result.error);
-    if (result.source === "offline") setNotice("Offline mode plays a test tone instead of speech.");
-    speechLoading = false;
-    render();
-    await playAudio(result.audio, result.mimeType, () => {
-      if (speakingKey === key) speakingKey = null;
-      render();
-    });
-  } catch (error) {
-    speechLoading = false;
-    if (speakingKey === key) speakingKey = null;
-    reportFailure(error);
-    render();
-  }
-}
-
-/** Opens the exception form for a finding. */
-function openExceptionDialog(reviewId: string, finding: Finding): void {
-  exceptionTarget = { reviewId, finding };
-  ui.dialogTarget.textContent = `${finding.standardId} on ${finding.path}`;
-  ui.dialogReason.value = "";
-  ui.dialogError.textContent = "";
-  ui.dialog.showModal();
-  ui.dialogReason.focus();
-}
-
-/** Submits the exception form and keeps it open with the error on failure. */
-async function saveException(): Promise<void> {
-  if (!client || !exceptionTarget) return;
-  const { reviewId, finding } = exceptionTarget;
-  try {
-    const result = (await client.call("acceptException", [{ reviewId, findingId: finding.id, reason: ui.dialogReason.value }])) as ActionResult;
-    if (result.ok) ui.dialog.close();
-    else ui.dialogError.textContent = result.error;
-  } catch (error) {
-    ui.dialogError.textContent = error instanceof Error ? error.message : "The exception was not saved.";
-  }
-}
-
-/**
- * Calls a settings action. After a rejection the snapshot is refetched, which also restores a
- * checkbox the browser has already toggled.
- */
-async function runAction(method: string, args: unknown[]): Promise<void> {
-  if (!client) return;
-  try {
-    const result = (await client.call(method, args)) as ActionResult;
+    const result = (await client.call("speak", [{ messageId: id }])) as unknown as ActionResult<{ audio: string; mimeType: string; source: AnswerSource }>;
+    if (speakingId !== id) return;
     if (!result.ok) {
       setNotice(result.error);
-      await refresh();
+      speakingId = null;
+    } else {
+      if (result.source === "offline") setNotice("Offline preview: Listen plays a test tone instead of speech.");
+      speechLoading = false;
+      render();
+      await playAudio(result.audio, result.mimeType, () => {
+        if (speakingId === id) speakingId = null;
+        render();
+      });
+      return;
     }
-  } catch (error) {
-    reportFailure(error);
+  } catch {
+    if (speakingId === id) speakingId = null;
+    setNotice("Audio could not be played.");
   }
+  speechLoading = false;
+  render();
 }
 
-/** Requests a change to a standard's enabled state. */
-const toggleStandard = (id: string, enabled: boolean) => void runAction("setStandardEnabled", [{ id, enabled }]);
-/** Requests removal of an exception. */
-const revokeException = (id: string) => void runAction("revokeException", [{ id }]);
-
-/**
- * Applies streamed text directly to the DOM, avoiding a full render per delta. A reset discards
- * partial text, which happens when a turn or Workflow step starts again.
- */
+/** Applies streamed text directly, avoiding a full render per delta. */
 function handleLiveMessage(message: LiveMessage): void {
-  if (message.type === "answer-reset" || message.type === "answer-delta") {
-    liveAnswer = message.type === "answer-reset" ? "" : liveAnswer + message.delta;
-    const answer = document.querySelector<HTMLElement>("#pending-answer .commentary");
-    if (answer && liveAnswer) renderCommentary(answer, liveAnswer);
-    if (isNearBottom()) scrollToEnd();
-    return;
-  }
-  const previous = message.type === "commentary-delta" ? (liveCommentary.get(message.reviewId) ?? "") : "";
-  const text = message.type === "commentary-delta" ? previous + message.delta : "";
-  liveCommentary.set(message.reviewId, text);
-  const target = document.querySelector<HTMLElement>(`[data-commentary="${message.reviewId}"]`);
-  if (!target || !text) return;
-  const follow = isNearBottom();
-  renderCommentary(target, text);
-  if (follow) scrollToEnd();
+  liveAnswer = message.type === "answer-reset" ? "" : liveAnswer + message.delta;
+  const target = document.getElementById("pending-answer");
+  if (target && liveAnswer) renderRichText(target, liveAnswer);
+  ui.conversation.scrollTop = ui.conversation.scrollHeight;
 }
 
-/** Updates the connection indicator. */
-function setConnection(label: string, state: string): void {
+/** Updates the connection indicator and the controls that depend on it. */
+function setConnection(label: string, stateName: string, open: boolean): void {
   ui.status.textContent = label;
-  ui.status.dataset.state = state;
+  ui.status.dataset.state = stateName;
+  connected = open;
+  updateComposer();
 }
 
-/**
- * Switches to a repository, clearing all state from the previous connection.
- *
- * @param repository - Name already converted by `toSlug`.
- */
-function connect(repository: string): void {
-  client?.close();
-  recording?.stop();
-  stopPlayback();
-  speakingKey = null;
-  snapshot = null;
-  guardState = null;
-  seenRevision = -1;
-  liveAnswer = "";
-  submittingQuestion = false;
-  liveCommentary.clear();
-  ui.repoInput.value = repository;
-  ui.timeline.replaceChildren();
-  setConnection("Connecting", "connecting");
-
-  const next = new AgentClient<unknown, GuardState>({
-    agent: "CodexGuardAgent",
-    name: repository,
+/** Connects to this browser's conversation. The SDK reconnects by itself. */
+function connect(): void {
+  const next = new AgentClient<unknown, ShowcaseState>({
+    agent: "ShowcaseAgent",
+    name: conversationId(),
     host: location.host,
     protocol: location.protocol === "https:" ? "wss" : "ws",
-    onStateUpdate: (state) => {
-      guardState = state;
-      // A new revision means stored data changed. Otherwise the current snapshot is redrawn.
-      if (state.revision !== seenRevision) {
-        seenRevision = state.revision;
+    onStateUpdate: (update) => {
+      state = update;
+      if (update.revision !== seenRevision) {
+        seenRevision = update.revision;
         void refresh().catch(reportFailure);
-      } else {
-        render();
-      }
+      } else render();
     },
   });
   client = next;
-
   next.addEventListener("open", () => {
-    if (client !== next) return;
-    setConnection("Connected", "open");
+    setConnection("Ready for questions", "open", true);
     void refresh().catch(reportFailure);
   });
-  next.addEventListener("close", () => {
-    if (client === next) setConnection("Reconnecting", "connecting");
-  });
+  next.addEventListener("close", () => setConnection("Reconnecting", "connecting", false));
   next.addEventListener("message", (event) => {
     // The socket also carries SDK frames, so a cheap test avoids parsing most of them.
-    if (typeof event.data !== "string" || !/"(commentary|answer)-(delta|reset)"/.test(event.data)) return;
+    if (typeof event.data !== "string" || !/"answer-(?:delta|reset)"/.test(event.data)) return;
     try {
       const message = JSON.parse(event.data) as LiveMessage;
-      if (["commentary-delta", "commentary-reset", "answer-delta", "answer-reset"].includes(message.type)) handleLiveMessage(message);
+      if (message.type === "answer-delta" || message.type === "answer-reset") handleLiveMessage(message);
     } catch {
       // Ignore frames that are not application messages.
     }
   });
-  updateComposer();
 }
 
-for (const sample of SAMPLES) {
-  ui.samples.append(
-    h(
-      "button",
-      {
-        class: "chip",
-        type: "button",
-        onClick: () => {
-          ui.input.value = sample.text;
-          updateComposer();
-          ui.input.focus();
-        },
-      },
-      sample.label,
+/** Sets text on a static element. */
+const setText = (id: string, value: string) => {
+  byId(id).textContent = value;
+};
+
+/** Builds a link that leaves the site. */
+const externalLink = (href: string, label: string) => h("a", { href, rel: "noopener noreferrer", target: "_blank" }, label);
+
+/** Fills every profile section from validated site content. */
+function renderProfile(content: SiteContent): void {
+  const first = content.name.split(" ")[0] ?? content.name;
+  document.title = `Ask about ${first}`;
+  setText("wordmark", `Ask about ${first}`);
+  setText("role-line", `${content.title} · ${content.location}`);
+  setText("name", content.name);
+  setText("tagline", content.tagline);
+  setText("about", content.about);
+  setText("seeking", content.seeking);
+  byId<HTMLAnchorElement>("resume-link").href = content.links.resume;
+  byId("stats").replaceChildren(...content.stats.map((stat) => h("div", {}, h("dt", {}, stat.label), h("dd", {}, stat.value))));
+  ui.suggestions.replaceChildren(
+    ...content.questions.map((question) => h("li", {}, h("button", { type: "button", onClick: () => void ask(question) }, question))),
+  );
+  byId("proof-list").replaceChildren(
+    ...content.proof.map((item) => h("li", {}, h("div", {}, h("h3", {}, item.title), h("p", { class: "result" }, item.result)), h("p", { class: "detail" }, item.detail))),
+  );
+  byId("project-list").replaceChildren(
+    ...content.projects.map((project) =>
+      h(
+        "a",
+        { class: "project", href: project.url, rel: "noopener noreferrer", target: "_blank" },
+        h("h3", {}, project.name),
+        h("p", {}, project.summary),
+        h("span", { class: "tags" }, ...project.tags.map((tag) => h("span", {}, tag))),
+      ),
     ),
+  );
+  byId("skill-list").replaceChildren(...content.skills.map((skill) => h("div", {}, h("dt", {}, skill.group), h("dd", {}, skill.items.join(" · ")))));
+  const email = byId<HTMLAnchorElement>("contact-email");
+  email.href = `mailto:${content.links.email}`;
+  email.textContent = content.links.email;
+  byId("contact-links").replaceChildren(
+    ...[
+      ["Website", content.links.site],
+      ["LinkedIn", content.links.linkedin],
+      ["GitHub", content.links.github],
+      ["Résumé", content.links.resume],
+    ].map(([label, href]) => h("li", {}, externalLink(href as string, label as string))),
   );
 }
 
+/** Loads public profile content. The ask experience still works if this fails. */
+async function loadProfile(): Promise<void> {
+  try {
+    const response = await fetch("/site.json");
+    if (!response.ok) throw new Error("Profile unavailable");
+    site = (await response.json()) as SiteContent;
+    renderProfile(site);
+  } catch {
+    site = null;
+    setText("name", "Ask about this work");
+    byId("load-error").hidden = false;
+  }
+  render();
+}
+
+/** Applies a theme and labels the toggle with the theme it will switch to. */
+function applyTheme(theme: "light" | "dark"): void {
+  document.documentElement.dataset.theme = theme;
+  ui.theme.textContent = theme === "dark" ? "Light" : "Dark";
+  ui.theme.setAttribute("aria-pressed", String(theme === "dark"));
+}
+
+const savedTheme = readStored(THEME_KEY);
+const prefersDark = typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches;
+applyTheme(savedTheme === "dark" || savedTheme === "light" ? savedTheme : prefersDark ? "dark" : "light");
+ui.theme.addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  applyTheme(next);
+  writeStored(THEME_KEY, next);
+});
 ui.input.addEventListener("input", updateComposer);
 ui.input.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
-    void submitReview();
+    void ask(ui.input.value);
   }
 });
-ui.review.addEventListener("click", () => void submitReview());
-ui.ask.addEventListener("click", () => void submitQuestion());
+ui.form.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void ask(ui.input.value);
+});
 ui.mic.addEventListener("click", () => void toggleRecording());
-ui.repoForm.addEventListener("submit", (event) => {
-  event.preventDefault();
-  const repository = toSlug(ui.repoInput.value);
-  if (repository) {
-    // Only an explicit choice is remembered, so a shared link cannot redirect later work.
-    try {
-      localStorage.setItem("codex-guard-repo", repository);
-    } catch {
-      // The page works without saved preferences.
-    }
-    connect(repository);
-  } else setNotice("Enter a repository name using letters, numbers, dots, dashes or underscores.");
-});
-ui.dialogForm.addEventListener("submit", (event) => {
-  event.preventDefault();
-  void saveException();
-});
-ui.dialogCancel.addEventListener("click", () => ui.dialog.close());
 
-connect(initialRepository());
+render();
+void loadProfile();
+connect();

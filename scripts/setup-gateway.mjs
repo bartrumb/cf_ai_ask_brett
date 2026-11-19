@@ -1,4 +1,4 @@
-// Creates or updates the AI Gateway used by Codex Guard.
+// Creates or updates the AI Gateway used by Ask about Brett.
 // Prints the planned settings by default. Add --apply to change the account.
 // Node runs the TypeScript import directly through type stripping, so no build step is needed.
 // The plan path needs no credentials. With --apply, CLOUDFLARE_ACCOUNT_ID and

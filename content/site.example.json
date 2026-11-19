@@ -1,0 +1,48 @@
+{
+  "name": "Avery Example",
+  "title": "Senior DevOps Engineer",
+  "tagline": "An invented engineer who keeps imaginary production calm.",
+  "location": "Sample City (remote)",
+  "seeking": "Seeking a platform engineering role, remote.",
+  "about": "Avery is a fictional profile that ships with this project, so the site can run without any private content.",
+  "links": {
+    "email": "avery@example.com",
+    "site": "https://avery.example.com/",
+    "linkedin": "https://www.example.com/in/avery",
+    "github": "https://www.example.com/avery",
+    "resume": "https://avery.example.com/resume.pdf"
+  },
+  "stats": [
+    { "value": "12", "label": "years running sample production" },
+    { "value": "3", "label": "teams using Harbor Review" },
+    { "value": "4", "label": "months from idea to production" },
+    { "value": "1", "label": "very reliable sourdough starter" }
+  ],
+  "proof": [
+    { "title": "Harbor Review", "result": "In production in 4 months", "detail": "An invented tool that checks deployment plans before people approve them." },
+    { "title": "Rules first", "result": "Deterministic risk levels", "detail": "Rules decide the risk, and the AI only explains it." },
+    { "title": "Team adoption", "result": "3 sample teams", "detail": "Each sample team uses the tool for its regular reviews." },
+    { "title": "Steady operations", "result": "12 years in production", "detail": "A fictional career spent keeping systems running." },
+    { "title": "Clear writing", "result": "Plain-English runbooks", "detail": "Documentation written so the next engineer can run the system." }
+  ],
+  "projects": [
+    { "name": "Harbor Review", "summary": "Sample deployment-plan checker.", "url": "https://www.example.com/harbor-review", "tags": ["TypeScript", "AI"] },
+    { "name": "Trail Mapper", "summary": "Sample map of local hiking trails.", "url": "https://www.example.com/trail-mapper", "tags": ["Maps"] },
+    { "name": "Starter Log", "summary": "Sample tracker for sourdough feedings.", "url": "https://www.example.com/starter-log", "tags": ["Workers"] }
+  ],
+  "skills": [
+    { "group": "Languages", "items": ["TypeScript", "Python", "SQL"] },
+    { "group": "Cloud", "items": ["Cloudflare Workers", "Durable Objects", "Kubernetes"] },
+    { "group": "Operations", "items": ["Terraform", "Observability", "Incident response"] }
+  ],
+  "questions": [
+    "What is Harbor Review?",
+    "How does Avery make AI safe to use?",
+    "How quickly did Harbor Review ship?",
+    "What is Avery's strongest skill?",
+    "What role is Avery seeking?",
+    "Which teams use Harbor Review?",
+    "What does Avery do outside work?",
+    "How do I reach Avery?"
+  ]
+}

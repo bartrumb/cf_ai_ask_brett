@@ -1,10 +1,12 @@
 {
-  "name": "codex-guard-agent",
+  "name": "ask-brett",
   "version": "0.1.0",
   "private": true,
-  "description": "A chat agent on Cloudflare that checks a proposed change against team engineering standards before a pull request.",
+  "description": "Ask about Brett: a public profile site with an AI advocate, built on Cloudflare Workers and Durable Objects.",
   "type": "module",
   "scripts": {
+    "content": "node scripts/build-content.mjs",
+    "prebuild:client": "npm run content --silent",
     "build:client": "esbuild client/main.ts --bundle --format=esm --target=es2022 --minify --outfile=public/app.js --log-level=warning",
     "dev": "wrangler dev --local --var AI_MODE:offline --port 8787",
     "dev:ai": "wrangler dev --var ALLOW_UNAUTHENTICATED_AI:true --port 8787",
@@ -13,8 +15,11 @@
     "gateway:plan": "node scripts/setup-gateway.mjs",
     "gateway:apply": "node scripts/setup-gateway.mjs --apply",
     "types": "wrangler types src/worker-configuration.d.ts --include-runtime=false --strict-vars=false",
+    "pretypecheck": "npm run content --silent",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p client/tsconfig.json",
+    "pretest": "npm run content --silent",
     "test": "vitest run",
+    "pretest:coverage": "npm run build:client --silent",
     "test:coverage": "vitest run --coverage",
     "check": "npm run typecheck && npm run test:coverage"
   },

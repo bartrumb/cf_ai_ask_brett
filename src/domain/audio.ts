@@ -1,17 +1,15 @@
 /*
- * Pure helpers for voice features: validating uploaded WAV data and preparing stored text for
- * speech. `CodexGuardAgent` calls these before `speech.ts` reaches a model.
+ * Pure helpers for voice features: validating uploaded WAV data and preparing stored answers for
+ * speech. `ShowcaseAgent` calls these before `speech.ts` reaches a model.
  */
 import { Buffer } from "node:buffer";
-import { normalizeText } from "./input";
-import { redactSecrets } from "./rules";
+import { normalizeText, redactAnswer } from "./redaction";
 import { MAX_AUDIO_BYTES } from "./schemas";
-import type { RuleResult } from "./types";
 
 /** Longest text sent to text-to-speech, which bounds the cost of one request. */
 export const MAX_SPOKEN_CHARS = 1_500;
 
-/** Decoded audio bytes, or a message that can be shown to the user. */
+/** Decoded audio bytes, or a message that can be shown to the visitor. */
 export type DecodedAudio = { ok: true; bytes: Uint8Array } | { ok: false; error: string };
 
 /**
@@ -46,25 +44,12 @@ function fitToLimit(text: string): string {
   return sentenceEnd > 0 ? cut.slice(0, sentenceEnd + 1) : cut;
 }
 
-/**
- * Turns stored markdown-like text into plain text that reads well aloud.
- *
- * Code blocks are replaced with a short notice. The result is normalized, redacted and length-limited.
- */
+/** Turns a stored answer into plain text that reads well aloud. */
 export function toSpokenText(text: string): string {
-  const withoutCode = text.replace(/```[\s\S]*?```/g, " Code example omitted. ");
-  const plain = withoutCode
+  const plain = text
     .split("\n")
-    .map((line) => line.replace(/^###\s*(F\d+)\s*·\s*(\S+)/, "Finding $1, standard $2.").replace(/[*`#]/g, "").trim())
+    .map((line) => line.replace(/[*`#]/g, "").trim())
     .filter(Boolean)
     .join(" ");
-  return fitToLimit(redactSecrets(normalizeText(plain)));
-}
-
-/** The verdict is spoken from rule results, so the model cannot restate it. */
-export function buildSpokenReview(result: RuleResult, commentary: string): string {
-  const open = result.findings.filter((finding) => finding.status === "open").length;
-  const verdict = `Rule engine result: ${result.risk} risk, with ${open} open finding${open === 1 ? "" : "s"}.`;
-  const explanation = toSpokenText(commentary);
-  return fitToLimit(explanation ? `${verdict} AI commentary follows. ${explanation}` : verdict);
+  return fitToLimit(redactAnswer(normalizeText(plain)));
 }

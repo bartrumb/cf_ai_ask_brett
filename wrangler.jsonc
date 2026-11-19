@@ -1,12 +1,12 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "codex-guard-agent",
+  "name": "ask-brett",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-18",
   "compatibility_flags": ["nodejs_compat"],
   "build": {
     "command": "npm run build:client",
-    "watch_dir": "client"
+    "watch_dir": ["client", "content"]
   },
   "assets": {
     "directory": "./public",
@@ -28,20 +28,13 @@
     "DAILY_CLIENT_AI_ACTION_LIMIT": "40"
   },
   "durable_objects": {
-    "bindings": [{ "name": "CodexGuardAgent", "class_name": "CodexGuardAgent" }]
+    "bindings": [{ "name": "ShowcaseAgent", "class_name": "ShowcaseAgent" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["CodexGuardAgent"] }],
-  "workflows": [
-    {
-      "name": "codex-guard-review",
-      "binding": "REVIEW_WORKFLOW",
-      "class_name": "ReviewWorkflow"
-    }
-  ],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ShowcaseAgent"] }],
   // Limits how quickly one address can open agent connections.
   "ratelimits": [
     { "name": "CONNECT_LIMIT", "namespace_id": "1101", "simple": { "limit": 30, "period": 60 } },
-    // A shared ceiling on metered AI work across all repository names.
+    // A shared ceiling on metered AI work across all conversations.
     { "name": "AI_ACTION_LIMIT", "namespace_id": "1102", "simple": { "limit": 300, "period": 60 } }
   ],
   // Think emits turn and model spans when traces are enabled.
