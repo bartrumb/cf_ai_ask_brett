@@ -385,3 +385,16 @@ great! now I want you to combine the chat agent into https://brett.bartrum.famil
 ````
 
 **Produced:** `client/widget.ts`, an embeddable version of the chat that mounts into any `[data-ask-widget]` element and connects over the host page's own domain, plus `npm run build:widget` and client tests. The personal site forwards `/agents/*` to this Worker through a service binding, so the agent's existing origin, rate-limit and budget checks apply unchanged. This Worker's server code did not change.
+
+
+---
+
+## Prompt 22
+
+This request came from the Claude Code session I use for résumé and site review. That session made the change itself. I had asked it what well-known applied AI engineers show that I don't, and it said public eval suites are rare and stand out. It asked whether to start with a write-up or an eval suite for this repo, and I answered:
+
+````text
+r a public eval suite for cf_ai_ask_brett?
+````
+
+**Produced:** `evals/`, a 48-case eval set covering guarded topics, over-blocking, facts, unknowns and prompt injection, scored by deterministic checks: required and forbidden patterns, prompt leaks, list formatting, length, and numbers that do not appear in the profile facts. `npm run eval:guards` scores the guards offline, and `npm run eval` asks the live agent over its real WebSocket and writes a report to `evals/results/`. `test/evals.test.ts` runs the guard cases in CI. The first run found two over-blocking bugs in the guards, recorded as known issues rather than fixed in the same change.
