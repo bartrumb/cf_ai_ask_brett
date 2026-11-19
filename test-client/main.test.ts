@@ -19,6 +19,9 @@ const mocks = vi.hoisted(() => ({
   startRecording: vi.fn(),
   startSpeech: vi.fn(),
   stopPlayback: vi.fn(),
+  dictationSupported: vi.fn(() => false),
+  startDictation: vi.fn(),
+  preloadDictation: vi.fn(),
 }));
 
 vi.mock("agents/client", () => ({
@@ -31,7 +34,14 @@ vi.mock("agents/client", () => ({
     }
   },
 }));
-vi.mock("../client/voice", () => ({ startRecording: mocks.startRecording, startSpeech: mocks.startSpeech, stopPlayback: mocks.stopPlayback }));
+vi.mock("../client/voice", () => ({
+  startRecording: mocks.startRecording,
+  startSpeech: mocks.startSpeech,
+  stopPlayback: mocks.stopPlayback,
+  dictationSupported: mocks.dictationSupported,
+  startDictation: mocks.startDictation,
+  preloadDictation: mocks.preloadDictation,
+}));
 
 const HOSTILE = '<img src=x onerror="alert(1)"> **bold** and `code`';
 const byId = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -88,6 +98,8 @@ beforeEach(async () => {
   offline = false;
   mocks.startRecording.mockReset();
   mocks.startSpeech.mockReset();
+  mocks.dictationSupported.mockReset().mockReturnValue(false);
+  mocks.startDictation.mockReset();
   speakParts = [];
   client().call.mockClear();
   setInput("");
@@ -258,7 +270,9 @@ describe("voice", () => {
   });
 
   it.each([
-    ["blocked microphones", () => mocks.startRecording.mockRejectedValue(new DOMException("no", "NotAllowedError")), "Microphone access was blocked."],
+    ["blocked microphones", () => mocks.startRecording.mockRejectedValue(new DOMException("no", "NotAllowedError")), "Microphone access was blocked. You can allow it in the browser's site settings."],
+    ["missing microphones", () => mocks.startRecording.mockRejectedValue(new DOMException("no", "NotFoundError")), "No microphone was found."],
+    ["microphones in use", () => mocks.startRecording.mockRejectedValue(new DOMException("no", "NotReadableError")), "The microphone is in use by another app."],
     ["recording failures", () => mocks.startRecording.mockRejectedValue(new Error("x")), "The recording could not be processed."],
     ["server errors", () => { mocks.startRecording.mockResolvedValue(recordingWith()); responses.transcribe = { ok: false, error: "Unavailable." }; }, "Unavailable."],
   ])("reports %s", async (_name, arrange, expected) => {
@@ -266,6 +280,72 @@ describe("voice", () => {
     byId("mic").click();
     await flush();
     expect(notice()).toBe(expected);
+  });
+
+  it("shows live dictation in the composer and stops on a second click", async () => {
+    mocks.dictationSupported.mockReturnValue(true);
+    let finishTurn: (text: string) => void = () => {};
+    let speak: (text: string) => void = () => {};
+    let level: (value: number) => void = () => {};
+    const stop = vi.fn();
+    mocks.startDictation.mockImplementation((url: string, worklet: string, onText: (text: string) => void, options: { onLevel: (value: number) => void }) => {
+      expect(url).toBe(`ws://${location.host}/agents/dictation`);
+      expect(worklet).toBe("/capture-processor.js");
+      speak = onText;
+      level = options.onLevel;
+      return { ready: Promise.resolve(), result: new Promise<string>((resolve) => { finishTurn = resolve; }), stop };
+    });
+    const box = byId<HTMLTextAreaElement>("question");
+    const mic = byId<HTMLButtonElement>("mic");
+    setInput("Hi.");
+    mic.click();
+    expect(mocks.startDictation).toHaveBeenCalledTimes(1);
+    expect(box.placeholder).toBe("Listening…");
+    expect(mic.textContent).toBe("Stop");
+    expect(mic.getAttribute("aria-pressed")).toBe("true");
+    expect(mic.classList.contains("listening")).toBe(true);
+    level(0.5);
+    expect(mic.style.getPropertyValue("--level")).toBe("0.50");
+    await flush();
+    speak("Tell me");
+    speak("Tell me about Shepherd");
+    expect(box.value).toBe("Hi. Tell me about Shepherd");
+    expect(box.selectionStart).toBe(box.value.length);
+    expect(box.placeholder).not.toBe("Listening…");
+    expect(byId<HTMLButtonElement>("send").disabled).toBe(false);
+    mic.click();
+    expect(stop).toHaveBeenCalled();
+    finishTurn("Tell me about Shepherd");
+    await flush();
+    expect(mic.getAttribute("aria-pressed")).toBe("false");
+    expect(mic.classList.contains("listening")).toBe(false);
+    expect(mic.style.getPropertyValue("--level")).toBe("");
+    expect(mocks.startRecording).not.toHaveBeenCalled();
+    expect(callsTo("ask")).toHaveLength(0);
+  });
+
+  it("falls back to recording when live dictation cannot connect, and explains a blocked microphone", async () => {
+    mocks.dictationSupported.mockReturnValue(true);
+    mocks.startDictation.mockReturnValue({ ready: Promise.reject(new Error("refused")), result: new Promise(() => {}), stop: vi.fn() });
+    mocks.startRecording.mockResolvedValue(recordingWith());
+    responses.transcribe = { ok: true, text: "Fallback words", source: "workers-ai" };
+    byId("mic").click();
+    await flush();
+    await flush();
+    expect(byId<HTMLTextAreaElement>("question").value).toBe("Fallback words");
+    mocks.startDictation.mockReturnValue({ ready: Promise.reject(new DOMException("no", "NotAllowedError")), result: new Promise(() => {}), stop: vi.fn() });
+    mocks.startRecording.mockClear();
+    byId("mic").click();
+    await flush();
+    expect(notice()).toContain("Microphone access was blocked");
+    expect(mocks.startRecording).not.toHaveBeenCalled();
+    expect(byId("mic").getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("preloads the dictation worklet once the composer or microphone is approached", () => {
+    byId("mic").dispatchEvent(new Event("pointerenter"));
+    byId("question").dispatchEvent(new Event("focus"));
+    expect(mocks.preloadDictation).toHaveBeenCalledWith("/capture-processor.js");
   });
 
   const listen = async () => {

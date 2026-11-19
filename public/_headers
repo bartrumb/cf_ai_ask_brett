@@ -6,3 +6,7 @@
   Strict-Transport-Security: max-age=31536000; includeSubDomains
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Resource-Policy: same-origin
+
+# The dictation worklet is fetched ahead of the first tap; a short cache lets addModule reuse it.
+/capture-processor.js
+  Cache-Control: public, max-age=3600

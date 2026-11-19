@@ -125,6 +125,8 @@ button, textarea { font: inherit; color: inherit; }
 .count.over { color: var(--ask-accent); }
 .ask .button.primary { background: var(--ask-accent); border-color: var(--ask-accent); color: #20100a; }
 .button.ghost[aria-pressed="true"] { background: var(--ask-accent); color: #20100a; }
+/* Listening indicator: a dot that grows with the microphone level. */
+.button.listening::before { content: ""; display: inline-block; width: 0.55rem; height: 0.55rem; margin-right: 0.45rem; border-radius: 50%; background: currentColor; vertical-align: 0.05em; transform: scale(calc(0.6 + var(--level, 0) * 0.9)); transition: transform 90ms linear; }
 .disclaimer { padding: 0 1.25rem 1rem; font-size: 0.82rem; color: var(--ask-muted); }
 
 .band { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 9fr); gap: 1.5rem clamp(2rem, 5vw, 4.5rem); padding: clamp(3rem, 6vw, 5rem) var(--gutter); border-bottom: 1px solid var(--ink); }
@@ -171,4 +173,6 @@ button, textarea { font: inherit; color: inherit; }
   html { scroll-behavior: auto; }
   .thinking::after { animation: none; }
   .button:hover:not(:disabled) { transform: none; box-shadow: none; }
+  /* A steady dot still shows that the microphone is on. */
+  .button.listening::before { transform: none; transition: none; }
 }

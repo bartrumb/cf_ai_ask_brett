@@ -1,12 +1,17 @@
 /*
  * AudioWorklet for live dictation. It turns microphone audio at the device's rate into 16 kHz,
  * 16-bit mono PCM and posts one 100 ms chunk at a time to the page, which sends it to the server.
+ * It also posts the input level as a number from 0 to 1, for a "listening" indicator.
  * Plain JavaScript, served as its own file: worklet modules load by URL under the page's script-src.
  * Adapted from Shop Shepherd's capture processor.
  */
 const TARGET_RATE = 16000;
 /** 100 ms at the target rate. */
 const CHUNK = 1600;
+/** Render quanta (128 frames each) per level report: about 20 a second at 48 kHz. */
+const LEVEL_EVERY = 16;
+/** Scales speech RMS, which is usually well under 0.3, into a useful 0 to 1 range. */
+const LEVEL_GAIN = 4;
 
 class CaptureProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -16,6 +21,9 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.buffer = new Float32Array(Math.ceil(CHUNK * this.ratio));
     this.length = 0;
     this.stopped = false;
+    this.levelSum = 0;
+    this.levelFrames = 0;
+    this.quanta = 0;
     this.port.onmessage = (event) => {
       if (event.data === "stop") {
         this.stopped = true;
@@ -31,7 +39,16 @@ class CaptureProcessor extends AudioWorkletProcessor {
     for (let index = 0; index < channel.length; index += 1) {
       this.buffer[this.length] = channel[index];
       this.length += 1;
+      this.levelSum += channel[index] * channel[index];
       if (this.length === this.buffer.length) this.flush();
+    }
+    this.levelFrames += channel.length;
+    this.quanta += 1;
+    if (this.quanta === LEVEL_EVERY) {
+      this.port.postMessage(Math.min(1, Math.sqrt(this.levelSum / this.levelFrames) * LEVEL_GAIN));
+      this.levelSum = 0;
+      this.levelFrames = 0;
+      this.quanta = 0;
     }
     return true;
   }

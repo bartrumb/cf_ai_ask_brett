@@ -8,7 +8,7 @@ import type { SiteContent } from "../src/domain/content";
 import type { ActionResult, AnswerSource, ChatMessage, LiveMessage, ShowcaseState, Snapshot, SpokenPart } from "../src/domain/types";
 import { byId, disclaimerText, emptyPrompt, h, renderProfile, setText } from "./profile";
 import { renderRichText } from "./rich-text";
-import { startRecording, startSpeech, stopPlayback, type Recording } from "./voice";
+import { dictationSupported, preloadDictation, startDictation, startRecording, startSpeech, stopPlayback, type Dictation, type Recording } from "./voice";
 
 /** Mirrors the server limit so the composer can warn before submitting. */
 const MAX_QUESTION_CHARS = 500;
@@ -16,6 +16,8 @@ const MAX_QUESTION_CHARS = 500;
 const CONVERSATION_KEY = "ask-brett-conversation";
 /** localStorage key for an explicit theme choice. */
 const THEME_KEY = "ask-brett-theme";
+/** This site serves `public/` at its root, including the dictation worklet. */
+const WORKLET_URL = "/capture-processor.js";
 /** Backstop for a whole streamed answer. Parts play as they arrive, well before this. */
 const SPEECH_CALL_TIMEOUT_MS = 60_000;
 /** Labels shown under answers. */
@@ -51,6 +53,10 @@ let submitting = false;
 let refreshing = false;
 let refreshQueued = false;
 let recording: Recording | null = null;
+/** Live dictation in progress. Words stream into the composer while it runs. */
+let dictation: Dictation | null = null;
+/** True until the first dictated word arrives, while the composer shows "Listening…". */
+let awaitingWords = false;
 let transcribing = false;
 /** Answer being fetched or played as speech. */
 let speakingId: number | null = null;
@@ -109,9 +115,13 @@ function updateComposer(): void {
   ui.count.classList.toggle("over", length >= MAX_QUESTION_CHARS);
   ui.send.disabled = !connected || isBusy() || !ui.input.value.trim() || length > MAX_QUESTION_CHARS;
   ui.send.textContent = isBusy() ? "Answering" : "Ask";
+  const listening = Boolean(recording || dictation);
   ui.mic.disabled = !connected || transcribing;
-  ui.mic.textContent = recording ? "Stop" : transcribing ? "Transcribing" : "Speak";
-  ui.mic.setAttribute("aria-pressed", String(Boolean(recording)));
+  ui.mic.textContent = listening ? "Stop" : transcribing ? "Transcribing" : "Speak";
+  ui.mic.setAttribute("aria-pressed", String(listening));
+  ui.mic.classList.toggle("listening", listening);
+  if (!listening) ui.mic.style.removeProperty("--level");
+  ui.input.placeholder = dictation && awaitingWords ? "Listening…" : "What should I know about this work?";
   for (const button of ui.suggestions.querySelectorAll("button")) button.disabled = !connected || isBusy();
 }
 
@@ -215,12 +225,77 @@ async function ask(question: string): Promise<void> {
   }
 }
 
-/** Starts recording, or stops it. The transcript goes to the composer for checking. */
+/** Shows a microphone failure in plain words. */
+function reportMicError(error: unknown): void {
+  const name = error instanceof DOMException ? error.name : "";
+  setNotice(
+    name === "NotAllowedError" ? "Microphone access was blocked. You can allow it in the browser's site settings."
+    : name === "NotFoundError" ? "No microphone was found."
+    : name === "NotReadableError" ? "The microphone is in use by another app."
+    : "The recording could not be processed.",
+  );
+}
+
+/** Puts dictated text in the composer, keeping the caret and view at the end as words are revised. */
+function showDictatedText(prefix: string, text: string): void {
+  const value = [prefix, text].filter(Boolean).join(" ").slice(0, MAX_QUESTION_CHARS);
+  if (ui.input.value !== value) {
+    ui.input.value = value;
+    ui.input.setSelectionRange(value.length, value.length);
+    ui.input.scrollTop = ui.input.scrollHeight;
+  }
+  awaitingWords = false;
+  updateComposer();
+}
+
+/**
+ * Live dictation: words appear in the composer while the visitor speaks. It starts synchronously
+ * inside the click, which iOS requires for audio, and returns false when it cannot run so the
+ * caller can record instead. The text is left for the visitor to check and send.
+ */
+async function dictate(): Promise<boolean> {
+  const prefix = ui.input.value.trim();
+  const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/agents/dictation`;
+  const live = startDictation(url, WORKLET_URL, (text) => showDictatedText(prefix, text), {
+    onLevel: (level) => ui.mic.style.setProperty("--level", level.toFixed(2)),
+  });
+  dictation = live;
+  awaitingWords = true;
+  updateComposer();
+  try {
+    await live.ready;
+  } catch (error) {
+    dictation = null;
+    updateComposer();
+    if (error instanceof DOMException && error.name !== "AbortError") {
+      reportMicError(error);
+      return true;
+    }
+    return false;
+  }
+  try {
+    await live.result;
+  } finally {
+    dictation = null;
+    updateComposer();
+    ui.input.focus();
+  }
+  return true;
+}
+
+/** Starts listening, or stops it. The transcript goes to the composer for checking. */
 async function toggleRecording(): Promise<void> {
+  if (dictation) {
+    dictation.stop();
+    return;
+  }
   if (recording) {
     recording.stop();
     return;
   }
+  setNotice("");
+  // Live dictation first. Offline mode, a refused socket or an older browser falls back to recording.
+  if (dictationSupported() && (await dictate())) return;
   setNotice("");
   const owner = client;
   try {
@@ -240,8 +315,7 @@ async function toggleRecording(): Promise<void> {
       if (result.source === "offline") setNotice("Offline preview: this is a sample transcript, not your words.");
     }
   } catch (error) {
-    const denied = error instanceof DOMException && error.name === "NotAllowedError";
-    setNotice(denied ? "Microphone access was blocked." : "The recording could not be processed.");
+    reportMicError(error);
   } finally {
     recording = null;
     transcribing = false;
@@ -395,6 +469,10 @@ ui.form.addEventListener("submit", (event) => {
   void ask(ui.input.value);
 });
 ui.mic.addEventListener("click", () => void toggleRecording());
+// Fetch the worklet before the first tap, so starting dictation does not wait for it.
+for (const target of [ui.mic, ui.input]) {
+  for (const event of ["pointerenter", "focus"]) target.addEventListener(event, () => preloadDictation(WORKLET_URL), { once: true });
+}
 
 loadProfile();
 render();

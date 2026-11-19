@@ -101,6 +101,8 @@ export async function startRecording(): Promise<Recording> {
 const DICTATION_CONNECT_MS = 6_000;
 /** After the visitor stops, how long to wait for the transcriber's final words. */
 const DICTATION_SETTLE_MS = 1_500;
+/** Audio kept while the socket opens: about 2 seconds of 16 kHz, 16-bit mono. */
+const MAX_QUEUED_BYTES = 64_000;
 
 /** A live dictation. Text arrives through `onText` while the visitor speaks. */
 export interface Dictation {
@@ -112,6 +114,27 @@ export interface Dictation {
   stop: () => void;
 }
 
+/** Optional behaviour for a live dictation. */
+export interface DictationOptions {
+  /** Receives the microphone level from 0 to 1, a few dozen times a second. */
+  onLevel?: (level: number) => void;
+  /** End after the first finished turn (the default), or keep listening until Stop or the time limit. */
+  endOnTurn?: boolean;
+}
+
+/** Worklet URLs already fetched, so each is requested once. */
+const preloaded = new Set<string>();
+
+/**
+ * Fetches the worklet ahead of the first tap, so `addModule` reads it from the HTTP cache instead
+ * of waiting on the network. Failures are ignored: dictation simply fetches it again.
+ */
+export function preloadDictation(workletUrl: string): void {
+  if (preloaded.has(workletUrl) || typeof fetch !== "function") return;
+  preloaded.add(workletUrl);
+  void fetch(workletUrl, { credentials: "same-origin" }).catch(() => preloaded.delete(workletUrl));
+}
+
 /** True when this browser can stream microphone audio through an AudioWorklet. */
 export function dictationSupported(): boolean {
   return typeof AudioWorkletNode !== "undefined" && typeof WebSocket !== "undefined" && Boolean(navigator.mediaDevices?.getUserMedia) && window.isSecureContext;
@@ -121,18 +144,29 @@ export function dictationSupported(): boolean {
  * Starts live dictation. Call it directly from the click handler: the AudioContext is created and
  * resumed before any await, because iOS Safari only lets audio start inside the user's gesture.
  *
+ * The microphone, the worklet module and the socket start together. Capture begins as soon as the
+ * microphone and worklet are ready, and audio recorded before the socket opens is queued and sent
+ * in order, so the first words are not lost while it connects.
+ *
  * @param url - The dictation WebSocket URL.
  * @param workletUrl - Where `capture-processor.js` is served.
  * @param onText - Receives the transcript so far, replacing the previous value.
  */
-export function startDictation(url: string, workletUrl: string, onText: (text: string) => void): Dictation {
+export function startDictation(url: string, workletUrl: string, onText: (text: string) => void, options: DictationOptions = {}): Dictation {
   const context = new AudioContext();
   void context.resume();
+  const endOnTurn = options.endOnTurn ?? true;
   let socket: WebSocket | null = null;
   let stream: MediaStream | null = null;
   let node: AudioWorkletNode | null = null;
+  /** Finished turns, when dictation continues past the first one. */
+  let earlier = "";
   let text = "";
   let finished = false;
+  const queue: ArrayBuffer[] = [];
+  let queuedBytes = 0;
+  /** Stop was pressed while the socket was still opening; finish once the queued audio is sent. */
+  let stopRequested = false;
   let settle: (value: string) => void = () => {};
   let fail: (error: unknown) => void = () => {};
   const result = new Promise<string>((resolve, reject) => {
@@ -156,20 +190,64 @@ export function startDictation(url: string, workletUrl: string, onText: (text: s
     settle(value.trim());
   };
 
+  /** Sends a chunk, or queues it until the socket opens. The oldest audio is dropped past the cap. */
+  const sendAudio = (chunk: ArrayBuffer) => {
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(chunk);
+      return;
+    }
+    queue.push(chunk);
+    queuedBytes += chunk.byteLength;
+    while (queuedBytes > MAX_QUEUED_BYTES && queue.length > 1) queuedBytes -= queue.shift()?.byteLength ?? 0;
+  };
+
   const ready = (async () => {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-    // Stopped while the permission prompt was open: release the microphone at once.
-    if (finished) return cleanUp();
-    await context.audioWorklet.addModule(workletUrl);
     const opened = new WebSocket(url);
     socket = opened;
     opened.binaryType = "arraybuffer";
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("Dictation did not connect.")), DICTATION_CONNECT_MS);
+    let connectError: Error | null = null;
+    const connected = new Promise<void>((resolve, reject) => {
+      const fail = (message: string) => {
+        clearTimeout(timer);
+        connectError = new Error(message);
+        reject(connectError);
+      };
+      const timer = setTimeout(() => fail("Dictation did not connect."), DICTATION_CONNECT_MS);
       opened.addEventListener("open", () => (clearTimeout(timer), resolve()), { once: true });
-      opened.addEventListener("error", () => (clearTimeout(timer), reject(new Error("Dictation did not connect."))), { once: true });
-      opened.addEventListener("close", () => (clearTimeout(timer), reject(new Error("Dictation was refused."))), { once: true });
+      opened.addEventListener("error", () => fail("Dictation did not connect."), { once: true });
+      opened.addEventListener("close", () => fail("Dictation was refused."), { once: true });
     });
+    // Awaited below; until then a refusal must not surface as an unhandled rejection.
+    connected.catch(() => {});
+
+    const [media] = await Promise.all([
+      navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }),
+      context.audioWorklet.addModule(workletUrl),
+    ]);
+    stream = media;
+    // Stopped while the permission prompt was open: release the microphone at once.
+    if (finished) return cleanUp();
+    // Refused before the microphone was ready: no point capturing, so the caller can fall back now.
+    if (connectError) throw connectError;
+
+    const source = context.createMediaStreamSource(media);
+    node = new AudioWorkletNode(context, "capture-processor");
+    node.port.onmessage = (event: MessageEvent<ArrayBuffer | number>) => {
+      if (typeof event.data === "number") options.onLevel?.(event.data);
+      else sendAudio(event.data);
+    };
+    source.connect(node);
+    // Some browsers only run a worklet that reaches the destination. It outputs silence.
+    node.connect(context.destination);
+    if (context.state !== "running") await context.resume();
+
+    try {
+      await connected;
+    } catch (error) {
+      // The visitor already pressed Stop: end quietly instead of falling back to recording.
+      if (stopRequested) return finish();
+      throw error;
+    }
     if (finished) return cleanUp();
     opened.addEventListener("message", (event) => {
       if (typeof event.data !== "string") return;
@@ -180,22 +258,18 @@ export function startDictation(url: string, workletUrl: string, onText: (text: s
         return;
       }
       if (typeof message.transcript === "string" && message.transcript) {
-        text = message.transcript;
+        text = [earlier, message.transcript].filter(Boolean).join(" ");
         onText(text);
       }
-      if (message.event === "EndOfTurn") finish();
+      if (message.event !== "EndOfTurn") return;
+      if (endOnTurn) finish();
+      else earlier = text.trim();
     });
     // Covers the server's time limit and any drop: keep what was heard.
     opened.addEventListener("close", () => finish());
-    const source = context.createMediaStreamSource(stream);
-    node = new AudioWorkletNode(context, "capture-processor");
-    node.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
-      if (opened.readyState === WebSocket.OPEN) opened.send(event.data);
-    };
-    source.connect(node);
-    // Some browsers only run a worklet that reaches the destination. It outputs silence.
-    node.connect(context.destination);
-    if (context.state !== "running") await context.resume();
+    for (const chunk of queue.splice(0)) opened.send(chunk);
+    queuedBytes = 0;
+    if (stopRequested) requestFinalWords();
   })();
   ready.catch((error: unknown) => {
     if (finished) return;
@@ -204,14 +278,27 @@ export function startDictation(url: string, workletUrl: string, onText: (text: s
     fail(error);
   });
 
-  const stop = () => {
-    if (finished) return;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return finish();
-    // Flush the last audio, ask the transcriber to finish, and keep whatever arrives in time.
-    node?.port.postMessage("stop");
-    stream?.getTracks().forEach((track) => track.stop());
-    socket.send("stop");
+  /** Asks the transcriber to finish, and keeps whatever arrives in time. */
+  function requestFinalWords(): void {
+    socket?.send("stop");
     setTimeout(() => finish(), DICTATION_SETTLE_MS);
+  }
+
+  const stop = () => {
+    if (finished || stopRequested) return;
+    const capturing = Boolean(node);
+    if (capturing) {
+      // Flush the last audio from the worklet and release the microphone.
+      node?.port.postMessage("stop");
+      stream?.getTracks().forEach((track) => track.stop());
+    }
+    if (socket?.readyState === WebSocket.OPEN) return requestFinalWords();
+    // Still connecting with audio queued: send it once the socket opens, then finish.
+    if (capturing && socket?.readyState === WebSocket.CONNECTING) {
+      stopRequested = true;
+      return;
+    }
+    finish();
   };
   return { ready, result, stop };
 }

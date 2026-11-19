@@ -48,7 +48,7 @@ All of this lives on computers spread around the world, so the receptionist is a
 | --- | --- | --- |
 | **LLM** | DeepSeek V4.1 Flash on Workers AI, with Inkling 2 Small as the automatic fallback. Every language-model call goes through AI Gateway | [`src/llm.ts`](./src/llm.ts), [`src/models.ts`](./src/models.ts) |
 | **Workflow or coordination** | One Durable Object per conversation runs the Agents SDK and the **Think** harness. Questions enter a durable inbox with idempotency keys, turns survive interruption, and alarms handle cleanup. A separate Durable Object instance coordinates the shared daily budget | [`src/agent.ts`](./src/agent.ts) |
-| **User input through chat or voice** | A streaming web chat, plus push-to-talk speech recognition and streamed spoken answers | [`client/main.ts`](./client/main.ts), [`client/voice.ts`](./client/voice.ts), [`src/speech.ts`](./src/speech.ts) |
+| **User input through chat or voice** | A streaming web chat, live dictation that shows words in the composer while the visitor speaks (with recording as the fallback), and streamed spoken answers | [`client/main.ts`](./client/main.ts), [`client/voice.ts`](./client/voice.ts), [`src/speech.ts`](./src/speech.ts) |
 | **Memory or state** | Each conversation keeps its messages in Durable Object SQLite, and recent redacted exchanges give the model context for follow-up questions | [`src/agent.ts`](./src/agent.ts), [`src/domain/prompt.ts`](./src/domain/prompt.ts) |
 | **AI-assisted coding with prompt history** | Every prompt is recorded in order, with a note on what it produced | [`PROMPTS.md`](./PROMPTS.md) |
 | **Documentation and run instructions** | This file, with an offline mode that needs no Cloudflare account | [Run it yourself](#run-it-yourself) |
@@ -172,7 +172,7 @@ flowchart LR
 | Purpose | Live today | Fallback | Optional |
 | --- | --- | --- | --- |
 | Language | `@cf/deepseek-ai/deepseek-v4.1-flash-1017` | `@cf/thinkingmachines/inkling-2-small` | |
-| Live dictation (embedded widget) | `@cf/deepgram/flux`, streamed over a WebSocket | Recording, then Whisper | |
+| Live dictation (this site and the embedded widget) | `@cf/deepgram/flux`, streamed over a WebSocket | Recording, then Whisper | |
 | Speech to text | `@cf/openai/whisper-large-v3-turbo` | | `@cf/deepgram/nova-3` with `AI_GATEWAY_TOKEN` |
 | Text to speech | ElevenLabs `eleven_v4`, Jarnathan voice | `@cf/deepgram/aura-1`, Orion voice | Deepgram `aura-2-aries-en` with `DEEPGRAM_API_KEY` |
 
