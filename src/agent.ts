@@ -15,6 +15,7 @@ import { allowedClientFrameId, parseInput, questionRequestSchema, speakRequestSc
 import type { ActionResult, AnswerSource, ChatMessage, LiveMessage, ShowcaseState, Snapshot } from "./domain/types";
 import type { GatewayContext } from "./gateway";
 import { KNOWLEDGE_SECTIONS, PROFILE } from "./generated/knowledge";
+import { reportBudgetRefusal, type BudgetLimit } from "./alerts";
 import { createLanguageModel, isOffline } from "./llm";
 import { createOfflineModel } from "./offline-model";
 import { streamSpeech, transcribeAudio, type Transcript } from "./speech";
@@ -333,7 +334,7 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
         const [recent] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM messages
           WHERE source = 'guarded' AND created_at > ${now - HOUR_MS}`;
         if ((recent?.count ?? 0) >= MAX_GUARDED_REPLIES_PER_HOUR && currentIdentity()?.budgetExempt !== true) {
-          console.warn("budget refused", { limit: "guarded-hourly" });
+          this.refused("guarded-hourly");
           return { ok: false, error: BUSY_MESSAGE };
         }
         // No await separates these writes, so the pair commits together and stays adjacent.
@@ -433,14 +434,13 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
     this.sql`DELETE FROM daily_client_budget WHERE day <> ${day}`;
     const [row] = this.sql<{ used: number }>`SELECT used FROM daily_budget WHERE day = ${day}`;
     if ((row?.used ?? 0) + units > limit) {
-      console.warn("budget refused", { limit: "site-daily", used: row?.used ?? 0 });
+      this.refused("site-daily", row?.used ?? 0);
       return false;
     }
     if (client) {
       const [visitor] = this.sql<{ used: number }>`SELECT used FROM daily_client_budget WHERE day = ${day} AND client = ${client}`;
       if ((visitor?.used ?? 0) + units > clientLimit) {
-        // The client key is a daily hash, so this log can count visitors without identifying them.
-        console.warn("budget refused", { limit: "visitor-daily", visitor: client.slice(0, 8), used: visitor?.used ?? 0 });
+        this.refused("visitor-daily", visitor?.used ?? 0);
         return false;
       }
       this.sql`INSERT INTO daily_client_budget (day, client, used) VALUES (${day}, ${client}, ${units})
@@ -521,7 +521,7 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
    */
   private async allowSharedAiSpend(units: number, exempt: boolean): Promise<boolean> {
     if (!(await this.env.AI_ACTION_LIMIT.limit({ key: "global" })).success) {
-      console.warn("budget refused", { limit: "per-minute" });
+      this.refused("per-minute");
       return false;
     }
     // The owner's testing network neither uses nor counts toward the daily budgets, so testing
@@ -569,7 +569,7 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
     this.sql`DELETE FROM ai_actions WHERE created_at <= ${hourAgo}`;
     const [used] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM ai_actions`;
     if (!exempt && (used?.count ?? 0) >= MAX_AI_ACTIONS_PER_HOUR) {
-      console.warn("budget refused", { limit: "conversation-hourly" });
+      this.refused("conversation-hourly");
       return false;
     }
     // The slot is held before the await, so concurrent calls cannot pass the hourly limit.
@@ -579,7 +579,14 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
     return false;
   }
 
+  /** Logs a refused action and sends the alert event without delaying the visitor's reply. */
+  private refused(limit: BudgetLimit, used?: number): void {
+    console.warn("budget refused", { limit, ...(used === undefined ? {} : { used }) });
+    this.ctx.waitUntil(reportBudgetRefusal(this.env as Env & { POSTHOG_PROJECT_KEY?: string }, limit, used));
+  }
+
   /** Caps stored conversation rows. */
+
   private prune(): void {
     this.sql`DELETE FROM messages WHERE id NOT IN (
       SELECT id FROM messages ORDER BY id DESC LIMIT ${MAX_STORED_MESSAGES})`;

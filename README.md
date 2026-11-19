@@ -11,7 +11,7 @@
 [![Live site](https://img.shields.io/badge/live-ask--brett.shopdawg.workers.dev-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](https://ask-brett.shopdawg.workers.dev)
 [![CI](https://img.shields.io/github/actions/workflow/status/bartrumb/cf_ai_ask_brett/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/bartrumb/cf_ai_ask_brett/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-95.5%25-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
-[![Tests](https://img.shields.io/badge/tests-365%20passing-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
+[![Tests](https://img.shields.io/badge/tests-368%20passing-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
 
 [![Lighthouse mobile](https://img.shields.io/badge/Lighthouse%20mobile-99%20%C2%B7%20100%20%C2%B7%20100%20%C2%B7%20100-0CCE6B?logo=lighthouse&logoColor=white)](#quality)
 [![Lighthouse desktop](https://img.shields.io/badge/Lighthouse%20desktop-100%20%C2%B7%20100%20%C2%B7%20100%20%C2%B7%20100-0CCE6B?logo=lighthouse&logoColor=white)](#quality)
@@ -248,11 +248,13 @@ A question, transcription or live dictation session costs one unit, Listen costs
 
 For testing, the optional `BUDGET_EXEMPT_IPS` secret lists addresses (an IPv6 entry covers its /64) that skip the hourly and daily budgets and do not count toward them. The per-minute ceiling and the gateway spend limit still apply. It is a secret so the address stays out of the repository.
 
+Alerts: with the optional `POSTHOG_PROJECT_KEY` secret set, every refusal also sends an `ask_budget_refused` event (the limit's name and count, nothing about the visitor) to PostHog, where an hourly alert emails the owner when the count goes above zero. Without the secret, nothing is sent.
+
 ## Quality
 
 | Check | Result |
 | --- | --- |
-| Tests | 365 passing across 16 files, in the Workers runtime and a simulated DOM |
+| Tests | 368 passing across 17 files, in the Workers runtime and a simulated DOM |
 | Statements | 95.5% |
 | Branches | 85.9% |
 | Functions | 96.0% |

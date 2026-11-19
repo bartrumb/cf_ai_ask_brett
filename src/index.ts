@@ -4,6 +4,7 @@
  */
 import { getAgentByName, routeAgentRequest } from "agents";
 import { BUDGET_INSTANCE, type ShowcaseAgent } from "./agent";
+import { reportBudgetRefusal } from "./alerts";
 import { DICTATION_PATH, openDictation } from "./dictation";
 import { ACCESS_EXPIRES_HEADER, BUDGET_EXEMPT_HEADER, CLIENT_KEY_HEADER, verifyAccessToken, type AccessIdentity } from "./access";
 import { conversationIdSchema } from "./domain/schemas";
@@ -98,7 +99,7 @@ async function forwardRequest(request: Request, identity: AccessIdentity | null,
  * budget unit, like one recorded transcription, and the owner's testing network skips the daily
  * budgets as it does in the agent. Offline mode has no transcriber, so the browser falls back.
  */
-async function dictation(request: Request, env: Env, url: URL): Promise<Response> {
+async function dictation(request: Request, env: Env, url: URL, ctx?: ExecutionContext): Promise<Response> {
   // HTTP/2 can drop the Upgrade header on the way in; every WebSocket handshake carries a version.
   if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket" && !request.headers.get("Sec-WebSocket-Version")) {
     return new Response("WebSocket required", { status: 426 });
@@ -111,7 +112,12 @@ async function dictation(request: Request, env: Env, url: URL): Promise<Response
   const access = await authorize(request, env);
   if ("denied" in access) return access.denied;
   if (isOffline(env)) return new Response("Dictation is unavailable offline", { status: 503 });
-  if (!(await env.AI_ACTION_LIMIT.limit({ key: "global" })).success) return new Response("Busy", { status: 429 });
+  if (!(await env.AI_ACTION_LIMIT.limit({ key: "global" })).success) {
+    // Daily refusals are reported by the budget instance itself; this one happens here.
+    console.warn("budget refused", { limit: "per-minute" });
+    ctx?.waitUntil(reportBudgetRefusal(env as Env & { POSTHOG_PROJECT_KEY?: string }, "per-minute"));
+    return new Response("Busy", { status: 429 });
+  }
   if (!isBudgetExempt(address, (env as Env & { BUDGET_EXEMPT_IPS?: string }).BUDGET_EXEMPT_IPS)) {
     const limit = Number(env.DAILY_AI_ACTION_LIMIT);
     const clientLimit = Number(env.DAILY_CLIENT_AI_ACTION_LIMIT);
@@ -133,10 +139,10 @@ async function dictation(request: Request, env: Env, url: URL): Promise<Response
  * do not use the per-address connection budget.
  */
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/agents/")) return new Response("Not found", { status: 404 });
-    if (url.pathname === DICTATION_PATH) return dictation(request, env, url);
+    if (url.pathname === DICTATION_PATH) return dictation(request, env, url, ctx);
 
     const conversation = url.pathname.startsWith(AGENT_PREFIX) ? url.pathname.slice(AGENT_PREFIX.length) : "";
     if (!conversationIdSchema.safeParse(conversation).success) {

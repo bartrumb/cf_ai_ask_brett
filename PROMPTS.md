@@ -434,3 +434,15 @@ I have another agent working on that I want you to focus back on brett.bartrum.f
 ````
 
 **Produced:** `mountLauncher` in `client/widget.ts`, a floating avatar button that opens the chat in a panel and connects only when the button is approached. It sizes to the visual viewport on phones so the iOS keyboard cannot hide the composer, and handles Escape, focus return and scroll lock. Also live dictation: `public/capture-processor.js` streams 16 kHz PCM from an AudioWorklet over `/agents/dictation` (`src/dictation.ts`) to Deepgram Flux, so words appear while the visitor speaks, with the old record-then-transcribe path as the fallback. Plus the `BUDGET_EXEMPT_IPS` secret for the owner's testing network, and a `budget refused` log line for every limit. A test caught that binary WebSocket frames arrive as Blobs on this compatibility date, which would have sent "[object Blob]" instead of audio.
+
+---
+
+## Prompt 26
+
+This request came from the Claude Code session I use for résumé and site review. That session made the change itself.
+
+````text
+looks and works great, lets setup alerts if somebody hits the cap, see how many requests I just used testing the site the cap should be higher than whatever that took
+````
+
+**Produced:** `src/alerts.ts`, which sends an `ask_budget_refused` event to PostHog for every refusal when the `POSTHOG_PROJECT_KEY` secret is set, carrying only the limit's name and count. Every refusal in the agent and the dictation route now goes through one helper that logs and alerts. In PostHog, an hourly insight of those events and an alert that emails the owner when it goes above zero. The owner's test session used about five answers plus a few dictation sessions, well under the per-visitor cap of 200 units a day, so the caps were left as they are.
