@@ -1,14 +1,24 @@
+/*
+ * Pure helpers for voice features: validating uploaded WAV data and preparing stored text for
+ * speech. `CodexGuardAgent` calls these before `speech.ts` reaches a model.
+ */
 import { Buffer } from "node:buffer";
 import { normalizeText } from "./input";
 import { redactSecrets } from "./rules";
 import { MAX_AUDIO_BYTES } from "./schemas";
 import type { RuleResult } from "./types";
 
+/** Longest text sent to text-to-speech, which bounds the cost of one request. */
 export const MAX_SPOKEN_CHARS = 1_500;
 
+/** Decoded audio bytes, or a message that can be shown to the user. */
 export type DecodedAudio = { ok: true; bytes: Uint8Array } | { ok: false; error: string };
 
-/** Decodes schema-checked base64 and confirms that it is a bounded WAV file. */
+/**
+ * Decodes schema-checked base64 and confirms that it is a bounded WAV file.
+ *
+ * Only the size and RIFF/WAVE markers are checked. Sample format is left to the speech model.
+ */
 export function decodeWav(base64: string): DecodedAudio {
   const bytes = new Uint8Array(Buffer.from(base64, "base64"));
   if (bytes.length > MAX_AUDIO_BYTES) return { ok: false, error: "That recording is too long. Keep it under 30 seconds." };
@@ -19,6 +29,7 @@ export function decodeWav(base64: string): DecodedAudio {
   return { ok: true, bytes };
 }
 
+/** Shortens text to `MAX_SPOKEN_CHARS`, ending at the last full sentence when one exists. */
 function fitToLimit(text: string): string {
   if (text.length <= MAX_SPOKEN_CHARS) return text;
   const cut = text.slice(0, MAX_SPOKEN_CHARS);
@@ -26,7 +37,11 @@ function fitToLimit(text: string): string {
   return sentenceEnd > 0 ? cut.slice(0, sentenceEnd + 1) : cut;
 }
 
-/** Turns stored markdown-like text into plain text that reads well aloud. */
+/**
+ * Turns stored markdown-like text into plain text that reads well aloud.
+ *
+ * Code blocks are replaced with a short notice. The result is normalized, redacted and length-limited.
+ */
 export function toSpokenText(text: string): string {
   const withoutCode = text.replace(/```[\s\S]*?```/g, " Code example omitted. ");
   const plain = withoutCode

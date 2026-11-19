@@ -1,3 +1,7 @@
+/*
+ * Example changes offered as one-click inputs in the composer.
+ */
+/** A labeled example input. */
 export interface Sample {
   label: string;
   text: string;

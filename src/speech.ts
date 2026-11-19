@@ -1,21 +1,31 @@
+/*
+ * Speech-to-text and text-to-speech calls through AI Gateway, each with a fallback model and an
+ * offline path. `CodexGuardAgent` handles validation, rate limits and redaction around these calls.
+ */
 import { Buffer } from "node:buffer";
 import type { CommentarySource } from "./domain/types";
 import { gatewayOptions, type GatewayContext } from "./gateway";
 import { isOffline } from "./llm";
 import { MODELS } from "./models";
 
+/** Fixed transcript returned in offline mode. It triggers rules, so the voice flow can be tried. */
 export const OFFLINE_TRANSCRIPT = "Drop the legacy orders table and skip the integration tests in CI.";
 
+/** Bindings needed for speech calls. */
 type SpeechEnv = Pick<Env, "AI" | "AI_MODE" | "AI_GATEWAY_ID">;
+/** Where a successful speech result came from. */
 type Source = Exclude<CommentarySource, "unavailable">;
+/** Loose signature for `env.AI.run`, which is called here with model-specific input shapes. */
 type RunModel = (model: string, input: unknown, options: unknown) => Promise<unknown>;
 
+/** Result of speech recognition. The model is null in offline mode. */
 export interface Transcript {
   text: string;
   source: Source;
   model: string | null;
 }
 
+/** Base64 audio returned to the browser. The model is null in offline mode. */
 export interface SpokenAudio {
   audio: string;
   mimeType: string;
@@ -28,6 +38,11 @@ function runner(env: SpeechEnv): RunModel {
   return env.AI.run.bind(env.AI) as unknown as RunModel;
 }
 
+/**
+ * Reads the Deepgram Nova response shape.
+ *
+ * @throws Error when no transcript string is present, which triggers the fallback model.
+ */
 function readNovaTranscript(output: unknown): string {
   const result = output as { results?: { channels?: { alternatives?: { transcript?: unknown }[] }[] } };
   const transcript = result.results?.channels?.[0]?.alternatives?.[0]?.transcript;
@@ -35,12 +50,24 @@ function readNovaTranscript(output: unknown): string {
   return transcript.trim();
 }
 
+/**
+ * Reads the Whisper response shape.
+ *
+ * @throws Error when no text string is present.
+ */
 function readWhisperTranscript(output: unknown): string {
   const text = (output as { text?: unknown }).text;
   if (typeof text !== "string") throw new Error("Unexpected transcription response.");
   return text.trim();
 }
 
+/**
+ * Transcribes a validated WAV file, trying the secondary model after any primary failure.
+ *
+ * @param wav - Bytes already checked by `decodeWav`.
+ * @param context - Gateway metadata for the request.
+ * @throws The secondary model's error when both models fail.
+ */
 export async function transcribeAudio(env: SpeechEnv, wav: Uint8Array, context: GatewayContext): Promise<Transcript> {
   if (isOffline(env)) return { text: OFFLINE_TRANSCRIPT, source: "offline", model: null };
 
@@ -60,6 +87,7 @@ export async function transcribeAudio(env: SpeechEnv, wav: Uint8Array, context: 
   } catch (error) {
     console.warn("primary transcription failed", error instanceof Error ? error.message : "unknown error");
   }
+  // Whisper takes base64 audio, unlike the streamed body sent to Nova.
   const output = await run(
     MODELS.stt.secondary,
     { audio: Buffer.from(wav).toString("base64"), task: "transcribe", language: "en", vad_filter: true },
@@ -68,6 +96,11 @@ export async function transcribeAudio(env: SpeechEnv, wav: Uint8Array, context: 
   return { text: readWhisperTranscript(output), source: "workers-ai", model: MODELS.stt.secondary };
 }
 
+/**
+ * Converts a raw speech response to base64.
+ *
+ * @throws Error on a non-success status or an empty body, which triggers the fallback model.
+ */
 async function readAudioResponse(output: unknown): Promise<string> {
   const response = output instanceof Response ? output : new Response(output as BodyInit);
   if (!response.ok) throw new Error(`Speech request failed with status ${response.status}.`);
@@ -99,6 +132,13 @@ function offlineTone(): string {
   return buffer.toString("base64");
 }
 
+/**
+ * Synthesizes MP3 speech, trying the secondary model after any primary failure.
+ *
+ * @param text - Text already prepared and length-limited by `domain/audio.ts`.
+ * @param context - Gateway metadata for the request.
+ * @throws The secondary model's error when both models fail.
+ */
 export async function synthesizeSpeech(env: SpeechEnv, text: string, context: GatewayContext): Promise<SpokenAudio> {
   if (isOffline(env)) return { audio: offlineTone(), mimeType: "audio/wav", source: "offline", model: null };
 

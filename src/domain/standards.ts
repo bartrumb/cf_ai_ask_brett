@@ -1,6 +1,14 @@
+/*
+ * The catalog of engineering standards. Detection for each ID lives in `rules.ts`, and repository
+ * settings are merged over this list by `CodexGuardAgent`.
+ */
 import type { Standard } from "./types";
 
-/** Invented sample standards for a fictional engineering team. */
+/**
+ * Invented sample standards for a fictional engineering team.
+ *
+ * Standards with `waivable: false` are mandatory: they cannot be disabled or given exceptions.
+ */
 export const SAMPLE_STANDARDS: readonly Standard[] = [
   {
     id: "STD-SEC-01",
@@ -84,6 +92,7 @@ export const SAMPLE_STANDARDS: readonly Standard[] = [
   },
 ];
 
+/** Looks up a standard by ID. Returns undefined for an unknown ID. */
 export function findStandard(id: string): Standard | undefined {
   return SAMPLE_STANDARDS.find((standard) => standard.id === id);
 }

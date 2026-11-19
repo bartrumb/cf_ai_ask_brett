@@ -1,9 +1,16 @@
+/*
+ * Desired AI Gateway configuration and the Cloudflare API calls that apply it. Used only by
+ * `scripts/setup-gateway.mjs`; the Worker reads just the gateway ID at runtime.
+ */
 import { z } from "zod";
 
+/** Gateway name used when `AI_GATEWAY_ID` is not set. Matches `wrangler.jsonc`. */
 export const DEFAULT_GATEWAY_ID = "codex-guard";
 
+/** Action AI Gateway Guardrails takes for a category. */
 type GuardrailAction = "FLAG" | "BLOCK";
 
+/** Gateway fields this app sets. The index signature preserves fields it does not manage. */
 export interface GatewaySettings {
   [key: string]: unknown;
   cache_invalidate_on_update: boolean;
@@ -18,6 +25,10 @@ export interface GatewaySettings {
   };
 }
 
+/**
+ * Validates the setup script's environment. Error messages never include the supplied values, so
+ * a malformed token cannot reach the console.
+ */
 export const gatewayEnvironmentSchema = z.object({
   CLOUDFLARE_ACCOUNT_ID: z.string({ error: "Set CLOUDFLARE_ACCOUNT_ID first." }).regex(/^[a-f0-9]{32}$/, {
     error: "CLOUDFLARE_ACCOUNT_ID must be a 32-character account ID.",
@@ -31,12 +42,17 @@ export const gatewayEnvironmentSchema = z.object({
     .default(DEFAULT_GATEWAY_ID),
 });
 
+/** Fields the API returns but does not accept back on update. */
 const READ_ONLY_FIELDS = ["id", "account_id", "account_tag", "internal_id", "created_at", "modified_at"];
 
 /**
  * Prompt injection (P1) is flagged, not blocked. This app reviews hostile diffs
  * on purpose, and blocking them would remove commentary where it helps most.
  * The update API replaces settings, so anything already configured is carried over.
+ * Log collection is always forced on. Existing guardrail choices win, including one for P1.
+ *
+ * @param existing - Settings returned by the API, or nothing for a new gateway.
+ * @returns The complete settings to send.
  */
 export function desiredGateway(existing?: Record<string, unknown>): GatewaySettings {
   const current = { ...existing };
@@ -57,6 +73,7 @@ export function desiredGateway(existing?: Record<string, unknown>): GatewaySetti
   };
 }
 
+/** Normalized Cloudflare API response. */
 interface ApiResult {
   status: number;
   ok: boolean;
@@ -66,6 +83,11 @@ interface ApiResult {
 /**
  * Creates or updates the gateway. The token is only placed in the request
  * header, and error messages contain only what the Cloudflare API returns.
+ *
+ * @param rawEnvironment - Usually `process.env`; validated before any request.
+ * @param fetcher - Replaceable for tests.
+ * @returns Whether the gateway was created or updated.
+ * @throws Error for invalid configuration or a failed API call.
  */
 export async function applyGateway(rawEnvironment: unknown, fetcher: typeof fetch = fetch): Promise<"created" | "updated"> {
   const parsed = gatewayEnvironmentSchema.safeParse(rawEnvironment);
@@ -78,6 +100,7 @@ export async function applyGateway(rawEnvironment: unknown, fetcher: typeof fetc
       ...init,
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     });
+    // A non-JSON error body still produces a useful status-based failure.
     const body = (await response.json().catch(() => ({}))) as ApiResult["body"];
     return { status: response.status, ok: response.ok && body.success !== false, body };
   };
@@ -87,6 +110,7 @@ export async function applyGateway(rawEnvironment: unknown, fetcher: typeof fetc
     throw new Error(`Could not ${action} (HTTP ${result.status}): ${detail}`);
   };
 
+  // Reading first lets the update preserve settings made outside this script.
   const existing = await request(`/${gatewayId}`);
   if (existing.status === 404) {
     const body = JSON.stringify({ id: gatewayId, ...desiredGateway() });

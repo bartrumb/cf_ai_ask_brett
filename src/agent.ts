@@ -1,3 +1,11 @@
+/*
+ * Durable Object that owns one repository's Codex Guard memory and its browser API.
+ *
+ * It stores reviews, exceptions, standard settings and the visible chat log in SQLite, starts
+ * `ReviewWorkflow` for each review, and answers follow-up questions through Think's durable
+ * inbox. Rule logic lives in `domain/`, model access in `llm.ts` and `speech.ts`. Browsers reach
+ * only the `@callable` methods allowed by `domain/schemas.ts`; the Workflow calls the others.
+ */
 import { Think, type ChatResponseResult, type StepContext, type TurnConfig, type TurnContext } from "@cloudflare/think";
 import { callable, type Connection, type WSMessage } from "agents";
 import { buildSpokenReview, decodeWav, toSpokenText } from "./domain/audio";
@@ -37,20 +45,36 @@ import { MODELS } from "./models";
 import { createOfflineModel } from "./offline-model";
 import { synthesizeSpeech, transcribeAudio, type SpokenAudio, type Transcript } from "./speech";
 
+/**
+ * Reviews kept per repository. Keep this above `MAX_REVIEWS_PER_HOUR`, which counts stored rows.
+ */
 const MAX_STORED_REVIEWS = 50;
+/** Reviews one repository may start in a rolling hour. */
 const MAX_REVIEWS_PER_HOUR = 30;
+/** Questions, transcriptions and speech requests one repository may make in a rolling hour. */
 const MAX_AI_ACTIONS_PER_HOUR = 60;
+/** Age at which a review still marked running is treated as abandoned. */
 const STALE_REVIEW_MS = 10 * 60 * 1000;
+/** Length of the rolling rate-limit window. */
 const HOUR_MS = 60 * 60 * 1000;
+/** Progress steps accepted from Workflow callbacks. */
 const STEP_NAMES: readonly StepName[] = ["intake", "rules", "commentary", "save"];
+/** Stored as the answer when a question turn fails or produces no text. */
 const UNAVAILABLE_ANSWER = "The model is unavailable right now. Rule results are unaffected.";
 
+/** Untyped SQLite row, narrowed by the `to*` mappers below. */
 type Row = Record<string, string | number | null>;
 
+/** Returns the progress shown when a review starts; intake is already under way. */
 function initialSteps(): Record<StepName, StepStatus> {
   return { intake: "running", rules: "pending", commentary: "pending", save: "pending" };
 }
 
+/**
+ * Maps a `reviews` row to its client shape.
+ *
+ * @throws SyntaxError if a stored JSON column is corrupt. Only this class writes those columns.
+ */
 function toReview(row: Row): ReviewRecord {
   return {
     id: String(row.id),
@@ -66,6 +90,7 @@ function toReview(row: Row): ReviewRecord {
   };
 }
 
+/** Maps an `exceptions` row to its client shape. */
 function toException(row: Row): ExceptionRecord {
   return {
     id: String(row.id),
@@ -77,6 +102,7 @@ function toException(row: Row): ExceptionRecord {
   };
 }
 
+/** Maps a `messages` row to its client shape. */
 function toMessage(row: Row): ChatMessage {
   return {
     id: Number(row.id),
@@ -90,6 +116,11 @@ function toMessage(row: Row): ChatMessage {
   };
 }
 
+/**
+ * Extracts the newest user text from a Think turn.
+ *
+ * @returns The joined text parts, or an empty string when the turn has no user message.
+ */
 function lastUserText(messages: TurnContext["messages"]): string {
   const message = [...messages].reverse().find((item) => item.role === "user");
   if (!message) return "";
@@ -102,14 +133,22 @@ function lastUserText(messages: TurnContext["messages"]): string {
  * recovery and transcript. SQLite tables below hold the review domain data.
  */
 export class CodexGuardAgent extends Think<Env, GuardState> {
+  /** Synced to every client. It carries progress and a revision, never review content. */
   override initialState: GuardState = { revision: 0, active: null, activeQuestion: null };
+  /** Question turns have no tools, so one model step always ends them. */
   override maxSteps = 1;
+  /** Keeps model reasoning out of Think's client stream. */
   override sendReasoning = false;
+  /**
+   * Model that answered the current turn, as reported by the provider. It lives in memory only,
+   * so `onChatResponse` falls back to the primary model ID after an eviction.
+   */
   private answerModel: string | null = null;
 
   /**
    * Think installs its chat protocol handler immediately before calling
    * onStart. Wrapping here keeps this allowlist in front of that handler.
+   * Rejected frames get no reply, so a client call sent that way times out.
    */
   private installClientFrameFilter(): void {
     const handleMessage = this.onMessage.bind(this);
@@ -119,6 +158,10 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     };
   }
 
+  /**
+   * Installs the frame filter, creates the domain tables and queues recovery of interrupted launches.
+   * Runs on every Durable Object start, so each statement must be safe to repeat.
+   */
   override async onStart(): Promise<void> {
     this.installClientFrameFilter();
     this.sql`CREATE TABLE IF NOT EXISTS standard_settings (
@@ -139,23 +182,37 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
       created_at INTEGER NOT NULL)`;
     this.sql`CREATE TABLE IF NOT EXISTS ai_actions (created_at INTEGER NOT NULL)`;
 
+    // A review saved just before an eviction may have no Workflow yet. The launch runs as a
+    // scheduled callback, so startup does not wait for Workflow creation.
     const [waiting] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews
       WHERE status = 'running' AND workflow_started = 0`;
     if ((waiting?.count ?? 0) > 0) await this.schedule(0, "resumeUnstartedReviews", {});
   }
 
-  /** Browser clients can never write agent state directly. */
+  /**
+   * Browser clients can never write agent state directly. The frame filter already drops state
+   * frames, so this is a second layer.
+   *
+   * @throws Error for any change that does not originate on the server.
+   */
   override validateStateChange(_next: GuardState, source: Connection | "server"): void {
     if (source !== "server") throw new Error("Agent state is read-only for clients.");
   }
 
   // Think turn configuration --------------------------------------------------
 
+  /**
+   * Default model for Think. `beforeTurn` supplies its own model on every turn, including the
+   * injection flag this default does not carry.
+   */
   override getModel() {
     if (isOffline(this.env)) return createOfflineModel(offlineAnswer(this.latestResult()));
     return createLanguageModel(this.env, { repository: this.name, feature: "question" });
   }
 
+  /**
+   * Default instructions. `beforeTurn` replaces them with the prompt from `buildQuestionPrompt`.
+   */
   override getSystemPrompt(): string {
     return "You answer questions about Codex Guard rule results. You cannot change those results.";
   }
@@ -163,12 +220,14 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   /**
    * Every turn is rebuilt from stored rule results and the newest question. It
    * has no tools and no earlier model text, which limits prompt-injection reach.
+   * Think calls this again for a recovered turn, so clients are told to reset partial text.
    */
   override beforeTurn(context: TurnContext): TurnConfig {
     this.answerModel = null;
     this.sendLive({ type: "answer-reset" });
     const question = lastUserText(context.messages);
     const result = this.latestResult();
+    // A fresh delimiter per turn, so submitted text cannot predict the closing tag.
     const nonce = crypto.randomUUID().replaceAll("-", "");
     const [system, user] = buildQuestionPrompt(question, result, nonce);
     const gateway: GatewayContext = {
@@ -188,16 +247,25 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     };
   }
 
+  /**
+   * Streams answer text to every connected client. This is a live preview of raw model output;
+   * the redacted, durable copy is written by `onChatResponse`.
+   */
   override onChunk(context: Parameters<Think<Env, GuardState>["onChunk"]>[0]): void {
     if (context.chunk.type === "text-delta") this.sendLive({ type: "answer-delta", delta: context.chunk.text });
   }
 
+  /** Records which model answered, which may be the gateway-routed fallback. */
   override onStepEnd(context: StepContext): void {
     const model = context.providerMetadata?.cloudflare?.model;
     if (typeof model === "string") this.answerModel = model;
   }
 
-  /** Recovery can repeat this hook, so the stored answer is keyed by request. */
+  /**
+   * Stores the finished answer and releases the question slot. Think calls this after the turn is
+   * persisted and replays it after an interruption, so the stored answer is keyed by request.
+   * Failed, aborted and empty turns store a fixed message instead of partial text.
+   */
   override onChatResponse(result: ChatResponseResult): void {
     const answer = result.message.parts
       .map((part) => (part.type === "text" ? part.text : ""))
@@ -215,6 +283,10 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
 
   // Browser methods. schemas.ts lists the names that clients may call ----------
 
+  /**
+   * Returns everything the UI renders. Clients call this whenever the state revision changes.
+   * It also expires stale reviews and clears a finished question, so reads repair missed updates.
+   */
   @callable()
   async getSnapshot(): Promise<Snapshot> {
     this.failStaleReviews();
@@ -231,12 +303,21 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     };
   }
 
-  /** Repeating a request ID returns the original review instead of a new one. */
+  /**
+   * Validates a change, stores it and starts its Workflow.
+   *
+   * Repeating a request ID returns the original review instead of a new one. Only one review may
+   * run per repository at a time.
+   *
+   * @param raw - Untrusted input matching `reviewRequestSchema`.
+   * @returns The review ID, or a user-facing error. Validation, limit and launch failures do not throw.
+   */
   @callable()
   async startReview(raw: unknown): Promise<ActionResult<{ reviewId: string }>> {
     const input = parseInput(reviewRequestSchema, raw);
     if (!input.ok) return input;
     const { text, requestId } = input.data;
+    // Checked first so a retry gets its original answer even if a limit has since been reached.
     const [existing] = this.sql<{ id: string }>`SELECT id FROM reviews WHERE request_id = ${requestId}`;
     if (existing) return { ok: true, reviewId: existing.id };
     const parsed = parseChange(text);
@@ -255,7 +336,10 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     const reviewId = crypto.randomUUID();
     const now = Date.now();
     const title = describeChange(parsed.change, text);
+    // The chat log keeps only this redacted preview. Raw text stays in `pending_inputs`.
     const preview = redactSecrets(normalizeText(text)).slice(0, 280);
+    // No await separates these writes, so they commit together. They precede the launch so
+    // `onStart` can resume it if the object is interrupted.
     this.sql`INSERT INTO reviews (id, request_id, created_at, status, title)
       VALUES (${reviewId}, ${requestId}, ${now}, 'running', ${title})`;
     this.sql`INSERT INTO pending_inputs (review_id, text) VALUES (${reviewId}, ${text})`;
@@ -268,7 +352,16 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
       : { ok: false, error: "The review could not start. Try again." };
   }
 
-  /** The finding is looked up on the server, so a client cannot invent one. */
+  /**
+   * Records an exception for a finding's standard and file.
+   *
+   * The finding is looked up on the server, so a client cannot invent one. The exception applies
+   * from the next review; stored results are not rewritten. A later exception for the same standard
+   * and path replaces the earlier one.
+   *
+   * @param raw - Untrusted input matching `acceptExceptionSchema`.
+   * @returns The stored exception, or an error for an unknown or non-waivable finding.
+   */
   @callable()
   acceptException(raw: unknown): ActionResult<{ exception: ExceptionRecord }> {
     const input = parseInput(acceptExceptionSchema, raw);
@@ -297,6 +390,11 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     return { ok: true, exception };
   }
 
+  /**
+   * Deletes an exception so future reviews report the finding again. Unknown IDs succeed silently.
+   *
+   * @param raw - Untrusted input matching `revokeExceptionSchema`.
+   */
   @callable()
   revokeException(raw: unknown): ActionResult {
     const input = parseInput(revokeExceptionSchema, raw);
@@ -306,6 +404,11 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     return { ok: true };
   }
 
+  /**
+   * Turns a waivable standard on or off for future reviews. Mandatory standards cannot be disabled.
+   *
+   * @param raw - Untrusted input matching `setStandardSchema`.
+   */
   @callable()
   setStandardEnabled(raw: unknown): ActionResult {
     const input = parseInput(setStandardSchema, raw);
@@ -333,11 +436,14 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     await this.clearFinishedQuestion();
     const idempotencyKey = `question:${requestId}`;
     const [known] = this.sql`SELECT id FROM messages WHERE dedupe_key = ${idempotencyKey}`;
+    // A retry skips the busy and budget checks because Think returns the original submission
+    // for the same key and starts no new turn.
     if (!known) {
       if (this.state.activeQuestion) return { ok: false, error: "The previous question is still being answered." };
       if (!this.reserveAiAction()) return { ok: false, error: "This repository reached its hourly AI limit." };
     }
     const text = redactSecrets(normalizeText(question));
+    // The redacted text is what Think stores and what `beforeTurn` later reads.
     const submission = await this.submitMessages(
       [{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] }],
       { idempotencyKey, metadata: { feature: "question" } },
@@ -348,7 +454,13 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     return { ok: true, submissionId: submission.submissionId, accepted: submission.accepted };
   }
 
-  /** The transcript returns to the composer, so the user can check it first. */
+  /**
+   * Converts a WAV recording to text. The transcript returns to the composer, so the user can check
+   * it first. A budget slot is consumed before the call and is not returned on failure.
+   *
+   * @param raw - Untrusted input matching `transcribeSchema`.
+   * @returns The redacted transcript, or a generic error if both speech models fail.
+   */
   @callable()
   async transcribe(raw: unknown): Promise<ActionResult<Transcript>> {
     const input = parseInput(transcribeSchema, raw);
@@ -365,7 +477,13 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     }
   }
 
-  /** Speaks stored content only, so this cannot become a general speech API. */
+  /**
+   * Reads a stored review or assistant answer aloud. It speaks stored content only, so this cannot
+   * become a general speech API. A budget slot is not returned on failure.
+   *
+   * @param raw - Untrusted input matching `speakRequestSchema`.
+   * @returns Base64 audio, or an error when there is no target or both voice models fail.
+   */
   @callable()
   async speak(raw: unknown): Promise<ActionResult<SpokenAudio>> {
     const input = parseInput(speakRequestSchema, raw);
@@ -388,24 +506,38 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
 
   // Durable callbacks and Workflow RPC. These are not client-callable ----------
 
-  /** Starts reviews whose row was saved before an interruption stopped launch. */
+  /**
+   * Starts reviews whose row was saved before an interruption stopped launch. Invoked by name from
+   * the schedule set in `onStart`. A launch that fails marks that review failed.
+   */
   async resumeUnstartedReviews(): Promise<void> {
     const rows = this.sql<{ id: string }>`SELECT id FROM reviews WHERE status = 'running' AND workflow_started = 0`;
     for (const { id } of rows) await this.launchReview(id);
   }
 
+  /**
+   * Gives the Workflow the raw change plus the current standards and exceptions.
+   *
+   * @throws Error when the input is gone because the review already ended.
+   */
   loadReviewInput(reviewId: string): { text: string; standards: StandardSetting[]; exceptions: ExceptionRecord[] } {
     const [row] = this.sql<{ text: string }>`SELECT text FROM pending_inputs WHERE review_id = ${reviewId}`;
     if (!row) throw new Error("Review input is no longer available.");
     return { text: row.text, standards: this.readStandards(), exceptions: this.readExceptions() };
   }
 
+  /** Persists the rule result before any model call. Safe to repeat when the step retries. */
   saveRuleResult(reviewId: string, result: RuleResult): void {
     const json = JSON.stringify(result);
     this.sql`UPDATE reviews SET result_json = ${json} WHERE id = ${reviewId}`;
     this.publish();
   }
 
+  /**
+   * Marks a review complete, deletes its raw input and prunes old history. Safe to repeat when the
+   * save step retries. It does not check the review's current status or whether it is the active
+   * review, so callers should treat it as the final word for that review.
+   */
   finishReview(
     reviewId: string,
     commentary: { text: string; source: CommentarySource; model: string | null; warnings: string[] },
@@ -420,6 +552,10 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     this.publish({ active: null });
   }
 
+  /**
+   * Applies a Workflow progress callback to the synced step list. Callbacks run outside durable
+   * steps and can repeat, so anything for a review that is no longer active is ignored.
+   */
   override async onWorkflowProgress(_name: string, instanceId: string, progress: unknown): Promise<void> {
     const active = this.state.active;
     const update = progress as { step?: StepName; status?: StepStatus };
@@ -428,6 +564,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     this.publish({ active: { reviewId: instanceId, steps: { ...active.steps, [update.step]: update.status } } });
   }
 
+  /** Fails the review when `ReviewWorkflow.run` throws. The detailed error is logged, not shown. */
   override async onWorkflowError(_name: string, instanceId: string, error: string): Promise<void> {
     console.error("review workflow failed", error);
     this.markFailed(instanceId, "The review could not finish. Try again.");
@@ -435,19 +572,31 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
 
   // Internals -----------------------------------------------------------------
 
+  /** Broadcasts a transient message to every connection. Nothing is stored. */
   private sendLive(message: LiveMessage): void {
     this.broadcast(JSON.stringify(message));
   }
 
+  /**
+   * Updates synced state and bumps the revision. Call after every change to stored data, because
+   * clients use the new revision as their signal to refetch the snapshot.
+   */
   private publish(change: Partial<Pick<GuardState, "active" | "activeQuestion">> = {}): void {
     this.setState({ ...this.state, ...change, revision: this.state.revision + 1 });
   }
 
+  /** Returns the newest saved rule result, including one from a review still running. */
   private latestResult(): RuleResult | null {
     const [latest] = this.sql<Row>`SELECT * FROM reviews WHERE result_json IS NOT NULL ORDER BY created_at DESC LIMIT 1`;
     return latest ? toReview(latest).result : null;
   }
 
+  /**
+   * Starts the Workflow, using the review ID as its instance ID so callbacks map back to the review.
+   *
+   * @returns False after any start failure, including a rejected duplicate instance ID. The review
+   * is then marked failed.
+   */
   private async launchReview(reviewId: string): Promise<boolean> {
     try {
       await this.runWorkflow("REVIEW_WORKFLOW", { reviewId, repository: this.name }, { id: reviewId });
@@ -460,6 +609,10 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     }
   }
 
+  /**
+   * Releases the question slot if Think's submission has ended or disappeared. This covers turns
+   * whose `onChatResponse` did not clear it.
+   */
   private async clearFinishedQuestion(): Promise<void> {
     const active = this.state.activeQuestion;
     if (!active) return;
@@ -467,6 +620,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     if (!submission || !["pending", "running"].includes(submission.status)) this.publish({ activeQuestion: null });
   }
 
+  /** Describes the configured model routing for display. It contains no secrets. */
   private readRouting(): AiRouting {
     return {
       offline: isOffline(this.env),
@@ -479,6 +633,11 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     };
   }
 
+  /**
+   * Resolves a speech request to stored text. Message targets are limited to assistant messages.
+   *
+   * @returns The text to speak, or null when the target is missing, unfinished or empty.
+   */
   private readSpokenTarget(target: { kind: "review"; id: string } | { kind: "message"; id: number }) {
     if (target.kind === "review") {
       const [row] = this.sql<Row>`SELECT * FROM reviews WHERE id = ${target.id}`;
@@ -490,7 +649,12 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     return text ? { text, reviewId: undefined } : null;
   }
 
-  /** A per-repository brake. AI Gateway limits are the account-level control. */
+  /**
+   * Claims one slot in the rolling hourly budget. This is a per-repository brake; AI Gateway limits
+   * are the account-level control.
+   *
+   * @returns False when the budget is used up. A claimed slot is never returned.
+   */
   private reserveAiAction(): boolean {
     const hourAgo = Date.now() - HOUR_MS;
     this.sql`DELETE FROM ai_actions WHERE created_at <= ${hourAgo}`;
@@ -500,6 +664,10 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     return true;
   }
 
+  /**
+   * Merges stored settings over the catalog. Standards default to enabled, and mandatory standards
+   * stay enabled whatever is stored.
+   */
   private readStandards(): StandardSetting[] {
     const rows = this.sql<{ id: string; enabled: number }>`SELECT id, enabled FROM standard_settings`;
     const settings = new Map(rows.map((row) => [row.id, row.enabled === 1]));
@@ -509,10 +677,15 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     }));
   }
 
+  /** Returns every recorded exception, newest first. */
   private readExceptions(): ExceptionRecord[] {
     return this.sql<Row>`SELECT * FROM exceptions ORDER BY created_at DESC`.map(toException);
   }
 
+  /**
+   * Fails a running review and deletes its raw input. A review that already ended keeps its status,
+   * and the active slot is released only if it belongs to this review.
+   */
   private markFailed(reviewId: string, message: string): void {
     this.sql`UPDATE reviews SET status = 'failed', error = ${message}
       WHERE id = ${reviewId} AND status = 'running'`;
@@ -521,12 +694,19 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     else this.publish();
   }
 
+  /**
+   * Fails running reviews older than `STALE_REVIEW_MS`. This does not stop their Workflow instances.
+   */
   private failStaleReviews(): void {
     const cutoff = Date.now() - STALE_REVIEW_MS;
     const stale = this.sql<{ id: string }>`SELECT id FROM reviews WHERE status = 'running' AND created_at < ${cutoff}`;
     for (const { id } of stale) this.markFailed(id, "The review timed out. Try again.");
   }
 
+  /**
+   * Trims reviews to `MAX_STORED_REVIEWS` and removes their review messages. Plain question and
+   * answer messages have no review ID, so they are not removed here.
+   */
   private prune(): void {
     this.sql`DELETE FROM reviews WHERE id NOT IN (
       SELECT id FROM reviews ORDER BY created_at DESC LIMIT ${MAX_STORED_REVIEWS})`;

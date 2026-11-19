@@ -1,18 +1,33 @@
+/*
+ * Builds model prompts and checks model output. It keeps rule results separate from submitted text
+ * and supplies the offline templates. The model explains results here; it never decides them.
+ */
 import { normalizeText } from "./input";
 import { redactSecrets } from "./rules";
 import { findStandard } from "./standards";
 import type { Finding, RuleResult } from "./types";
 
+/** A chat message accepted by both the AI SDK and Think. */
 export interface PromptMessage {
   role: "system" | "user";
   content: string;
 }
 
+/**
+ * Wraps submitted text in delimiters the text cannot predict. Secrets are redacted, and anything
+ * resembling an `untrusted` tag is removed so the text cannot close the block.
+ *
+ * @param nonce - Value unique to the review or turn.
+ */
 function untrustedBlock(nonce: string, body: string): string {
   const clean = redactSecrets(normalizeText(body)).replace(/<\/?\s*untrusted[^>]*>/gi, "[removed tag]");
   return `<untrusted_${nonce}>\n${clean}\n</untrusted_${nonce}>`;
 }
 
+/**
+ * Selects the rule data placed outside the untrusted block. Evidence is deliberately left out.
+ * `path` is included here even though it comes from the submitted diff.
+ */
 function trustedFacts(result: RuleResult) {
   return {
     risk: result.risk,
@@ -35,6 +50,7 @@ function trustedFacts(result: RuleResult) {
   };
 }
 
+/** Shared system instructions that fix the rule results and describe the untrusted block. */
 function ground(nonce: string): string {
   return [
     "RULE_RESULTS is the final output of a deterministic rule engine.",
@@ -45,6 +61,12 @@ function ground(nonce: string): string {
   ].join(" ");
 }
 
+/**
+ * Builds the commentary prompt for a completed rule result.
+ *
+ * @param excerpt - Added lines from `buildExcerpt`.
+ * @param nonce - Delimiter suffix for the untrusted blocks.
+ */
 export function buildReviewPrompt(result: RuleResult, excerpt: string, nonce: string): PromptMessage[] {
   const evidence = result.findings.map((finding) => `${finding.id}: ${finding.evidence}`).join("\n");
   return [
@@ -73,6 +95,12 @@ export function buildReviewPrompt(result: RuleResult, excerpt: string, nonce: st
   ];
 }
 
+/**
+ * Builds the prompt for one follow-up question. No earlier chat text is included.
+ *
+ * @param result - Latest rule result, or null before any review has one.
+ * @param nonce - Delimiter suffix for the untrusted block.
+ */
 export function buildQuestionPrompt(question: string, result: RuleResult | null, nonce: string): PromptMessage[] {
   return [
     {
@@ -95,6 +123,7 @@ export function buildQuestionPrompt(question: string, result: RuleResult | null,
   ];
 }
 
+/** Writes one finding in the same format the model is asked to use. */
 function offlineSection(finding: Finding): string {
   const standard = findStandard(finding.standardId);
   if (finding.status === "excepted") {
@@ -116,6 +145,7 @@ export function offlineCommentary(result: RuleResult): string {
   return result.findings.map(offlineSection).join("\n\n");
 }
 
+/** Fixed answer to any question in offline mode, summarizing the latest open findings. */
 export function offlineAnswer(result: RuleResult | null): string {
   if (!result) return "No review has run yet. Paste a change and choose Review change.";
   const open = result.findings.filter((finding) => finding.status === "open");
@@ -124,7 +154,14 @@ export function offlineAnswer(result: RuleResult | null): string {
   return `The latest review has ${open.length} open finding${open.length === 1 ? "" : "s"}: ${list}. Offline mode gives this fixed summary. Connect Workers AI for a written answer.`;
 }
 
-/** Deterministic checks on model output. Warnings are shown beside the commentary. */
+/**
+ * Deterministic checks on model output. Warnings are shown beside the commentary.
+ *
+ * These checks do not alter the text or the result. Finding IDs are matched as substrings, and only
+ * the first risk statement is compared.
+ *
+ * @returns One message per problem, or an empty list.
+ */
 export function auditCommentary(text: string, result: RuleResult): string[] {
   const warnings: string[] = [];
   const allowed = new Set(result.findings.map((finding) => finding.standardId));

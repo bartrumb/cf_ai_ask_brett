@@ -1,3 +1,10 @@
+/*
+ * Browser application: connects to one repository's agent, renders its snapshot and sends user
+ * actions. The server validates everything, so limits checked here only improve feedback.
+ *
+ * Rendering is a full rebuild from `snapshot` and `guardState`. Streaming text is the exception: it
+ * is patched into the existing DOM. Voice capture and playback live in `voice.ts`.
+ */
 import { AgentClient } from "agents/client";
 import type {
   ActionResult,
@@ -14,8 +21,11 @@ import type {
 import { SAMPLES } from "./samples";
 import { playAudio, startRecording, stopPlayback, type Recording } from "./voice";
 
+/** Mirrors the server limit so the composer can warn before submitting. */
 const MAX_INPUT_CHARS = 40_000;
+/** Repository opened when the URL and saved preference name none. */
 const DEFAULT_REPO = "sample-payments-api";
+/** Display order and text for review progress. */
 const STEP_LABELS: Record<StepName, string> = {
   intake: "Input accepted",
   rules: "Rules evaluated",
@@ -23,9 +33,18 @@ const STEP_LABELS: Record<StepName, string> = {
   save: "Saved to memory",
 };
 
+/** Values accepted as children by `h`. Falsy values render nothing. */
 type Child = Node | string | null | undefined | false;
+/** Attributes for `h`. Function values whose keys start with `on` become event listeners. */
 type Props = Record<string, string | boolean | EventListener | undefined>;
 
+/**
+ * Creates an element. `true` sets an empty attribute; `false` and `undefined` omit it.
+ *
+ * @param tag - Element name.
+ * @param props - Attributes and `onEvent` listeners.
+ * @param children - Nodes or strings. Strings become text nodes.
+ */
 function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Props = {}, ...children: Child[]): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
@@ -39,12 +58,18 @@ function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Props = {}, ...
   return element;
 }
 
+/**
+ * Finds a required element.
+ *
+ * @throws Error when the element is missing.
+ */
 function byId<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
   if (!element) throw new Error(`Missing element #${id}`);
   return element as T;
 }
 
+/** Static page elements. Resolving them at load makes a page mismatch fail immediately. */
 const ui = {
   timeline: byId<HTMLElement>("timeline"),
   scroller: byId<HTMLElement>("chat-scroll"),
@@ -73,33 +98,52 @@ const ui = {
   dialogCancel: byId<HTMLButtonElement>("exception-cancel"),
 };
 
+/**
+ * Current connection. Async work compares against this to discard results for an old repository.
+ */
 let client: AgentClient<unknown, GuardState> | null = null;
+/** Latest stored data from `getSnapshot`. */
 let snapshot: Snapshot | null = null;
+/** Latest synced progress state. */
 let guardState: GuardState | null = null;
+/** Revision of the last state that triggered a refetch. */
 let seenRevision = -1;
+/** Streamed text of the question being answered. */
 let liveAnswer = "";
+/** True between sending a question and the server accepting it. */
 let submittingQuestion = false;
+/** Finding the exception dialog is editing. */
 let exceptionTarget: { reviewId: string; finding: Finding } | null = null;
+/** Active microphone capture. */
 let recording: Recording | null = null;
+/** True while a recording is being transcribed. */
 let transcribing = false;
+/** `kind:id` of the item being fetched or played as speech. */
 let speakingKey: string | null = null;
+/** Streamed commentary by review ID, kept until the stored version arrives. */
 const liveCommentary = new Map<string, string>();
 
+/** Successful response from `speak`. */
 interface SpeechResult {
   audio: string;
   mimeType: string;
   source: CommentarySource;
 }
 
+/** Successful response from `transcribe`. */
 interface TranscriptResult {
   text: string;
   source: CommentarySource;
 }
 
+/** Converts free text to a name accepted by `repositoryNameSchema`, or an empty string. */
 function toSlug(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 64);
 }
 
+/**
+ * Chooses the first repository. Storage access can throw, for example under strict privacy settings.
+ */
 function initialRepository(): string {
   const fromUrl = toSlug(new URLSearchParams(location.search).get("repo") ?? "");
   if (fromUrl) return fromUrl;
@@ -110,24 +154,29 @@ function initialRepository(): string {
   }
 }
 
+/** Shows a message in the notice area. An empty message hides it. */
 function setNotice(message: string): void {
   ui.notice.textContent = message;
   ui.notice.hidden = !message;
 }
 
+/** True when the reader is following the end of the timeline. */
 function isNearBottom(): boolean {
   const { scrollHeight, scrollTop, clientHeight } = ui.scroller;
   return scrollHeight - scrollTop - clientHeight < 120;
 }
 
+/** Scrolls the timeline to its newest content. */
 function scrollToEnd(): void {
   ui.scroller.scrollTop = ui.scroller.scrollHeight;
 }
 
+/** True while a review or question prevents another submission. */
 function isBusy(): boolean {
   return Boolean(guardState?.active || guardState?.activeQuestion) || submittingQuestion;
 }
 
+/** Synchronizes the character count, submit buttons and microphone control with current state. */
 function updateComposer(): void {
   const length = ui.input.value.length;
   const hasText = ui.input.value.trim().length > 0;
@@ -135,6 +184,7 @@ function updateComposer(): void {
   ui.count.classList.toggle("over", length > MAX_INPUT_CHARS);
   const blocked = !client || isBusy() || !hasText || length > MAX_INPUT_CHARS;
   ui.review.disabled = blocked;
+  // Mirrors `MAX_QUESTION_CHARS`.
   ui.ask.disabled = blocked || length > 2_000;
   ui.mic.disabled = !client || transcribing;
   ui.mic.textContent = recording ? "Stop recording" : transcribing ? "Transcribing…" : "Speak";
@@ -142,6 +192,7 @@ function updateComposer(): void {
   ui.mic.setAttribute("aria-pressed", String(Boolean(recording)));
 }
 
+/** Describes where AI text came from. */
 function sourceLabel(source: CommentarySource | null, model: string | null): string {
   if (source === "offline") return "Offline template, no model called";
   if (source === "unavailable") return "Unavailable";
@@ -149,6 +200,7 @@ function sourceLabel(source: CommentarySource | null, model: string | null): str
   return `${model ?? "Workers AI"}${gateway ? ` via AI Gateway ${gateway}` : ""}`;
 }
 
+/** Builds the control that starts or stops speech for a review or message. */
 function listenButton(kind: "review" | "message", id: string | number): HTMLElement {
   const key = `${kind}:${id}`;
   return h(
@@ -158,7 +210,10 @@ function listenButton(kind: "review" | "message", id: string | number): HTMLElem
   );
 }
 
-/** Renders the commentary format as text nodes, with headings for readability. */
+/**
+ * Renders the commentary format as text nodes, with headings for readability.
+ * This is not a Markdown parser: model output never becomes HTML.
+ */
 function renderCommentary(target: HTMLElement, text: string): void {
   target.replaceChildren();
   let code: HTMLElement | null = null;
@@ -177,6 +232,7 @@ function renderCommentary(target: HTMLElement, text: string): void {
   }
 }
 
+/** Renders review progress. */
 function stepper(steps: Record<StepName, StepStatus>): HTMLElement {
   const names = Object.keys(STEP_LABELS) as StepName[];
   return h(
@@ -186,10 +242,12 @@ function stepper(steps: Record<StepName, StepStatus>): HTMLElement {
   );
 }
 
+/** True when an exception now covers this finding, even if this older result predates it. */
 function hasExceptionOnFile(finding: Finding): boolean {
   return Boolean(snapshot?.exceptions.some((e) => e.standardId === finding.standardId && e.path === finding.path));
 }
 
+/** Renders one finding with the action its waiver state allows. */
 function findingRow(review: ReviewRecord, finding: Finding): HTMLElement {
   const location = finding.line ? `${finding.path}:${finding.line}` : finding.path;
   let action: Child;
@@ -218,6 +276,7 @@ function findingRow(review: ReviewRecord, finding: Finding): HTMLElement {
   );
 }
 
+/** Renders rule results, or a progress or failure message before results exist. */
 function rulePanel(review: ReviewRecord): HTMLElement {
   const result = review.result;
   if (!result) {
@@ -248,6 +307,9 @@ function rulePanel(review: ReviewRecord): HTMLElement {
   );
 }
 
+/**
+ * Renders commentary, preferring stored text over streamed text. Returns null before rules finish.
+ */
 function aiPanel(review: ReviewRecord): HTMLElement | null {
   if (!review.result) return null;
   const text = review.commentary || liveCommentary.get(review.id) || "";
@@ -270,6 +332,7 @@ function aiPanel(review: ReviewRecord): HTMLElement | null {
   );
 }
 
+/** Renders a review, with live progress when it is the active one. */
 function reviewCard(review: ReviewRecord): HTMLElement {
   const active = guardState?.active?.reviewId === review.id ? guardState.active : null;
   return h(
@@ -282,6 +345,7 @@ function reviewCard(review: ReviewRecord): HTMLElement {
   );
 }
 
+/** Renders one chat entry. A review entry also renders its review card. */
 function messageNode(message: ChatMessage, reviews: Map<string, ReviewRecord>): Child[] {
   if (message.kind === "review") {
     const review = message.reviewId ? reviews.get(message.reviewId) : undefined;
@@ -301,6 +365,7 @@ function messageNode(message: ChatMessage, reviews: Map<string, ReviewRecord>): 
   ];
 }
 
+/** Renders the introduction for a repository with no messages. */
 function emptyState(): HTMLElement {
   return h(
     "div",
@@ -311,6 +376,7 @@ function emptyState(): HTMLElement {
   );
 }
 
+/** Rebuilds the timeline and sidebar, keeping the reader at the end if they were already there. */
 function render(): void {
   if (!snapshot) return;
   const follow = isNearBottom();
@@ -327,6 +393,7 @@ function render(): void {
   if (follow) scrollToEnd();
 }
 
+/** Rebuilds routing, standards, exceptions and review history. */
 function renderSidebar(): void {
   if (!snapshot) return;
   const { routing } = snapshot;
@@ -399,6 +466,11 @@ function renderSidebar(): void {
   );
 }
 
+/**
+ * Fetches and renders the snapshot. A response for a replaced connection is dropped.
+ *
+ * @throws The RPC error, which callers report.
+ */
 async function refresh(): Promise<void> {
   if (!client) return;
   const current = client;
@@ -409,10 +481,12 @@ async function refresh(): Promise<void> {
   render();
 }
 
+/** Shows an unexpected failure in the notice area. */
 function reportFailure(error: unknown): void {
   setNotice(error instanceof Error ? error.message : "Something went wrong.");
 }
 
+/** Starts a review. The input is cleared only after the server accepts it. */
 async function submitReview(): Promise<void> {
   if (!client || ui.review.disabled) return;
   setNotice("");
@@ -428,7 +502,10 @@ async function submitReview(): Promise<void> {
   updateComposer();
 }
 
-/** Questions enter the agent's durable inbox, so they finish if this tab closes. */
+/**
+ * Sends the composer text as a question. Questions enter the agent's durable inbox, so they finish
+ * if this tab closes. The answer arrives through live messages and a later snapshot.
+ */
 async function submitQuestion(): Promise<void> {
   if (!client || ui.ask.disabled) return;
   setNotice("");
@@ -448,6 +525,11 @@ async function submitQuestion(): Promise<void> {
   }
 }
 
+/**
+ * Starts recording, or stops the active recording. The starting call stays pending until
+ * transcription ends, then appends the transcript to the composer for review. It uses whichever
+ * connection is current when the recording finishes.
+ */
 async function toggleRecording(): Promise<void> {
   if (recording) {
     recording.stop();
@@ -483,6 +565,10 @@ async function toggleRecording(): Promise<void> {
   }
 }
 
+/**
+ * Plays an item, or stops it when it is already selected. `speakingKey` is rechecked after the
+ * request so a late response cannot play over a newer choice.
+ */
 async function toggleSpeech(kind: "review" | "message", id: string | number): Promise<void> {
   const key = `${kind}:${id}`;
   stopPlayback();
@@ -511,6 +597,7 @@ async function toggleSpeech(kind: "review" | "message", id: string | number): Pr
   }
 }
 
+/** Opens the exception form for a finding. */
 function openExceptionDialog(reviewId: string, finding: Finding): void {
   exceptionTarget = { reviewId, finding };
   ui.dialogTarget.textContent = `${finding.standardId} on ${finding.path}`;
@@ -520,6 +607,7 @@ function openExceptionDialog(reviewId: string, finding: Finding): void {
   ui.dialogReason.focus();
 }
 
+/** Submits the exception form and keeps it open with the error on failure. */
 async function saveException(): Promise<void> {
   if (!client || !exceptionTarget) return;
   const { reviewId, finding } = exceptionTarget;
@@ -532,6 +620,10 @@ async function saveException(): Promise<void> {
   }
 }
 
+/**
+ * Calls a settings action. After a rejection the snapshot is refetched, which also restores a
+ * checkbox the browser has already toggled.
+ */
 async function runAction(method: string, args: unknown[]): Promise<void> {
   if (!client) return;
   try {
@@ -545,9 +637,15 @@ async function runAction(method: string, args: unknown[]): Promise<void> {
   }
 }
 
+/** Requests a change to a standard's enabled state. */
 const toggleStandard = (id: string, enabled: boolean) => void runAction("setStandardEnabled", [{ id, enabled }]);
+/** Requests removal of an exception. */
 const revokeException = (id: string) => void runAction("revokeException", [{ id }]);
 
+/**
+ * Applies streamed text directly to the DOM, avoiding a full render per delta. A reset discards
+ * partial text, which happens when a turn or Workflow step starts again.
+ */
 function handleLiveMessage(message: LiveMessage): void {
   if (message.type === "answer-reset" || message.type === "answer-delta") {
     liveAnswer = message.type === "answer-reset" ? "" : liveAnswer + message.delta;
@@ -566,11 +664,17 @@ function handleLiveMessage(message: LiveMessage): void {
   if (follow) scrollToEnd();
 }
 
+/** Updates the connection indicator. */
 function setConnection(label: string, state: string): void {
   ui.status.textContent = label;
   ui.status.dataset.state = state;
 }
 
+/**
+ * Switches to a repository, clearing all state from the previous connection.
+ *
+ * @param repository - Name already converted by `toSlug`.
+ */
 function connect(repository: string): void {
   client?.close();
   recording?.stop();
@@ -598,6 +702,7 @@ function connect(repository: string): void {
     protocol: location.protocol === "https:" ? "wss" : "ws",
     onStateUpdate: (state) => {
       guardState = state;
+      // A new revision means stored data changed. Otherwise the current snapshot is redrawn.
       if (state.revision !== seenRevision) {
         seenRevision = state.revision;
         void refresh().catch(reportFailure);
@@ -617,6 +722,7 @@ function connect(repository: string): void {
     if (client === next) setConnection("Reconnecting", "connecting");
   });
   next.addEventListener("message", (event) => {
+    // The socket also carries SDK frames, so a cheap test avoids parsing most of them.
     if (typeof event.data !== "string" || !/"(commentary|answer)-(delta|reset)"/.test(event.data)) return;
     try {
       const message = JSON.parse(event.data) as LiveMessage;

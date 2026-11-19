@@ -1,3 +1,9 @@
+/*
+ * Durable pipeline for one review: run the rules, write optional commentary, save the outcome.
+ *
+ * `CodexGuardAgent` starts this Workflow and owns all stored data; each step reaches it over RPC.
+ * The rule result is saved before any model call, so commentary can fail without affecting it.
+ */
 import { ThinkWorkflow, type ThinkWorkflowStep } from "@cloudflare/think/workflows";
 import type { AgentWorkflowEvent } from "agents/workflows";
 import { NonRetryableError } from "cloudflare:workflows";
@@ -10,18 +16,23 @@ import type { CommentarySource, LiveMessage, RuleResult, StepName, StepStatus } 
 import { isGuardrailBlock } from "./gateway";
 import { generateText } from "./llm";
 
-/** IDs only: Workflow params and step results are stored, so raw input stays out. */
+/**
+ * IDs only: Workflow params are stored, so raw input stays out. The agent holds the raw change, and
+ * step results carry only rule results and the redacted excerpt.
+ */
 export interface ReviewParams {
   reviewId: string;
   repository: string;
 }
 
+/** Progress sent to `CodexGuardAgent.onWorkflowProgress`, which reads `step` and `status`. */
 export interface ReviewProgress {
   step: StepName;
   status: StepStatus;
   [key: string]: unknown;
 }
 
+/** Commentary outcome saved with the review, including the unavailable case. */
 interface Commentary {
   text: string;
   source: CommentarySource;
@@ -29,15 +40,31 @@ interface Commentary {
   warnings: string[];
 }
 
+/** Minimum gap between live broadcasts, since each one is an RPC to the agent. */
 const FLUSH_INTERVAL_MS = 80;
 
+/**
+ * Runs one review. The instance ID equals the review ID.
+ *
+ * Code outside `step.do` can run again when the Workflow resumes, so progress reports may repeat.
+ * Any error that escapes `run` reaches `CodexGuardAgent.onWorkflowError` and fails the review.
+ */
 export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams, ReviewProgress, Env> {
+  /**
+   * Executes the review steps in order.
+   *
+   * @returns The review ID and final risk.
+   * @throws NonRetryableError if the stored input no longer parses; schema, step and RPC errors also
+   * propagate. Commentary failures do not: they are recorded as unavailable.
+   */
   override async run(event: AgentWorkflowEvent<ReviewParams>, step: ThinkWorkflowStep) {
     const { reviewId, repository } = reviewParamsSchema.parse(event.payload);
 
     await this.reportProgress({ step: "intake", status: "complete" });
     await this.reportProgress({ step: "rules", status: "running" });
 
+    // Input is read inside the step so it never enters the Workflow params. The step's return
+    // value is persisted, which is why it holds only redacted data.
     const rules = await step.do("run-deterministic-rules", async () => {
       const input = await this.agent.loadReviewInput(reviewId);
       const parsed = parseChange(input.text);
@@ -46,6 +73,7 @@ export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams,
       await this.agent.saveRuleResult(reviewId, result);
       return { result, excerpt: buildExcerpt(parsed.change) };
     });
+    // Step output comes back as a serialized type, so the known shape is restored here.
     const result = rules.result as RuleResult;
 
     await this.reportProgress({ step: "rules", status: "complete" });
@@ -61,6 +89,7 @@ export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams,
       );
     } catch (error) {
       console.error("commentary failed", error instanceof Error ? error.message : "unknown error");
+      // Other failures are reported only through the unavailable source.
       const warnings = isGuardrailBlock(error) ? ["AI Gateway Guardrails blocked this commentary."] : [];
       commentary = { text: "", source: "unavailable", model: null, warnings };
     }
@@ -80,12 +109,22 @@ export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams,
     return { reviewId, risk: result.risk };
   }
 
+  /**
+   * Generates commentary while streaming batched deltas to clients.
+   *
+   * Each retry starts by resetting the client's partial text. Live deltas are raw model output; only
+   * the returned text is redacted and audited.
+   *
+   * @returns Commentary ready to store, with warnings from `auditCommentary`.
+   * @throws Any model failure, so the surrounding step can retry.
+   */
   private async writeCommentary(
     reviewId: string,
     repository: string,
     result: RuleResult,
     excerpt: string,
   ): Promise<Commentary> {
+    // Broadcasts are not durable and the SDK does not return a promise for them.
     const send = (message: LiveMessage) => this.broadcastToClients(message);
     await send({ type: "commentary-reset", reviewId });
 
@@ -100,6 +139,7 @@ export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams,
     };
 
     const generated = await generateText(this.env, {
+      // The review ID is created after the change is submitted, so the change cannot anticipate it.
       messages: buildReviewPrompt(result, excerpt, reviewId.replaceAll("-", "")),
       offlineText: offlineCommentary(result),
       maxOutputTokens: 1_800,
@@ -114,6 +154,7 @@ export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams,
         if (Date.now() - lastFlush >= FLUSH_INTERVAL_MS) await flush();
       },
     });
+    // Sends text still held back by the flush interval.
     await flush();
 
     const text = redactSecrets(generated.text);

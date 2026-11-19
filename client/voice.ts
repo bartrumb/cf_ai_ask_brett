@@ -1,6 +1,13 @@
+/*
+ * Browser audio helpers: microphone capture, conversion to the WAV format the server accepts, and
+ * playback of returned speech. `main.ts` owns the related UI state.
+ */
+/** Output sample rate. With 30 seconds of 16-bit mono it stays within `MAX_AUDIO_BYTES`. */
 const TARGET_SAMPLE_RATE = 16_000;
+/** Recording stops automatically after this long. */
 export const MAX_RECORDING_MS = 30_000;
 
+/** Encodes mono samples as a 16-bit PCM WAV file, clipping values outside the valid range. */
 function toWav(samples: Float32Array): Uint8Array {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
   const view = new DataView(buffer);
@@ -26,6 +33,7 @@ function toWav(samples: Float32Array): Uint8Array {
   return new Uint8Array(buffer);
 }
 
+/** Encodes bytes in chunks, because spreading a whole recording could exceed argument limits. */
 function toBase64(bytes: Uint8Array): string {
   let binary = "";
   for (let index = 0; index < bytes.length; index += 0x8000) {
@@ -34,7 +42,12 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-/** Converts a browser recording to the 16 kHz mono WAV the server accepts. */
+/**
+ * Converts a browser recording to the 16 kHz mono WAV the server accepts.
+ * Recorders produce browser-specific formats, so the audio is decoded and resampled here.
+ *
+ * @throws DOMException when the browser cannot decode the recording.
+ */
 async function encodeRecording(blob: Blob): Promise<string> {
   const context = new AudioContext();
   try {
@@ -52,11 +65,18 @@ async function encodeRecording(blob: Blob): Promise<string> {
   }
 }
 
+/** An active capture. `result` settles with base64 WAV after recording stops. */
 export interface Recording {
+  /** Ends the capture. Safe to call more than once. */
   stop: () => void;
   result: Promise<string>;
 }
 
+/**
+ * Starts microphone capture with an automatic time limit. The microphone is released when it stops.
+ *
+ * @throws DOMException when access is denied or no microphone is available.
+ */
 export async function startRecording(): Promise<Recording> {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   const recorder = new MediaRecorder(stream);
@@ -77,8 +97,10 @@ export async function startRecording(): Promise<Recording> {
   return { stop, result };
 }
 
+/** The one active playback and the object URL to release. */
 let current: { audio: HTMLAudioElement; url: string } | null = null;
 
+/** Stops playback and frees its URL. The `onEnd` callback is not called. */
 export function stopPlayback(): void {
   if (!current) return;
   current.audio.pause();
@@ -86,6 +108,14 @@ export function stopPlayback(): void {
   current = null;
 }
 
+/**
+ * Replaces any current playback with the given audio.
+ *
+ * @param base64 - Encoded audio from the server.
+ * @param mimeType - Audio type of the decoded bytes.
+ * @param onEnd - Called when playback reaches its end.
+ * @throws An error when decoding fails or the browser refuses to start playback.
+ */
 export async function playAudio(base64: string, mimeType: string, onEnd: () => void): Promise<void> {
   stopPlayback();
   const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));

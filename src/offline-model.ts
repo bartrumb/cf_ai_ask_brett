@@ -1,12 +1,22 @@
+/*
+ * AI SDK model used for Think question turns in offline mode. Review commentary has its own offline
+ * path in `llm.ts`.
+ */
 import type { LanguageModelV4, LanguageModelV4StreamPart } from "@ai-sdk/provider";
 
+/** Zero usage, since no model runs. */
 const USAGE = {
   inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
   outputTokens: { total: 0, text: 0, reasoning: 0 },
 };
+/** Normal completion reported by every offline response. */
 const FINISH = { unified: "stop" as const, raw: "stop" };
 
-/** A provider-compatible model that returns fixed text without any network call. */
+/**
+ * A provider-compatible model that returns fixed text without any network call.
+ *
+ * @param text - Complete answer. Streaming splits it into word-sized deltas.
+ */
 export function createOfflineModel(text: string): LanguageModelV4 {
   return {
     specificationVersion: "v4",

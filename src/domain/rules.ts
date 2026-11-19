@@ -1,3 +1,8 @@
+/*
+ * The deterministic rule engine and secret redaction. Given a parsed change, the enabled standards
+ * and recorded exceptions, it produces every finding and the risk level. It has no I/O and never
+ * receives model output. Add a standard in `standards.ts` and its detection here.
+ */
 import { normalizeText, PREAMBLE_PATH, SUMMARY_PATH, type ChangeLine, type ParsedChange } from "./input";
 import {
   SEVERITIES,
@@ -8,11 +13,18 @@ import {
   type StandardSetting,
 } from "./types";
 
+/** Pseudo-path for findings about the change as a whole. */
 export const CHANGE_PATH = "(whole change)";
+/** STD-SIZ-01 fires above this many added plus removed lines. */
 export const MAX_CHANGED_LINES = 400;
+/** Findings kept in a result. Risk is calculated before this cap applies. */
 const MAX_REPORTED_FINDINGS = 50;
+/** Longest evidence snippet stored with a finding. */
 const MAX_EVIDENCE_CHARS = 160;
 
+/**
+ * Credential shapes for STD-SEC-01. Named assignments need a quoted value of 8 or more characters.
+ */
 const SECRET_PATTERNS: readonly RegExp[] = [
   /\b[\w-]*(?:api[_-]?key|secret|token|passw(?:or)?d|credential)[\w-]*["']?\s*[:=]\s*["'][^"'\s]{8,}["']/i,
   /\bAKIA[0-9A-Z]{16}\b/,
@@ -21,6 +33,7 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
 ];
 
+/** Language aimed at automated reviewers, for STD-AGT-01 and gateway metadata. */
 const INJECTION_PATTERNS: readonly RegExp[] = [
   /\b(?:ignore|disregard|forget|override)\b[^\n]{0,40}\b(?:instructions?|rules?|prompts?|findings?|policy|policies|standards?)\b/i,
   /\bsystem prompt\b/i,
@@ -32,25 +45,38 @@ const INJECTION_PATTERNS: readonly RegExp[] = [
   /<\/?\s*(?:system|assistant|instructions?)\s*>/i,
 ];
 
+/** Files that may define network or permission settings. */
 const INFRA_FILE = /(\.tf|\.tfvars|\.ya?ml|\.json|\.toml|\.hcl)$/i;
+/** Files that may reference deployable images or pipeline actions. */
 const DEPLOY_FILE = /(^|\/)Dockerfile[^/]*$|\.ya?ml$|\.tf$/i;
+/** Files that may control CI behavior. */
 const PIPELINE_FILE = /(^|\/)\.github\/workflows\/|(^|\/)\.gitlab-ci|(^|\/)ci\/|(^|\/)Makefile$|(^|\/)package\.json$|\.sh$/i;
+/** Database migration files. */
 const MIGRATION_FILE = /\.sql$|(^|\/)migrations?\//i;
+/** Test files, by directory or naming convention. */
 const TEST_FILE = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[a-z]+$|_test\.(go|py)$/i;
+/** Application source extensions. Test files are excluded by `isSource`. */
 const SOURCE_FILE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb)$/i;
 
+/** True for application source that is not a test. */
 const isSource = (path: string) => SOURCE_FILE.test(path) && !TEST_FILE.test(path);
+/** Scope for rules that apply to every file. */
 const anyFile = () => true;
 
+/** Line-by-line detection for one standard. */
 interface LineRule {
   standardId: string;
+  /** Limits the rule by file path. Ignored for summaries and preamble text. */
   appliesTo: (path: string) => boolean;
+  /** Patterns for diff lines. They must not use the `g` flag, because `test` would keep state. */
   patterns: readonly RegExp[];
+  /** Patterns for plain-language summaries, which describe a change instead of showing it. */
   summaryPatterns: readonly RegExp[];
   /** Also scan unchanged context lines and any text before the first file. */
   scanContext?: boolean;
 }
 
+/** Rules evaluated in `evaluateChange`. STD-SIZ-01 and STD-TST-01 are whole-change checks there. */
 const LINE_RULES: readonly LineRule[] = [
   {
     standardId: "STD-SEC-01",
@@ -117,11 +143,19 @@ const LINE_RULES: readonly LineRule[] = [
   },
 ];
 
+/** Tests normalized text for reviewer-directed language. Used to tag gateway requests. */
 export function containsInjectionLanguage(text: string): boolean {
   const normalized = normalizeText(text);
   return INJECTION_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
+/**
+ * Masks credential-like values before text is stored, displayed or sent to a model.
+ *
+ * This is broader than detection: named assignments are masked at any length. Each pattern needs
+ * its value in the supplied string, so the body of a private key is only masked when its BEGIN line
+ * is part of the same call.
+ */
 export function redactSecrets(text: string): string {
   return text
     .replace(
@@ -134,14 +168,17 @@ export function redactSecrets(text: string): string {
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, "[REDACTED PRIVATE KEY]");
 }
 
+/** Produces the redacted, bounded snippet stored on a finding. */
 function toEvidence(text: string): string {
   return redactSecrets(normalizeText(text)).trim().slice(0, MAX_EVIDENCE_CHARS);
 }
 
+/** Returns a severity's position, where a larger number is more severe. */
 export function severityRank(severity: Severity): number {
   return SEVERITIES.indexOf(severity);
 }
 
+/** Returns the highest severity present. With no findings the result is `low`. */
 function highestSeverity(findings: readonly Finding[]): Severity {
   return findings.reduce<Severity>(
     (highest, finding) => (severityRank(finding.severity) > severityRank(highest) ? finding.severity : highest),
@@ -149,16 +186,24 @@ function highestSeverity(findings: readonly Finding[]): Severity {
   );
 }
 
+/** Repository settings that affect one evaluation. */
 export interface RuleContext {
   standards: readonly StandardSetting[];
   exceptions: readonly ExceptionRecord[];
 }
 
+/** A finding before IDs and exception status are assigned. */
 type Draft = Omit<Finding, "id" | "status" | "exceptionId">;
 
 /**
  * The only place a risk level is decided. It is pure and takes no model output,
  * so the same change, standards and exceptions always give the same result.
+ *
+ * Matches are grouped into one finding per standard and path, the same scope as an exception.
+ * Evidence and line number come from the first match.
+ *
+ * @param change - Output of `parseChange`.
+ * @param context - Standards with their enabled state, plus recorded exceptions.
  */
 export function evaluateChange(change: ParsedChange, context: RuleContext): RuleResult {
   const enabled = new Map(context.standards.filter((s) => s.enabled).map((s) => [s.id, s]));
@@ -192,11 +237,14 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
     if (!enabled.has(rule.standardId)) continue;
     const patterns = isSummary ? rule.summaryPatterns : rule.patterns;
     for (const file of change.files) {
+      // Summaries and preambles have no meaningful path, so path scoping cannot apply to them.
       const inScope = isSummary || file.path === PREAMBLE_PATH ? true : rule.appliesTo(file.path);
       if (!inScope) continue;
+      // A preamble alone does not make a standard count as checked.
       if (file.path !== PREAMBLE_PATH) applicable.add(rule.standardId);
       const lines: ChangeLine[] = rule.scanContext ? [...file.additions, ...file.context] : file.additions;
       for (const { line, text } of lines) {
+        // Match the normalized form so invisible characters cannot split a keyword.
         const normalized = normalizeText(text);
         if (patterns.some((pattern) => pattern.test(normalized))) {
           record(rule.standardId, file.path, line, text);
@@ -208,6 +256,7 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
   const additions = realFiles.reduce((sum, file) => sum + file.additions.length, 0);
   const deletions = realFiles.reduce((sum, file) => sum + file.deletions, 0);
 
+  // Size and test coverage cannot be judged from a description.
   if (!isSummary) {
     if (enabled.has("STD-SIZ-01")) {
       applicable.add("STD-SIZ-01");
@@ -226,11 +275,13 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
     }
   }
 
+  // Stored exceptions are ignored for standards that cannot be waived.
   const exceptionFor = (draft: Draft) =>
     draft.waivable
       ? context.exceptions.find((e) => e.standardId === draft.standardId && e.path === draft.path)
       : undefined;
 
+  // A total order keeps finding IDs stable for identical input.
   const ordered = [...drafts.values()].sort(
     (a, b) =>
       severityRank(b.severity) - severityRank(a.severity) ||
@@ -264,6 +315,10 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
   };
 }
 
+/**
+ * Builds the short review title: the first summary line, or up to two changed paths.
+ * Summary text is redacted. Diff paths are used as parsed.
+ */
 export function describeChange(change: ParsedChange, text: string): string {
   if (change.kind === "summary") {
     const first = text.split("\n").find((line) => line.trim()) ?? "Change summary";
@@ -274,7 +329,14 @@ export function describeChange(change: ParsedChange, text: string): string {
   return paths.length > 2 ? `${shown} and ${paths.length - 2} more` : shown;
 }
 
-/** A bounded, redacted view of added lines that gives the model code context. */
+/**
+ * A bounded view of added lines that gives the model code context.
+ *
+ * Each line is redacted on its own, so a value spanning lines is masked only where a single-line
+ * pattern matches it. Output stops at the first entry that would exceed the limit.
+ *
+ * @param maxChars - Approximate limit on the returned text.
+ */
 export function buildExcerpt(change: ParsedChange, maxChars = 5_000): string {
   const parts: string[] = [];
   let used = 0;
