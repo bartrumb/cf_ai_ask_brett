@@ -1,7 +1,10 @@
 /*
- * Renders answer text as DOM nodes. Only paragraphs, bold and inline code are recognized, and every
- * piece of text becomes a text node, so model output can never become HTML.
+ * Renders answer text as DOM nodes. Only paragraphs, headings, bold and inline code are recognized,
+ * and every piece of text becomes a text node, so model output can never become HTML.
  */
+/** A Markdown heading line, captured without its markers. */
+const HEADING = /^#{1,6}\s+(.+)$/;
+
 /** Splits one paragraph into text, `strong` and `code` nodes. */
 function inlineNodes(text: string): Node[] {
   return text
@@ -16,7 +19,7 @@ function inlineNodes(text: string): Node[] {
     });
 }
 
-/** Replaces the target's content with one paragraph per non-empty line. */
+/** Replaces the target's content with one paragraph per non-empty line. Headings become bold lines. */
 export function renderRichText(target: HTMLElement, text: string): void {
   const paragraphs = text
     .split("\n")
@@ -24,7 +27,14 @@ export function renderRichText(target: HTMLElement, text: string): void {
     .filter(Boolean)
     .map((line) => {
       const paragraph = document.createElement("p");
-      paragraph.append(...inlineNodes(line));
+      const heading = HEADING.exec(line)?.[1];
+      if (heading) {
+        const title = document.createElement("strong");
+        title.textContent = heading.replaceAll("**", "");
+        paragraph.append(title);
+      } else {
+        paragraph.append(...inlineNodes(line));
+      }
       return paragraph;
     });
   target.replaceChildren(...paragraphs);

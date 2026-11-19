@@ -15,6 +15,8 @@ const MAX_QUESTION_CHARS = 500;
 const CONVERSATION_KEY = "ask-brett-conversation";
 /** localStorage key for an explicit theme choice. */
 const THEME_KEY = "ask-brett-theme";
+/** Time allowed for speech, which can include a slow primary voice and a fallback. */
+const SPEECH_CALL_TIMEOUT_MS = 45_000;
 /** Labels shown under answers. */
 const SOURCE_LABELS: Record<AnswerSource, string> = {
   "workers-ai": "AI-generated",
@@ -291,7 +293,7 @@ async function toggleSpeech(id: number): Promise<void> {
   speechLoading = true;
   render();
   try {
-    const result = (await client.call("speak", [{ messageId: id }])) as unknown as ActionResult<{ audio: string; mimeType: string; source: AnswerSource }>;
+    const result = (await client.call("speak", [{ messageId: id }], { timeout: SPEECH_CALL_TIMEOUT_MS })) as unknown as ActionResult<{ audio: string; mimeType: string; source: AnswerSource }>;
     if (speakingId !== id) return;
     if (!result.ok) {
       setNotice(result.error);

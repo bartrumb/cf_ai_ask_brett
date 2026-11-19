@@ -31,6 +31,20 @@ export interface TurnPrompt {
   user: string;
 }
 
+/** Answers at least this long may have reached the output token limit. */
+const NEAR_OUTPUT_LIMIT_CHARS = 2_000;
+
+/**
+ * Ends a long answer at its last full sentence when the model ran out of room mid-sentence. Shorter
+ * answers are left alone, because they may simply end without punctuation.
+ */
+export function dropUnfinishedSentence(answer: string): string {
+  const text = answer.trimEnd();
+  if (text.length < NEAR_OUTPUT_LIMIT_CHARS || /[.!?:)"'”’]$/.test(text)) return text;
+  const last = [...text.matchAll(/[.!?]["'”’)]?(?=\s)/g)].at(-1);
+  return last ? text.slice(0, last.index + last[0].length) : text;
+}
+
 /** Cleans visitor-controlled text so it cannot close or imitate the delimiter. */
 function cleanUntrusted(text: string): string {
   return redactSecrets(normalizeText(text)).replace(/<\/?\s*untrusted[^>]*>/gi, "[removed tag]");
@@ -49,7 +63,9 @@ export function buildTurnPrompt(question: string, history: readonly Exchange[], 
     "",
     "How to answer:",
     "- Lead with the result, then explain how it was achieved.",
-    "- Be specific and warm, in plain English. Keep answers short by default: two to four sentences unless asked for depth.",
+    "- Be specific and warm, in plain English. Keep answers short by default: two to four sentences.",
+    "- If asked for depth or for several topics, use at most 150 words, cover what matters most, and offer to go further on one part.",
+    "- Write plain paragraphs that read well aloud. Do not use headings, bullet lists or tables.",
     "- Use only the PROFILE FACTS below. Never invent, estimate or round a number, name, date or claim.",
     `- If the facts do not answer the question, say you don't know and point to ${profile.links.email} or ${profile.links.site}.`,
     `- Keep titles accurate. ${profile.name}'s current title is ${profile.title}. Describe any other level or role only as held in the facts, or as a role being sought.`,

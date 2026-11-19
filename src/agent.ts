@@ -9,7 +9,7 @@ import { callable, getAgentByName, getCurrentAgent, type Connection, type Connec
 import { ACCESS_EXPIRES_HEADER, CLIENT_KEY_HEADER } from "./access";
 import { decodeWav, toSpokenText } from "./domain/audio";
 import { classifyQuestion, guardedAnswer } from "./domain/guards";
-import { buildTurnPrompt, MAX_HISTORY_EXCHANGES, offlineAnswer, type Exchange } from "./domain/prompt";
+import { buildTurnPrompt, dropUnfinishedSentence, MAX_HISTORY_EXCHANGES, offlineAnswer, type Exchange } from "./domain/prompt";
 import { createStreamRedactor, normalizeText, redactAnswer, redactSecrets } from "./domain/redaction";
 import { allowedClientFrameId, parseInput, questionRequestSchema, speakRequestSchema, transcribeSchema } from "./domain/schemas";
 import type { ActionResult, AnswerSource, ChatMessage, LiveMessage, ShowcaseState, Snapshot } from "./domain/types";
@@ -258,7 +258,7 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
       .join("")
       .trim();
     const succeeded = result.status === "completed" && answer.length > 0;
-    const text = succeeded ? redactAnswer(answer) : UNAVAILABLE_ANSWER;
+    const text = succeeded ? redactAnswer(dropUnfinishedSentence(answer)) : UNAVAILABLE_ANSWER;
     const source: AnswerSource = !succeeded ? "unavailable" : isOffline(this.env) ? "offline" : "workers-ai";
     // A real outcome replaces any placeholder written while this turn looked lost.
     this.sql`DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages) AND dedupe_key LIKE 'answer:recovered:%'`;

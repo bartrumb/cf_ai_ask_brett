@@ -18,8 +18,10 @@ const DEEPGRAM_SPEAK_URL = `https://api.deepgram.com/v1/speak?model=${MODELS.tts
 /** Fixed transcript returned in offline mode, so the voice flow can be tried for free. */
 export const OFFLINE_TRANSCRIPT = "What is the strongest proof of this work?";
 
-/** Time allowed for each speech model, so both attempts fit inside the browser's 30-second call limit. */
+/** Time allowed for most speech models. */
 const SPEECH_TIMEOUT_MS = 12_000;
+/** ElevenLabs takes longer on the longest answers. With a fallback, this fits the browser's 45-second limit. */
+const ELEVENLABS_TIMEOUT_MS = 25_000;
 
 /** Bindings needed for speech calls. */
 type SpeechEnv = Pick<Env, "AI" | "AI_MODE" | "AI_GATEWAY_ID"> & {
@@ -205,27 +207,28 @@ function requestDeepgramSpeech(apiKey: string, text: string, signal: AbortSignal
  *
  * @param text - Text already prepared and length-limited by `domain/audio.ts`.
  * @param context - Gateway metadata for the request.
+ * @param timeoutMs - Overrides the time allowed for every attempt.
  * @throws The fallback model's error when both attempts fail.
  */
 export async function synthesizeSpeech(
   env: SpeechEnv,
   text: string,
   context: GatewayContext,
-  timeoutMs = SPEECH_TIMEOUT_MS,
+  timeoutMs?: number,
 ): Promise<SpokenAudio> {
   if (isOffline(env)) return { audio: offlineTone(), mimeType: "audio/wav", source: "offline", model: null };
 
   const run = runner(env);
   const options = { gateway: gatewayOptions(env, context), returnRawResponse: true };
   // The limit covers the whole download, because a slow stream can start promptly and then stall.
-  const readWithin = async (request: (signal: AbortSignal) => Promise<unknown>): Promise<string> => {
+  const readWithin = async (request: (signal: AbortSignal) => Promise<unknown>, limitMs = timeoutMs ?? SPEECH_TIMEOUT_MS): Promise<string> => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
         controller.abort();
         reject(new Error("Speech request timed out."));
-      }, timeoutMs);
+      }, limitMs);
     });
     try {
       const audio = (async () => readAudioResponse(await request(controller.signal)))();
@@ -243,7 +246,7 @@ export async function synthesizeSpeech(
   const { ELEVENLABS_API_KEY: elevenLabsKey, DEEPGRAM_API_KEY: deepgramKey } = env;
   if (elevenLabsKey) {
     attempts.push(async () => ({
-      audio: await readWithin((signal) => requestElevenLabsSpeech(elevenLabsKey, text, signal)),
+      audio: await readWithin((signal) => requestElevenLabsSpeech(elevenLabsKey, text, signal), timeoutMs ?? ELEVENLABS_TIMEOUT_MS),
       mimeType: "audio/mpeg",
       source: "elevenlabs",
       model: MODELS.tts.elevenLabs,

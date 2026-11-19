@@ -31,4 +31,11 @@ describe("rich text", () => {
     expect(target.querySelector("script")).toBeNull();
     expect(target.textContent).toContain("<script>");
   });
+
+  it("shows headings as bold text without their markers", () => {
+    const target = document.createElement("div");
+    renderRichText(target, "## 1. **Shepherd**\nBody");
+    expect(target.querySelector("strong")?.textContent).toBe("1. Shepherd");
+    expect(target.textContent).not.toContain("#");
+  });
 });

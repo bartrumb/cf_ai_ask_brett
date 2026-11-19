@@ -275,3 +275,13 @@ tried setting key failed
 ````
 
 **Produced:** a diagnosis. The terminal was still using the short-lived AI Gateway token, which cannot change Worker secrets.
+
+---
+
+## Prompt 14
+
+````text
+set proceed to testing and checking traces for errors after to debug and repair
+````
+
+**Produced:** live testing with Worker logs, then fixes for speech timeouts on long answers, cut-off answers and raw headings.

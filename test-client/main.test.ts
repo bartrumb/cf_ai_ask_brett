@@ -268,6 +268,7 @@ describe("voice", () => {
     mocks.playAudio.mockResolvedValue(undefined);
     await listen();
     expect(callsTo("speak")[0]?.[1]).toEqual([{ messageId: 7 }]);
+    expect(callsTo("speak")[0]?.[2]).toEqual({ timeout: 45_000 });
     expect(notice()).toContain("test tone");
     const button = () => byId("conversation").querySelector(".listen") as HTMLElement;
     expect(button().textContent).toBe("Stop");
