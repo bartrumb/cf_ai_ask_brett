@@ -43,10 +43,23 @@ async function authorize(request: Request, env: Env): Promise<{ denied: Response
   return { denied: new Response("Cloudflare Access is not configured", { status: 503 }) };
 }
 
+/**
+ * Groups an address for limits. IPv4 addresses stand alone. IPv6 addresses are expanded, including
+ * `::`, and reduced to their /64, so one network cannot pose as many visitors.
+ */
+export function networkKey(address: string): string {
+  if (!address.includes(":")) return address;
+  const [head = "", tail] = address.toLowerCase().split("::", 2);
+  const groups = (part: string) => (part ? part.split(":").flatMap((group) => (group.includes(".") ? ["0", "0"] : [group])) : []);
+  const front = groups(head);
+  const back = tail === undefined ? [] : groups(tail);
+  const all = tail === undefined ? front : [...front, ...Array<string>(Math.max(0, 8 - front.length - back.length)).fill("0"), ...back];
+  return `${all.slice(0, 4).map((group) => (Number.parseInt(group, 16) || 0).toString(16)).join(":")}::/64`;
+}
+
 /** Creates a non-reversible daily visitor key for spend limits. IPv6 clients are grouped by /64. */
 async function clientKey(request: Request): Promise<string> {
-  const address = request.headers.get("CF-Connecting-IP") ?? "local";
-  const network = address.includes(":") ? address.split(":").slice(0, 4).join(":") : address;
+  const network = networkKey(request.headers.get("CF-Connecting-IP") ?? "local");
   const value = `${new Date().toISOString().slice(0, 10)}:${network}`;
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return [...new Uint8Array(digest).slice(0, 16)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -79,13 +92,17 @@ export default {
     if (!conversationIdSchema.safeParse(conversation).success) {
       return new Response("Invalid conversation", { status: 400 });
     }
+    // Parameters starting with "__" select SDK internals, such as a socket that stays in memory.
+    if ([...url.searchParams.keys()].some((name) => name.startsWith("__"))) {
+      return new Response("Unsupported parameter", { status: 400 });
+    }
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("WebSocket required", { status: 426 });
     }
     if (!hasAllowedOrigin(request, url)) return new Response("Forbidden", { status: 403 });
 
     // The header is absent in local development, where all connections share one key.
-    const client = request.headers.get("CF-Connecting-IP") ?? "local";
+    const client = networkKey(request.headers.get("CF-Connecting-IP") ?? "local");
     const { success } = await env.CONNECT_LIMIT.limit({ key: client });
     if (!success) return new Response("Too many connections", { status: 429 });
 

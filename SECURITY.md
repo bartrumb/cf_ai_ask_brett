@@ -16,7 +16,10 @@ Ask about Brett is a public site. Every question, transcript and model response 
 | Spoofed identity | The Worker strips internal and SDK headers. Visitor keys and Access expiry come only from the Worker. Clients cannot write agent state |
 | Cross-site socket use | Browser connections must come from the same host |
 | Cost abuse | Connection, per-connection, per-conversation, shared per-minute, daily global and daily per-visitor limits apply. Speech costs five units. Questions are capped at 500 characters and audio at 30 seconds |
-| Duplicate spend | Request IDs are idempotent through Think's submission records |
+| Duplicate spend | Request IDs are idempotent through Think's submission records. A repeated ID must carry the same question within the seven-day retry window, so an ID used for a free fixed reply can never start a model turn |
+| Free-path abuse | Fixed replies are limited to 30 per conversation per hour, and each conversation accepts at most eight open sockets |
+| SDK internals | Connection URLs with parameters starting with `__`, which select SDK transports, are rejected |
+| Address rotation | Connection and daily visitor limits group IPv6 addresses by their /64, with `::` expanded correctly |
 | Secret exposure | One redactor covers stored questions, prompts, live text, answers and speech |
 | Data retention | Think's transcript is cleared after each turn. Conversations are deleted after 30 idle days |
 | Script injection | All dynamic text is added as text nodes under a strict Content Security Policy, with no external scripts or fonts |
@@ -27,7 +30,8 @@ Ask about Brett is a public site. Every question, transcript and model response 
 - A model can still misstate facts. The page says answers are AI-generated and should be verified.
 - Guards use patterns. An unusual phrasing can get past them and reach the model, which then has only sanitized facts. Harmless questions can occasionally get a fixed reply.
 - The full sanitized knowledge base is sent to AI Gateway and Workers AI each turn, and gateway logs may contain it. Review it as content you are willing to send there, and set log retention to suit.
-- Output masking covers money and phone formats only. Anything else in the knowledge base can appear in an answer, so remove it from the source if it must stay private.
+- Output masking covers money and phone formats only. Treat everything else in the knowledge base as public: a determined visitor can extract it over several turns. Remove anything from the source that must stay private.
+- With the defaults, three visitor networks can use the whole daily site budget, which pauses AI answers for everyone until midnight UTC. Turnstile before paid actions would raise that bar.
 - The visitor key is an unsalted daily hash of an IP network. It limits spend and is not strong anonymity. Shared networks share a limit, and rotating addresses can get around it. The global limits still apply.
 - The conversation ID in `localStorage` is a bearer value for that conversation. Anyone with it can read that conversation.
 - Set an AI Gateway spend limit. Application limits count actions, and one action can call a primary and a fallback model.

@@ -5,6 +5,21 @@ repository, verbatim and in order, with a short note of what each produced.
 
 Redactions are marked `[REDACTED: ...]`. Nothing else has been changed.
 
+## How to read this log
+
+Prompt 1 is a brief written by another Claude Code session that was helping me plan the application. Every later prompt is my own wording, typos included, because the point is to show how I actually steer the work.
+
+| Prompts | What was happening |
+| --- | --- |
+| 1 | Brief for the first product, Codex Guard |
+| 2–5 | Choosing models, adding AI Gateway, Think durability, schemas, coverage and security reviews |
+| 6–8 | Personal knowledge base work, first live model test and first public deployment |
+| 9–10 | Recognizing the wrong direction and converting the project into a showcase of my work |
+| 11–14 | Voice selection, then live testing and repairs from Worker logs |
+| 15–17 | Lighthouse tuning, public release preparation and final polish |
+
+This file holds the prompts and their outcomes. The raw session transcript is not published because it also contains unrelated private material, such as personal career notes and local machine details.
+
 ---
 
 ## Prompt 1
@@ -269,7 +284,7 @@ ElevenLabs Jarnathan it is for primary. I have used so many models that I'm gett
 ## Prompt 13
 
 ````text
-[Attached terminal output redacted: it contained a Cloudflare account ID and local log paths. It showed `wrangler secret put ELEVENLABS_API_KEY` failing with "No access to the specified resource."]
+[REDACTED: attached terminal output containing a Cloudflare account ID and local log paths. It showed `wrangler secret put ELEVENLABS_API_KEY` failing with "No access to the specified resource."]
 
 tried setting key failed
 ````
@@ -291,8 +306,28 @@ set proceed to testing and checking traces for errors after to debug and repair
 ## Prompt 15
 
 ````text
-@"[local path redacted]\ask-brett.shopdawg.workers.dev-20261118T213639.json" @"[local path redacted]\ask-brett.shopdawg.workers.dev-20261118T213548.json"
+@"[REDACTED: local path]\ask-brett.shopdawg.workers.dev-20261118T213639.json" @"[REDACTED: local path]\ask-brett.shopdawg.workers.dev-20261118T213548.json"
 review lighthouse reports goal is 99-100%
 ````
 
 **Produced:** a page built with its profile content already in the HTML, which removes the layout shift, and a contrast fix.
+
+---
+
+## Prompt 16
+
+````text
+include lots of flair on the repo linking to active site, code coverage, update github repo readme.md and ensure it covers all of the asks for the cloudflare job req, also include mermaid diagrams showcasing the system, eli5, do final security pass of the code, deployed worker, and repo. ensure we are ready for public consumption and that our claude session is logged to the repo so cloudflare reviewers can see my prompting style. raise the daily ai limit to 200
+````
+
+**Produced:** this README with diagrams and badges, CI, a final security review of the code, live Worker and git history, this log's reading guide, and a per-visitor daily limit of 200 units.
+
+---
+
+## Prompt 17
+
+````text
+if you have not creates a fav icon yet create one of my initials BBB but make it look cool and futuristic
+````
+
+**Produced:** the neon BBB icon in SVG, ICO and Apple touch formats.

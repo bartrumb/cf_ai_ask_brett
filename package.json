@@ -4,6 +4,9 @@
   "private": true,
   "description": "Ask about Brett: a public profile site with an AI advocate, built on Cloudflare Workers and Durable Objects.",
   "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
     "content": "node scripts/build-content.mjs",
     "prebuild:client": "npm run content --silent",

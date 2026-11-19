@@ -25,7 +25,7 @@
     // Account-wide count of metered AI actions allowed per UTC day.
     "DAILY_AI_ACTION_LIMIT": "500",
     // Daily units for one visitor network. Spoken audio costs five units.
-    "DAILY_CLIENT_AI_ACTION_LIMIT": "40"
+    "DAILY_CLIENT_AI_ACTION_LIMIT": "200"
   },
   "durable_objects": {
     "bindings": [{ "name": "ShowcaseAgent", "class_name": "ShowcaseAgent" }]

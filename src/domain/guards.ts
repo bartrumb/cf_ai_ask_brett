@@ -30,6 +30,7 @@ const GUARD_PATTERNS: readonly (readonly [GuardCategory, readonly RegExp[]])[] =
       /\byou\s+are\s+now\b|\bjailbreak\w*\b|\b(?:developer|god|dan)\s+mode\b|\bdo anything now\b|\bnew instructions\b/,
       /^\W*(?:please\s+)?(?:act as|pretend|roleplay|role-play)\b|\byou\s+(?:must|should|will|can)\s+(?:now\s+)?(?:act|pretend|behave)\b/,
       /<\/?\s*(?:untrusted|system|instructions?)/,
+      /\b(?:repeat|print|output|dump|reveal|show|quote|copy|recite)\b.{0,40}\b(?:verbatim|word for word|everything (?:above|before)|(?:all )?(?:the )?text (?:above|before)|profile facts|system context|your context)\b/,
     ],
   ],
   [
@@ -37,6 +38,7 @@ const GUARD_PATTERNS: readonly (readonly [GuardCategory, readonly RegExp[]])[] =
     [
       /\bsalar(?:y|ies)\b|\bcompensation\b|\btotal comp\b|\bcomp (?:range|expectations?|target|package)\b/,
       /\b(?:pay|wage|rate) (?:range|target|history|expectations?|band|requirements?)\b|\b(?:base|desired|current|expected) (?:pay|wage)\b/,
+      /\btake[- ]?home\b|\b(?:yearly|annual|monthly) (?:pay|income|earnings)\b/,
       /\bhourly rate\b|\bw-?2 rate\b|\bpaycheck\b|\b(?:signing|sign-on|annual) bonus\b|\bstock options\b|\brsus?\b/,
       new RegExp(String.raw`\bhow much\b.{0,30}\b${PERSON}\b.{0,30}\b(?:make|makes|earn|earns|paid|charge|charges|want|wants|expect|expects|cost|costs)\b`),
       new RegExp(String.raw`\b(?:what|how much)\b.{0,20}\b(?:does|did|would|will|is)\s+${PERSON}\s+(?:earn|make|get paid|being paid)\b`),
@@ -96,9 +98,20 @@ const GUARD_PATTERNS: readonly (readonly [GuardCategory, readonly RegExp[]])[] =
   ],
 ];
 
-/** Folds common character swaps, so "s4lary"-style spellings reach the same patterns. */
+/** Character swaps folded before matching: digits and symbols, and Cyrillic letters that look Latin. */
+const LOOKALIKES: Record<string, string> = {
+  "0": "o", "1": "i", "3": "e", "4": "a", $: "s", "@": "a", "5": "s",
+  а: "a", е: "e", о: "o", р: "p", с: "c", у: "y", х: "x", і: "i", ѕ: "s", ј: "j", ӏ: "l", к: "k", м: "m", т: "t", н: "h", в: "b",
+};
+
+/** Folds common character swaps, so "s4lary"-style and look-alike spellings reach the same patterns. */
 function unmask(text: string): string {
-  return text.replace(/[0134$@5]/g, (character) => ({ "0": "o", "1": "i", "3": "e", "4": "a", $: "s", "@": "a", "5": "s" })[character] ?? character);
+  return text.replace(/[0134$@5а-яіѕјӏ]/g, (character) => LOOKALIKES[character] ?? character);
+}
+
+/** Joins letters spaced one apart, so "s a l a r y" reads as "salary". */
+function joinSpacedLetters(text: string): string {
+  return text.replace(/\b([a-z]) (?=[a-z]\b)/g, "$1");
 }
 
 /**
@@ -108,7 +121,8 @@ function unmask(text: string): string {
  */
 export function classifyQuestion(question: string): GuardCategory | null {
   const plain = normalizeText(question).toLowerCase().replace(/[‘’]/g, "'").replace(/\s+/g, " ").trim();
-  const forms = [plain, unmask(plain)];
+  const folded = unmask(plain);
+  const forms = [plain, folded, joinSpacedLetters(folded)];
   for (const [category, patterns] of GUARD_PATTERNS) {
     if (patterns.some((pattern) => forms.some((form) => pattern.test(form)))) return category;
   }

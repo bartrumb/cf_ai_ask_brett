@@ -21,6 +21,12 @@ import { synthesizeSpeech, transcribeAudio, type SpokenAudio, type Transcript } 
 
 /** Questions, transcriptions and speech requests one conversation may make in a rolling hour. */
 const MAX_AI_ACTIONS_PER_HOUR = 60;
+/** Fixed replies one conversation may receive in a rolling hour. They are free but still write rows. */
+const MAX_GUARDED_REPLIES_PER_HOUR = 30;
+/** Open sockets allowed per conversation, which covers several tabs of one visitor. */
+const MAX_CONNECTIONS_PER_CONVERSATION = 8;
+/** Returned when a request ID is reused for different text or after its retry window. */
+const REUSED_REQUEST = "That question could not be repeated. Please ask it again.";
 /** Length of the rolling rate-limit window. */
 const HOUR_MS = 60 * 60 * 1000;
 /** Speech is charged more because one spoken answer can use many billed characters. */
@@ -119,6 +125,11 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
         if (typeof message !== "string" || !CHAT_PROTOCOL_FRAME.test(message)) send(message);
       };
       const expires = Number(context.request.headers.get(ACCESS_EXPIRES_HEADER));
+      // Each open socket keeps work alive, so one conversation cannot hold an unbounded number.
+      if ([...this.getConnections()].length > MAX_CONNECTIONS_PER_CONVERSATION) {
+        connection.close(4429, "Too many connections");
+        return;
+      }
       connection.setState({
         ...(expires > 0 ? { accessExpiresAt: expires } : {}),
         clientKey: context.request.headers.get(CLIENT_KEY_HEADER),
@@ -293,7 +304,16 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
     await this.clearFinishedQuestion();
     const key = `question:${requestId}`;
     const text = redactSecrets(normalizeText(question)).trim();
-    const known = this.sql`SELECT id FROM messages WHERE dedupe_key = ${key}`.length > 0;
+    const [row] = this.sql<{ text: string; created_at: number }>`SELECT text, created_at FROM messages WHERE dedupe_key = ${key}`;
+    // A repeat is free, so it must be the same question within Think's retry window. Otherwise an ID
+    // that never paid for a model turn, such as one used for a fixed reply, could start one.
+    if (row && (row.text !== text || Date.now() - row.created_at >= SUBMISSION_RETENTION_MS)) {
+      return { ok: false, error: REUSED_REQUEST };
+    }
+    if (row && this.sql`SELECT id FROM messages WHERE dedupe_key = ${`answer:${key}`}`.length > 0) {
+      return { ok: true, submissionId: `guarded:${requestId}`, accepted: false };
+    }
+    const known = Boolean(row);
     // One question at a time keeps every answer directly after its question.
     if (!known && (this.state.activeQuestion || this.submittingQuestion)) {
       return { ok: false, error: "The previous question is still being answered." };
@@ -302,6 +322,9 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
     if (category) {
       if (!known) {
         const now = Date.now();
+        const [recent] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM messages
+          WHERE source = 'guarded' AND created_at > ${now - HOUR_MS}`;
+        if ((recent?.count ?? 0) >= MAX_GUARDED_REPLIES_PER_HOUR) return { ok: false, error: BUSY_MESSAGE };
         // No await separates these writes, so the pair commits together and stays adjacent.
         this.sql`INSERT INTO messages (dedupe_key, role, text, created_at) VALUES (${key}, 'user', ${text}, ${now})`;
         this.sql`INSERT INTO messages (dedupe_key, role, text, source, created_at)

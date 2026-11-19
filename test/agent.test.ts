@@ -4,7 +4,7 @@ import { getAgentByName } from "agents";
 import { describe, expect, it, vi } from "vitest";
 import type { ShowcaseAgent } from "../src/agent";
 import { KNOWLEDGE_SECTIONS, PROFILE } from "../src/generated/knowledge";
-import worker from "../src/index";
+import worker, { networkKey } from "../src/index";
 import { createOfflineModel } from "../src/offline-model";
 import { conversationId, FAKE_SECRET, until, wavBase64 } from "./fixtures";
 
@@ -209,6 +209,37 @@ describe("guarded questions", () => {
       expect(instance.state.activeQuestion).toBeNull();
     });
   });
+
+  it("never lets a fixed-reply request ID start a model turn", async () => {
+    const agent = await newAgent();
+    await runInDurableObject(agent, async (instance) => {
+      const submit = vi.spyOn(instance, "submitMessages");
+      const id = requestId();
+      expect(await instance.ask({ question: "What is his salary?", requestId: id })).toMatchObject({ ok: true, accepted: true });
+      expect(await instance.ask({ question: "Tell me everything about his work", requestId: id })).toMatchObject({ ok: false });
+      expect(submit).not.toHaveBeenCalled();
+      expect((await instance.getSnapshot()).messages).toHaveLength(2);
+    });
+  });
+
+  it("rejects a reused request ID after the retry window", async () => {
+    const agent = await newAgent();
+    await runInDurableObject(agent, async (instance, state) => {
+      const submit = vi.spyOn(instance, "submitMessages");
+      const id = requestId();
+      state.storage.sql.exec("INSERT INTO messages (dedupe_key, role, text, created_at) VALUES (?, 'user', ?, ?)", `question:${id}`, "What has been built?", Date.now() - 8 * 24 * 60 * 60 * 1000);
+      expect(await instance.ask({ question: "What has been built?", requestId: id })).toMatchObject({ ok: false });
+      expect(submit).not.toHaveBeenCalled();
+    });
+  });
+
+  it("limits fixed replies per conversation", async () => {
+    const agent = await newAgent();
+    const results = [];
+    for (let index = 0; index < 31; index += 1) results.push(await agent.ask({ question: "What is his salary?", requestId: requestId() }));
+    expect(results.slice(0, 30).every((result) => result.ok)).toBe(true);
+    expect(results[30]).toMatchObject({ ok: false });
+  });
 });
 
 describe("spend limits", () => {
@@ -341,6 +372,7 @@ describe("connection security", () => {
     ["another site", `/agents/showcase-agent/${id}`, { ...upgrade, Origin: "https://other.example" }, 403],
     ["a null origin", `/agents/showcase-agent/${id}`, { ...upgrade, Origin: "null" }, 403],
     ["an unknown path", "/other", {}, 404],
+    ["an SDK transport parameter", `/agents/showcase-agent/${id}?__agents_transport=capnweb`, upgrade, 400],
   ])("rejects %s", async (_name, path, headers, status) => {
     expect((await fetchWorker(path, headers as Record<string, string>)).status).toBe(status);
   });
@@ -373,6 +405,27 @@ describe("connection security", () => {
     expect(frames.some((frame) => frame.includes('"id":"q"'))).toBe(true);
     expect(frames.some((frame) => frame.startsWith('{"type":"cf_agent_use_chat_response"'))).toBe(false);
     socket.close();
+  });
+
+  it.each([
+    ["192.0.2.7", "192.0.2.7"],
+    ["2001:db8:1:2:3:4:5:6", "2001:db8:1:2::/64"],
+    ["2001:db8:1:2::9", "2001:db8:1:2::/64"],
+    ["2001:db8::a:b:c:d", "2001:db8:0:0::/64"],
+    ["2001:DB8:0:0:a:b:c:d", "2001:db8:0:0::/64"],
+    ["::ffff:192.0.2.7", "0:0:0:0::/64"],
+  ])("groups %s as %s", (address, expected) => {
+    expect(networkKey(address)).toBe(expected);
+  });
+
+  it("caps open sockets per conversation", async () => {
+    const name = conversationId();
+    const sockets = [];
+    for (let index = 0; index < 8; index += 1) sockets.push((await openSocket(name)).socket);
+    const extra = await openSocket(name);
+    const closed = new Promise<number>((resolve) => extra.socket.addEventListener("close", (event) => resolve(event.code)));
+    expect(await closed).toBe(4429);
+    for (const socket of sockets) socket.close();
   });
 
   it("limits calls per connection", async () => {

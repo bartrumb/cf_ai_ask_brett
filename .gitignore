@@ -10,8 +10,8 @@ coverage/
 *.log
 
 # Private profile content and everything generated from it
-content/knowledge-base.md
-content/site.json
+content/*
+!content/*.example.*
 src/generated/
 public/site.json
 public/index.html
