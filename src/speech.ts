@@ -1,12 +1,16 @@
 /*
- * Speech-to-text and text-to-speech calls through AI Gateway, each with a fallback model and an
- * offline path. `ShowcaseAgent` handles validation, rate limits and redaction around these calls.
+ * Speech-to-text and text-to-speech calls, each with a fallback model and an offline path. Calls go
+ * through AI Gateway, except text to speech when a Deepgram key is set. `ShowcaseAgent` handles
+ * validation, rate limits and redaction around these calls.
  */
 import { Buffer } from "node:buffer";
 import type { AnswerSource } from "./domain/types";
 import { gatewayMetadata, gatewayOptions, type GatewayContext } from "./gateway";
 import { isOffline } from "./llm";
-import { MODELS } from "./models";
+import { MODELS, TTS_SPEAKERS } from "./models";
+
+/** Deepgram's speech endpoint, set to the podcast voice. */
+const DEEPGRAM_SPEAK_URL = `https://api.deepgram.com/v1/speak?model=${MODELS.tts.direct}&encoding=mp3`;
 
 /** Fixed transcript returned in offline mode, so the voice flow can be tried for free. */
 export const OFFLINE_TRANSCRIPT = "What is the strongest proof of this work?";
@@ -15,7 +19,7 @@ export const OFFLINE_TRANSCRIPT = "What is the strongest proof of this work?";
 const SPEECH_TIMEOUT_MS = 12_000;
 
 /** Bindings needed for speech calls. */
-type SpeechEnv = Pick<Env, "AI" | "AI_MODE" | "AI_GATEWAY_ID"> & { AI_GATEWAY_TOKEN?: string };
+type SpeechEnv = Pick<Env, "AI" | "AI_MODE" | "AI_GATEWAY_ID"> & { AI_GATEWAY_TOKEN?: string; DEEPGRAM_API_KEY?: string };
 /** Where a successful speech result came from. */
 type Source = Extract<AnswerSource, "workers-ai" | "offline">;
 /** Loose signature for `env.AI.run`, which is called here with model-specific input shapes. */
@@ -32,7 +36,7 @@ export interface Transcript {
 export interface SpokenAudio {
   audio: string;
   mimeType: string;
-  source: Source;
+  source: Source | "deepgram";
   model: string | null;
 }
 
@@ -160,11 +164,27 @@ function offlineTone(): string {
 }
 
 /**
- * Synthesizes MP3 speech, trying the secondary model after any primary failure.
+ * Requests speech from Deepgram's own API. Redirects are not followed, so the key is only ever sent
+ * to Deepgram, and a redirect counts as a failure.
+ */
+function requestDeepgramSpeech(apiKey: string, text: string, signal: AbortSignal): Promise<Response> {
+  return fetch(DEEPGRAM_SPEAK_URL, {
+    method: "POST",
+    headers: { Authorization: `Token ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+    redirect: "manual",
+    signal,
+  });
+}
+
+/**
+ * Synthesizes MP3 speech in two attempts, so both fit inside the browser's call limit. The first is
+ * Deepgram directly when `DEEPGRAM_API_KEY` is set, otherwise Aura-2 through the gateway. The second
+ * is always Aura-1 through the gateway, which keeps speech working if Deepgram's API is unavailable.
  *
  * @param text - Text already prepared and length-limited by `domain/audio.ts`.
  * @param context - Gateway metadata for the request.
- * @throws The secondary model's error when both models fail.
+ * @throws The fallback model's error when both attempts fail.
  */
 export async function synthesizeSpeech(
   env: SpeechEnv,
@@ -176,9 +196,8 @@ export async function synthesizeSpeech(
 
   const run = runner(env);
   const options = { gateway: gatewayOptions(env, context), returnRawResponse: true };
-  const input = { text, speaker: "luna", encoding: "mp3" };
   // The limit covers the whole download, because a slow stream can start promptly and then stall.
-  const speak = async (model: string): Promise<SpokenAudio> => {
+  const readWithin = async (request: (signal: AbortSignal) => Promise<unknown>): Promise<string> => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
@@ -188,17 +207,27 @@ export async function synthesizeSpeech(
       }, timeoutMs);
     });
     try {
-      const request = (async () => readAudioResponse(await run(model, input, { ...options, signal: controller.signal })))();
-      const audio = await Promise.race([request, timeout]);
-      return { audio, mimeType: "audio/mpeg", source: "workers-ai", model };
+      const audio = (async () => readAudioResponse(await request(controller.signal)))();
+      return await Promise.race([audio, timeout]);
     } finally {
       clearTimeout(timer);
     }
   };
+  const speakThroughGateway = async (model: string, speaker: string): Promise<SpokenAudio> => {
+    const input = { text, speaker, encoding: "mp3" };
+    const audio = await readWithin((signal) => run(model, input, { ...options, signal }));
+    return { audio, mimeType: "audio/mpeg", source: "workers-ai", model };
+  };
+  const speakFirstChoice = async (): Promise<SpokenAudio> => {
+    const apiKey = env.DEEPGRAM_API_KEY;
+    if (!apiKey) return speakThroughGateway(MODELS.tts.primary, TTS_SPEAKERS.primary);
+    const audio = await readWithin((signal) => requestDeepgramSpeech(apiKey, text, signal));
+    return { audio, mimeType: "audio/mpeg", source: "deepgram", model: MODELS.tts.direct };
+  };
   try {
-    return await speak(MODELS.tts.primary);
+    return await speakFirstChoice();
   } catch (error) {
     console.warn("primary speech failed", error instanceof Error ? error.message : "unknown error");
   }
-  return speak(MODELS.tts.secondary);
+  return speakThroughGateway(MODELS.tts.secondary, TTS_SPEAKERS.secondary);
 }

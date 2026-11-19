@@ -243,3 +243,13 @@ Yes, convert it
 ````
 
 **Produced:** conversion of the application into a public AI showcase site.
+
+---
+
+## Prompt 11
+
+````text
+I set the spend limit perhaps we should switch over to deep gram direct using the voice from our podcast like we do in shepherd
+````
+
+**Produced:** text to speech in the podcast's Deepgram Aura-2 Aries voice, called directly when a Deepgram key is set, with AI Gateway models as fallbacks.

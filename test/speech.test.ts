@@ -4,7 +4,7 @@ import { decodeWav, MAX_SPOKEN_CHARS, toSpokenText } from "../src/domain/audio";
 import { applyGateway, desiredGateway } from "../src/domain/gateway-config";
 import { MAX_AUDIO_BYTES, parseInput, transcribeSchema } from "../src/domain/schemas";
 import { gatewayMetadata } from "../src/gateway";
-import { MODELS } from "../src/models";
+import { MODELS, TTS_SPEAKERS } from "../src/models";
 import { synthesizeSpeech, transcribeAudio } from "../src/speech";
 import { FAKE_SECRET, wavBase64 } from "./fixtures";
 
@@ -62,20 +62,57 @@ describe("speech to text", () => {
 });
 
 describe("text to speech", () => {
-  it("uses the primary model through the gateway", async () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("uses the primary model and podcast voice through the gateway without a Deepgram key", async () => {
     const { calls, env } = fakeEnv(() => new Response(new Uint8Array([1, 2, 3]), { headers: { "content-type": "audio/mpeg" } }));
+    const fetcher = vi.spyOn(globalThis, "fetch");
     const result = await synthesizeSpeech(env, "Hello.", context);
-    expect(result).toMatchObject({ audio: "AQID", mimeType: "audio/mpeg", model: MODELS.tts.primary });
+    expect(result).toMatchObject({ audio: "AQID", mimeType: "audio/mpeg", source: "workers-ai", model: MODELS.tts.primary });
     expect(calls[0]?.options.gateway?.id).toBe("test-gateway");
+    expect(calls[0]?.input.speaker).toBe(TTS_SPEAKERS.primary);
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it("falls back to the secondary model with the same request", async () => {
+  it("calls Deepgram directly with the podcast voice when a key is set", async () => {
+    const { calls, env } = fakeEnv(() => new Response("unused"));
+    const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(new Uint8Array([1, 2, 3])));
+    const result = await synthesizeSpeech({ ...env, DEEPGRAM_API_KEY: "test-key" }, "Hello.", context);
+    expect(result).toEqual({ audio: "AQID", mimeType: "audio/mpeg", source: "deepgram", model: "aura-2-aries-en" });
+    expect(calls).toEqual([]);
+    const [url, init] = fetcher.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.deepgram.com/v1/speak?model=aura-2-aries-en&encoding=mp3");
+    expect(url).not.toContain("test-key");
+    expect(new Headers(init.headers).get("Authorization")).toBe("Token test-key");
+    expect(init.body).toBe(JSON.stringify({ text: "Hello." }));
+    expect(init.redirect).toBe("manual");
+  });
+
+  it.each([
+    ["an error status", () => Promise.resolve(new Response("no", { status: 401 }))],
+    ["a redirect", () => Promise.resolve(new Response(null, { status: 302, headers: { location: "https://example.com/" } }))],
+    ["a network failure", () => Promise.reject(new Error("offline"))],
+  ])("falls back to the gateway when Deepgram returns %s", async (_name, reply) => {
+    const { calls, env } = fakeEnv(() => new Response(new Uint8Array([1, 2, 3])));
+    vi.spyOn(globalThis, "fetch").mockImplementation(reply);
+    const result = await synthesizeSpeech({ ...env, DEEPGRAM_API_KEY: "test-key" }, "Hello.", context);
+    expect(result).toMatchObject({ audio: "AQID", source: "workers-ai", model: MODELS.tts.secondary });
+    expect(calls.map((call) => call.model)).toEqual([MODELS.tts.secondary]);
+  });
+
+  it("falls back when Deepgram stalls", async () => {
+    const { env } = fakeEnv(() => new Response(new Uint8Array([1, 2, 3])));
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => new Promise(() => {}));
+    await expect(synthesizeSpeech({ ...env, DEEPGRAM_API_KEY: "test-key" }, "Hello.", context, 5)).resolves.toMatchObject({ model: MODELS.tts.secondary });
+  });
+
+  it("falls back to the secondary model and its own voice", async () => {
     const { calls, env } = fakeEnv(({ model }) =>
       model === MODELS.tts.primary ? new Response("no", { status: 500 }) : new Response(new Uint8Array([1, 2, 3])),
     );
     expect(await synthesizeSpeech(env, "Hello.", context)).toMatchObject({ audio: "AQID", model: MODELS.tts.secondary });
     expect(calls.map((call) => call.model)).toEqual([MODELS.tts.primary, MODELS.tts.secondary]);
-    expect(calls[1]?.input).toEqual(calls[0]?.input);
+    expect(calls[1]?.input).toEqual({ ...calls[0]?.input, speaker: TTS_SPEAKERS.secondary });
     expect(calls[1]?.options.gateway?.id).toBe("test-gateway");
   });
 

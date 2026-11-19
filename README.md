@@ -78,15 +78,21 @@ Open <http://127.0.0.1:8787>.
 
 ## Models
 
-Model IDs live in `src/models.ts`. Every call goes through the `codex-guard` AI Gateway, an existing gateway ID kept so its logs and limits carry over. Requests carry `app: ask-brett` metadata.
+Model IDs live in `src/models.ts`. Calls go through the `codex-guard` AI Gateway, an existing gateway ID kept so its logs and limits carry over, except direct Deepgram speech described below. Gateway requests carry `app: ask-brett` metadata.
 
 | Purpose | Primary | Fallback |
 | --- | --- | --- |
 | Language | `@cf/deepseek-ai/deepseek-v4.1-flash-1017` | `@cf/thinkingmachines/inkling-2-small` |
 | Speech to text | `@cf/deepgram/nova-3` | `@cf/openai/whisper-large-v3-turbo` |
-| Text to speech | `@cf/deepgram/aura-2-en` | `@cf/deepgram/aura-1` |
+| Text to speech | Deepgram `aura-2-aries-en` (direct), or `@cf/deepgram/aura-2-en` with the `aries` voice | `@cf/deepgram/aura-1` with the `orion` voice |
 
 Nova runs through the gateway's HTTP endpoint only when the `AI_GATEWAY_TOKEN` Worker secret is set. Otherwise speech recognition uses Whisper through the gateway.
+
+Text to speech calls Deepgram's API directly only when the `DEEPGRAM_API_KEY` Worker secret is set. Those calls do not pass through AI Gateway, so its logs and spend limit do not cover them. Set the secret from a hidden prompt:
+
+```powershell
+npx wrangler secret put DEEPGRAM_API_KEY
+```
 
 ## Deployment
 
