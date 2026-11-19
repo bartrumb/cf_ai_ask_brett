@@ -373,3 +373,15 @@ Then run tests, redeploy, and live-check at least these: "How did he get AI Chan
 ````
 
 **Produced:** edits to the gitignored knowledge base and site content only: the approval wording, the employer details removed or generalized, and company cost figures dropped. No public source file changed apart from this log.
+
+---
+
+## Prompt 21
+
+This request came from the Claude Code session I use for résumé and site review. That session made the change itself, outside this project's main session.
+
+````text
+great! now I want you to combine the chat agent into https://brett.bartrum.family/
+````
+
+**Produced:** `client/widget.ts`, an embeddable version of the chat that mounts into any `[data-ask-widget]` element and connects over the host page's own domain, plus `npm run build:widget` and client tests. The personal site forwards `/agents/*` to this Worker through a service binding, so the agent's existing origin, rate-limit and budget checks apply unchanged. This Worker's server code did not change.

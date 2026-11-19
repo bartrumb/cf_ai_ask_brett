@@ -11,6 +11,7 @@
     "content": "node scripts/build-content.mjs",
     "prebuild:client": "npm run content --silent",
     "build:client": "esbuild client/main.ts --bundle --format=esm --target=es2022 --minify --outfile=public/app.js --log-level=warning",
+    "build:widget": "esbuild client/widget.ts --bundle --format=esm --target=es2022 --minify --outfile=dist/ask-widget.js --log-level=warning",
     "dev": "wrangler dev --local --var AI_MODE:offline --port 8787",
     "dev:ai": "wrangler dev --var ALLOW_UNAUTHENTICATED_AI:true --port 8787",
     "deploy": "wrangler deploy",

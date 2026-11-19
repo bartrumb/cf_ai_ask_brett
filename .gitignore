@@ -15,3 +15,6 @@ content/*
 src/generated/
 public/site.json
 public/index.html
+
+# Embeddable widget build output
+dist/
