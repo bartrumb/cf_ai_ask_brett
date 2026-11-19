@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Guard</title>
+    <meta name="description" content="Check a proposed change against your team's engineering standards before you open a pull request." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%230f766e' d='M16 2 4 7v8c0 7.5 5 12.6 12 15 7-2.4 12-7.5 12-15V7z'/%3E%3Cpath fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round' d='m10.5 16 4 4 7-8'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 2 4 7v8c0 7.5 5 12.6 12 15 7-2.4 12-7.5 12-15V7z" /><path class="check" d="m10.5 16 4 4 7-8" /></svg>
+        <div>
+          <h1>Codex Guard</h1>
+          <p>Standards check before the pull request</p>
+        </div>
+      </div>
+      <form id="repo-form" class="repo">
+        <label for="repo-input">Repository</label>
+        <input id="repo-input" maxlength="64" autocomplete="off" spellcheck="false" />
+        <button type="submit">Open</button>
+      </form>
+      <span id="connection" class="connection" role="status" data-state="connecting">Connecting</span>
+    </header>
+
+    <div class="layout">
+      <main class="chat">
+        <div id="chat-scroll" class="chat-scroll">
+          <div id="timeline" class="timeline" aria-live="polite"></div>
+        </div>
+        <div class="composer">
+          <div id="notice" class="notice" role="alert" hidden></div>
+          <div class="sample-row">
+            <span>Samples</span>
+            <div id="samples" class="samples"></div>
+          </div>
+          <label class="sr-only" for="change-input">Change summary, unified diff or question</label>
+          <textarea id="change-input" rows="5" spellcheck="false" placeholder="Paste a unified diff or describe the change. Ask a question about the latest review."></textarea>
+          <div class="composer-actions">
+            <span id="char-count" class="count">0 / 40,000</span>
+            <button id="ask-button" class="secondary" type="button" disabled>Ask a question</button>
+            <button id="review-button" class="primary" type="button" disabled>Review change</button>
+          </div>
+        </div>
+      </main>
+
+      <aside class="memory" aria-label="Repository memory">
+        <p class="memory-heading">Repository memory</p>
+        <details open>
+          <summary>Accepted exceptions <span id="exception-count" class="pill">0</span></summary>
+          <ul id="exceptions" class="plain-list"></ul>
+        </details>
+        <details open>
+          <summary>Past reviews <span id="history-count" class="pill">0</span></summary>
+          <ul id="history" class="plain-list"></ul>
+        </details>
+        <details open>
+          <summary>Sample standards <span id="standard-count" class="pill">0</span></summary>
+          <ul id="standards" class="plain-list"></ul>
+        </details>
+      </aside>
+    </div>
+
+    <dialog id="exception-dialog">
+      <form id="exception-form">
+        <h2>Accept as an exception</h2>
+        <p>Later reviews will mark <strong id="exception-target"></strong> as accepted and leave it out of the risk level. The finding stays visible.</p>
+        <label for="exception-reason">Reason</label>
+        <textarea id="exception-reason" rows="4" minlength="10" maxlength="500" required placeholder="Why is this acceptable, and until when?"></textarea>
+        <p id="exception-error" class="dialog-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button id="exception-cancel" class="secondary" type="button">Cancel</button>
+          <button class="primary" type="submit">Save exception</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
