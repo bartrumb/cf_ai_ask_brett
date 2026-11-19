@@ -18,6 +18,10 @@ Codex Guard treats every submitted change, transcript and model response as untr
 | Stale authorization and data | Sockets close when their Access token expires. Exceptions record the verified user, expire after 90 days, and cannot target whole-change or summary findings. Repository data is deleted after 30 idle days |
 | Script injection | The UI renders text nodes only, under a restrictive Content Security Policy |
 
+## Public demo
+
+`npm run deploy:public` allows anonymous use of real models. Browsers receive unguessable workspace names, visitors see a notice not to submit private code or secrets, and shared daily and per-visitor limits apply. Anyone given a workspace link can use that workspace.
+
 ## Remaining risks
 
 - People admitted by Access share all repositories. Add per-repository authorization before using this for separate teams.

@@ -23,8 +23,6 @@ import { playAudio, startRecording, stopPlayback, type Recording } from "./voice
 
 /** Mirrors the server limit so the composer can warn before submitting. */
 const MAX_INPUT_CHARS = 40_000;
-/** Repository opened when the URL and saved preference name none. */
-const DEFAULT_REPO = "sample-payments-api";
 /** Display order and text for review progress. */
 const STEP_LABELS: Record<StepName, string> = {
   intake: "Input accepted",
@@ -122,6 +120,7 @@ let recording: Recording | null = null;
 let transcribing = false;
 /** `kind:id` of the item being fetched or played as speech. */
 let speakingKey: string | null = null;
+let speechLoading = false;
 /** Streamed commentary by review ID, kept until the stored version arrives. */
 const liveCommentary = new Map<string, string>();
 
@@ -149,11 +148,16 @@ function toSlug(value: string): string {
 function initialRepository(): string {
   const fromUrl = toSlug(new URLSearchParams(location.search).get("repo") ?? "");
   if (fromUrl) return fromUrl;
+  const random = crypto.getRandomValues(new Uint8Array(12));
+  const privateName = `demo-${[...random].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
   try {
-    return toSlug(localStorage.getItem("codex-guard-repo") ?? "") || DEFAULT_REPO;
+    const saved = toSlug(localStorage.getItem("codex-guard-repo") ?? "");
+    if (saved && saved !== "sample-payments-api") return saved;
+    localStorage.setItem("codex-guard-repo", privateName);
   } catch {
-    return DEFAULT_REPO;
+    // Without storage, the visitor still gets a private workspace for this page load.
   }
+  return privateName;
 }
 
 /** Shows a message in the notice area. An empty message hides it. */
@@ -208,8 +212,17 @@ function listenButton(kind: "review" | "message", id: string | number): HTMLElem
   return h(
     "button",
     { class: "link-button listen", type: "button", onClick: () => void toggleSpeech(kind, id) },
-    speakingKey === key ? "Stop" : "Listen",
+    speakingKey === key ? (speechLoading ? "Preparing audio…" : "Stop") : "Listen",
   );
+}
+
+/** Turns the small inline Markdown subset used by models into safe DOM nodes. */
+function inlineText(text: string): Child[] {
+  return text.split(/(\*\*[^*\n]+\*\*|`[^`\n]+`)/).map((part) => {
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) return h("strong", {}, part.slice(2, -2));
+    if (part.startsWith("`") && part.endsWith("`") && part.length > 2) return h("code", {}, part.slice(1, -1));
+    return part;
+  });
 }
 
 /**
@@ -225,11 +238,11 @@ function renderCommentary(target: HTMLElement, text: string): void {
       continue;
     }
     if (code) code.append(`${line}\n`);
-    else if (line.startsWith("### ")) target.append(h("h4", {}, line.slice(4)));
+    else if (line.startsWith("### ")) target.append(h("h4", {}, line.slice(4).replaceAll("**", "")));
     else if (line.trim()) {
       const label = /^\**(Why it matters|Suggested fix):\**\s*(.*)$/.exec(line);
-      if (label) target.append(h("p", {}, h("strong", {}, `${label[1]}: `), label[2] ?? ""));
-      else target.append(h("p", {}, line));
+      if (label) target.append(h("p", {}, h("strong", {}, `${label[1]}: `), ...inlineText(label[2] ?? "")));
+      else target.append(h("p", {}, ...inlineText(line)));
     }
   }
 }
@@ -600,17 +613,21 @@ async function toggleSpeech(kind: "review" | "message", id: string | number): Pr
   if (!client) return;
   setNotice("");
   speakingKey = key;
+  speechLoading = true;
   render();
   try {
     const result = (await client.call("speak", [{ kind, id }])) as unknown as ActionResult<SpeechResult>;
     if (speakingKey !== key) return;
     if (!result.ok) throw new Error(result.error);
     if (result.source === "offline") setNotice("Offline mode plays a test tone instead of speech.");
+    speechLoading = false;
+    render();
     await playAudio(result.audio, result.mimeType, () => {
       if (speakingKey === key) speakingKey = null;
       render();
     });
   } catch (error) {
+    speechLoading = false;
     if (speakingKey === key) speakingKey = null;
     reportFailure(error);
     render();

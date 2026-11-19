@@ -8,7 +8,7 @@
  */
 import { Think, type ChatResponseResult, type StepContext, type TurnConfig, type TurnContext } from "@cloudflare/think";
 import { callable, getAgentByName, getCurrentAgent, type Connection, type ConnectionContext, type WSMessage } from "agents";
-import { ACCESS_EMAIL_HEADER, ACCESS_EXPIRES_HEADER } from "./access";
+import { ACCESS_EMAIL_HEADER, ACCESS_EXPIRES_HEADER, CLIENT_KEY_HEADER } from "./access";
 import { buildSpokenReview, decodeWav, toSpokenText } from "./domain/audio";
 import { normalizeText, parseChange } from "./domain/input";
 import { buildQuestionPrompt, offlineAnswer } from "./domain/prompt";
@@ -59,6 +59,8 @@ const STALE_REVIEW_MS = 20 * 60 * 1000;
 /** Length of the rolling rate-limit window. */
 const HOUR_MS = 60 * 60 * 1000;
 /** Progress steps accepted from Workflow callbacks. */
+/** Speech is charged more because one spoken review can use many billed characters. */
+const SPEECH_BUDGET_UNITS = 5;
 /** Exceptions stop applying after this long and must be accepted again. */
 const EXCEPTION_LIFETIME_MS = 90 * 24 * HOUR_MS;
 /** Repository data is deleted after this long without activity. */
@@ -92,6 +94,7 @@ function isSnapshotFrame(message: string): boolean {
 interface ConnectionIdentity {
   accessExpiresAt?: number;
   accessEmail?: string | null;
+  clientKey?: string | null;
 }
 const STEP_NAMES: readonly StepName[] = ["intake", "rules", "commentary", "save"];
 /** Stored as the answer when a question turn fails or produces no text. */
@@ -203,9 +206,10 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
         if (typeof message !== "string" || !CHAT_PROTOCOL_FRAME.test(message)) send(message);
       };
       const expires = Number(context.request.headers.get(ACCESS_EXPIRES_HEADER));
-      if (expires > 0) {
-        connection.setState({ accessExpiresAt: expires, accessEmail: context.request.headers.get(ACCESS_EMAIL_HEADER) });
-      }
+      connection.setState({
+        ...(expires > 0 ? { accessExpiresAt: expires, accessEmail: context.request.headers.get(ACCESS_EMAIL_HEADER) } : {}),
+        clientKey: context.request.headers.get(CLIENT_KEY_HEADER),
+      });
       return handleConnect(connection, context);
     };
 
@@ -283,6 +287,8 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
       created_at INTEGER NOT NULL)`;
     this.sql`CREATE TABLE IF NOT EXISTS ai_actions (created_at INTEGER NOT NULL)`;
     this.sql`CREATE TABLE IF NOT EXISTS daily_budget (day TEXT PRIMARY KEY, used INTEGER NOT NULL)`;
+    this.sql`CREATE TABLE IF NOT EXISTS daily_client_budget (
+      day TEXT NOT NULL, client TEXT NOT NULL, used INTEGER NOT NULL, PRIMARY KEY (day, client))`;
     if (!this.getSchedules().some((schedule) => schedule.callback === "expireIdleData")) {
       await this.schedule(IDLE_CHECK_SECONDS, "expireIdleData", {});
     }
@@ -463,7 +469,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     const now = Date.now();
     const title = describeChange(parsed.change, text);
     // The chat log keeps only this redacted preview. Raw text stays in `pending_inputs`.
-    const preview = redactSecrets(normalizeText(text)).slice(0, 280);
+    const preview = redactSecrets(normalizeText(text)).slice(0, 280).replace(/\[[A-Z ]{0,30}$/, "…");
     // No await separates these writes, so they commit together. They precede the launch so
     // `onStart` can resume it if the object is interrupted.
     this.sql`INSERT INTO reviews (id, request_id, created_at, status, title)
@@ -634,7 +640,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     if (!input.ok) return input;
     const target = this.readSpokenTarget(input.data);
     if (!target) return { ok: false, error: "There is nothing to read aloud yet." };
-    if (!(await this.reserveAiAction())) return { ok: false, error: "This repository reached its hourly AI limit." };
+    if (!(await this.reserveAiAction(SPEECH_BUDGET_UNITS))) return { ok: false, error: "This repository reached its hourly AI limit." };
     try {
       const speech = await synthesizeSpeech(this.env, target.text, {
         repository: this.name,
@@ -670,13 +676,20 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
    *
    * @returns False when the limit has been reached.
    */
-  consumeDailyBudget(limit: number): boolean {
+  consumeDailyBudget(limit: number, units = 1, client?: string | null, clientLimit = limit): boolean {
     const day = new Date().toISOString().slice(0, 10);
     this.sql`DELETE FROM daily_budget WHERE day <> ${day}`;
+    this.sql`DELETE FROM daily_client_budget WHERE day <> ${day}`;
     const [row] = this.sql<{ used: number }>`SELECT used FROM daily_budget WHERE day = ${day}`;
-    if ((row?.used ?? 0) >= limit) return false;
-    this.sql`INSERT INTO daily_budget (day, used) VALUES (${day}, 1)
-      ON CONFLICT (day) DO UPDATE SET used = used + 1`;
+    if ((row?.used ?? 0) + units > limit) return false;
+    if (client) {
+      const [visitor] = this.sql<{ used: number }>`SELECT used FROM daily_client_budget WHERE day = ${day} AND client = ${client}`;
+      if ((visitor?.used ?? 0) + units > clientLimit) return false;
+      this.sql`INSERT INTO daily_client_budget (day, client, used) VALUES (${day}, ${client}, ${units})
+        ON CONFLICT (day, client) DO UPDATE SET used = used + ${units}`;
+    }
+    this.sql`INSERT INTO daily_budget (day, used) VALUES (${day}, ${units})
+      ON CONFLICT (day) DO UPDATE SET used = used + ${units}`;
     return true;
   }
 
@@ -825,15 +838,17 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
    * Applies shared limits across every repository name: a per-minute ceiling always, and a daily
    * budget for real model calls. Budget failures deny the action.
    */
-  private async allowSharedAiSpend(): Promise<boolean> {
+  private async allowSharedAiSpend(units = 1): Promise<boolean> {
     if (!(await this.env.AI_ACTION_LIMIT.limit({ key: "global" })).success) return false;
     if (isOffline(this.env)) return true;
     const limit = Number(this.env.DAILY_AI_ACTION_LIMIT);
-    if (!Number.isFinite(limit) || limit <= 0) return false;
+    const clientLimit = Number(this.env.DAILY_CLIENT_AI_ACTION_LIMIT);
+    if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(clientLimit) || clientLimit <= 0) return false;
+    const client = (getCurrentAgent().connection?.state as ConnectionIdentity | null | undefined)?.clientKey ?? null;
     try {
       const namespace = this.env.CodexGuardAgent as unknown as DurableObjectNamespace<CodexGuardAgent>;
       const budget = await getAgentByName<Env, CodexGuardAgent>(namespace, BUDGET_INSTANCE);
-      return await budget.consumeDailyBudget(limit);
+      return await budget.consumeDailyBudget(limit, units, client, clientLimit);
     } catch (error) {
       console.error("daily budget check failed", error instanceof Error ? error.message : "unknown error");
       return false;
@@ -896,14 +911,14 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
    *
    * @returns False when either budget is used up. A claimed slot is never returned.
    */
-  private async reserveAiAction(): Promise<boolean> {
+  private async reserveAiAction(units = 1): Promise<boolean> {
     const hourAgo = Date.now() - HOUR_MS;
     this.sql`DELETE FROM ai_actions WHERE created_at <= ${hourAgo}`;
     const [used] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM ai_actions`;
     if ((used?.count ?? 0) >= MAX_AI_ACTIONS_PER_HOUR) return false;
     // The slot is held before the await, so concurrent calls cannot pass the hourly limit.
     const [slot] = this.sql<{ rowid: number }>`INSERT INTO ai_actions (created_at) VALUES (${Date.now()}) RETURNING rowid`;
-    if (await this.allowSharedAiSpend()) return true;
+    if (await this.allowSharedAiSpend(units)) return true;
     this.sql`DELETE FROM ai_actions WHERE rowid = ${slot?.rowid ?? -1}`;
     return false;
   }

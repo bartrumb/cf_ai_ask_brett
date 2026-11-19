@@ -67,7 +67,7 @@ const snapshot = (): Snapshot => ({
     { id: 2, role: "user", kind: "review", text: "running", reviewId: "pending", source: null, model: null, createdAt: 1 },
     { id: 3, role: "user", kind: "review", text: "failed", reviewId: "failed", source: null, model: null, createdAt: 1 },
     { id: 4, role: "user", kind: "text", text: "Question?", reviewId: null, source: null, model: null, createdAt: 2 },
-    { id: 5, role: "assistant", kind: "text", text: "Answer", reviewId: null, source: "offline", model: null, createdAt: 3 },
+    { id: 5, role: "assistant", kind: "text", text: "Answer **bold** and `code`", reviewId: null, source: "offline", model: null, createdAt: 3 },
   ],
 });
 
@@ -119,6 +119,8 @@ describe("chat page", () => {
     expect(document.querySelector(".panel.ai")?.textContent).toContain("via AI Gateway gw");
     expect(document.querySelector(".evidence")?.textContent).toContain("<img");
     expect(document.querySelector(".evidence img")).toBeNull();
+    expect(document.querySelector(".bubble.assistant strong")?.textContent).toBe("bold");
+    expect(document.querySelector(".bubble.assistant .commentary code")?.textContent).toBe("code");
     expect(document.querySelector(".commentary pre")?.textContent).toContain("code");
     expect(document.body.textContent).toContain("Cannot be waived");
     expect(document.body.textContent).toContain("Exception applied: Approved reason");

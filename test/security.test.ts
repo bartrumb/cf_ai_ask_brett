@@ -426,6 +426,24 @@ describe("agent hardening", () => {
     });
   });
 
+  it("limits each visitor and charges more for speech", async () => {
+    const agent = await agentFor();
+    await runInDurableObject(agent, (instance) => {
+      expect(instance.consumeDailyBudget(100, 5, "visitor", 6)).toBe(true);
+      expect(instance.consumeDailyBudget(100, 5, "visitor", 6)).toBe(false);
+      expect(instance.consumeDailyBudget(100, 5, "other", 6)).toBe(true);
+      expect(instance.consumeDailyBudget(10, 1, "third", 6)).toBe(false);
+    });
+  });
+
+  it("does not leave a cut-off redaction marker in chat previews", async () => {
+    const agent = await agentFor();
+    const line = `${"x".repeat(250)} api_key = "sample-not-a-real-key-1234"`;
+    await agent.startReview({ text: line, requestId: crypto.randomUUID() });
+    await until(async () => (await agent.getSnapshot()).reviews.every((review) => review.status === "complete"));
+    expect((await agent.getSnapshot()).messages[0]?.text).not.toMatch(/\[RE?D?A?C?T?E?D?$/);
+  });
+
   it("deletes idle repository data and keeps recent data", async () => {
     const agent = await agentFor();
     await agent.ask({ question: "What is open?", requestId: crypto.randomUUID() });

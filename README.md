@@ -146,7 +146,15 @@ Remove-Item Env:\CLOUDFLARE_API_TOKEN, Env:\CLOUDFLARE_ACCOUNT_ID
 
 ## Deployment
 
-Real-model deployments refuse connections until Cloudflare Access is configured.
+Real-model deployments refuse connections until Cloudflare Access is configured, unless the public demo is deployed deliberately:
+
+```powershell
+npm run deploy:public
+```
+
+The public demo gives each browser a private random workspace. It allows 500 AI units a day overall and 40 per visitor network, and spoken audio costs five units.
+
+For a private deployment:
 
 1. Create the gateway using the commands above.
 2. Create a self-hosted Cloudflare Access application for the Worker hostname.

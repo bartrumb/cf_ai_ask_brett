@@ -18,7 +18,7 @@
         </div>
       </div>
       <form id="repo-form" class="repo">
-        <label for="repo-input">Repository</label>
+        <label for="repo-input">Workspace</label>
         <input id="repo-input" maxlength="64" autocomplete="off" spellcheck="false" />
         <button type="submit">Open</button>
       </form>
@@ -38,6 +38,7 @@
           </div>
           <label class="sr-only" for="change-input">Change summary, unified diff or question</label>
           <textarea id="change-input" rows="5" spellcheck="false" placeholder="Paste a unified diff, describe the change, or choose Speak. Ask a question about the latest review."></textarea>
+          <p class="demo-note">Public demo. Do not paste private code or real secrets. Submissions are sent to AI models and redacted logs are kept for monitoring.</p>
           <div class="composer-actions">
             <span id="char-count" class="count">0 / 40,000</span>
             <button id="mic-button" class="secondary" type="button" aria-pressed="false" disabled>Speak</button>
