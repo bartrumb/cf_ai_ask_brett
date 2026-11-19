@@ -285,3 +285,14 @@ set proceed to testing and checking traces for errors after to debug and repair
 ````
 
 **Produced:** live testing with Worker logs, then fixes for speech timeouts on long answers, cut-off answers and raw headings.
+
+---
+
+## Prompt 15
+
+````text
+@"[local path redacted]\ask-brett.shopdawg.workers.dev-20261118T213639.json" @"[local path redacted]\ask-brett.shopdawg.workers.dev-20261118T213548.json"
+review lighthouse reports goal is 99-100%
+````
+
+**Produced:** a page built with its profile content already in the HTML, which removes the layout shift, and a contrast fix.

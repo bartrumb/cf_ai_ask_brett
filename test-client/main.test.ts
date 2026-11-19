@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import html from "../public/index.html?raw";
+import html from "../client/index.template.html?raw";
 import site from "../content/site.example.json";
 import type { ChatMessage, ShowcaseState, Snapshot } from "../src/domain/types";
 
@@ -54,9 +54,13 @@ const answer = (id: number, source: ChatMessage["source"] = "workers-ai", text =
 
 beforeAll(async () => {
   document.documentElement.innerHTML = html.replace(/<script[\s\S]*?<\/script>|<link[^>]*>/g, "");
+  const data = document.createElement("script");
+  data.type = "application/json";
+  data.id = "site-data";
+  data.textContent = JSON.stringify(site);
+  document.body.append(data);
   const stored = new Map<string, string>([["ask-brett-conversation", "not-valid"]]);
   vi.stubGlobal("localStorage", { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => void stored.set(key, value) });
-  vi.stubGlobal("fetch", vi.fn(async () => Response.json(site)));
   mocks.respond = (method) => {
     if (method === "getSnapshot") return { offline, messages } satisfies Snapshot;
     const value = responses[method];

@@ -38,7 +38,7 @@ flowchart LR
 | `src/domain/redaction.ts` | Normalization, secret masking and answer filtering |
 | `src/domain/schemas.ts` | RPC schemas and the client frame allowlist |
 | `src/llm.ts`, `src/speech.ts`, `src/models.ts` | Gateway-routed models with fallbacks |
-| `scripts/build-content.mjs` | Generates the Worker's profile module and `public/site.json` |
+| `scripts/build-content.mjs` | Generates the Worker's profile module, `public/site.json` and `public/index.html` |
 | `client/`, `public/` | The site |
 
 ## Content setup
@@ -51,6 +51,8 @@ flowchart LR
 | `content/site.json` | No | Real site content |
 | `src/generated/knowledge.ts` | No | Generated model context and contact details |
 | `public/site.json` | No | Generated public site content |
+| `client/index.template.html` | Yes | Page template |
+| `public/index.html` | No | Generated page with the profile built in, so it loads without layout shift |
 
 `npm run content` uses the real files when both exist and the examples otherwise. It runs automatically before the client build, tests and type checks. Set `CONTENT_MODE=example` to force the examples.
 

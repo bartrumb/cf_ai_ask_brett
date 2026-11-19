@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import html from "../public/index.html?raw";
+import html from "../client/index.template.html?raw";
 import { renderRichText } from "../client/rich-text";
 
 vi.mock("agents/client", () => ({ AgentClient: class extends EventTarget {} }));

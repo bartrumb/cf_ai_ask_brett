@@ -1,11 +1,12 @@
 /*
- * Browser application: renders the public profile from `/site.json`, connects this browser's private
+ * Browser application: activates the profile built into the page, connects this browser's private
  * conversation and handles questions, voice and playback. The server validates everything, so limits
  * here only improve feedback. All dynamic text is added as text nodes.
  */
 import { AgentClient } from "agents/client";
 import type { SiteContent } from "../src/domain/content";
 import type { ActionResult, AnswerSource, ChatMessage, LiveMessage, ShowcaseState, Snapshot } from "../src/domain/types";
+import { byId, disclaimerText, emptyPrompt, h, renderProfile, setText } from "./profile";
 import { renderRichText } from "./rich-text";
 import { playAudio, startRecording, stopPlayback, type Recording } from "./voice";
 
@@ -24,34 +25,6 @@ const SOURCE_LABELS: Record<AnswerSource, string> = {
   guarded: "Standard reply",
   unavailable: "Not answered",
 };
-
-/** Values accepted as children by `h`. Falsy values render nothing. */
-type Child = Node | string | null | undefined | false;
-/** Attributes for `h`. Function values become listeners for the event named after `on`. */
-type Props = Record<string, string | boolean | EventListener | undefined>;
-
-/** Creates an element whose string children become text nodes. */
-function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Props = {}, ...children: Child[]): HTMLElementTagNameMap[K] {
-  const element = document.createElement(tag);
-  for (const [key, value] of Object.entries(props)) {
-    if (value === undefined || value === false) continue;
-    if (typeof value === "function") element.addEventListener(key.slice(2).toLowerCase(), value);
-    else element.setAttribute(key, value === true ? "" : value);
-  }
-  for (const child of children) if (child) element.append(child);
-  return element;
-}
-
-/**
- * Finds a required element.
- *
- * @throws Error when the page and this script do not match.
- */
-function byId<T extends HTMLElement>(id: string): T {
-  const element = document.getElementById(id);
-  if (!element) throw new Error(`Missing element #${id}`);
-  return element as T;
-}
 
 const ui = {
   conversation: byId("conversation"),
@@ -180,15 +153,12 @@ function render(): void {
   const follow = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight < 120;
   const nodes: Node[] = (snapshot?.messages ?? []).map(messageNode);
   if (state?.activeQuestion || submitting) nodes.push(pendingNode());
-  if (nodes.length === 0) {
-    const name = site?.name.split(" ")[0] ?? "this person";
-    nodes.push(h("p", { class: "empty" }, `Pick a question, or ask your own about ${name}'s work.`));
-  }
+  if (nodes.length === 0) nodes.push(h("p", { class: "empty" }, emptyPrompt(site)));
   conversation.replaceChildren(...nodes);
   if (follow) conversation.scrollTop = conversation.scrollHeight;
   ui.disclaimer.textContent = snapshot?.offline
     ? "Offline preview: answers are matched from the written profile, and no AI model is used."
-    : `Answers are AI-generated from a written profile and can be wrong. Please verify anything important with ${site?.links.email ?? "the source"}.`;
+    : disclaimerText(site);
   updateComposer();
 }
 
@@ -365,70 +335,19 @@ function connect(): void {
   });
 }
 
-/** Sets text on a static element. */
-const setText = (id: string, value: string) => {
-  byId(id).textContent = value;
-};
-
-/** Builds a link that leaves the site. */
-const externalLink = (href: string, label: string) => h("a", { href, rel: "noopener noreferrer", target: "_blank" }, label);
-
-/** Fills every profile section from validated site content. */
-function renderProfile(content: SiteContent): void {
-  const first = content.name.split(" ")[0] ?? content.name;
-  document.title = `Ask about ${first}`;
-  setText("wordmark", `Ask about ${first}`);
-  setText("role-line", `${content.title} · ${content.location}`);
-  setText("name", content.name);
-  setText("tagline", content.tagline);
-  setText("about", content.about);
-  setText("seeking", content.seeking);
-  byId<HTMLAnchorElement>("resume-link").href = content.links.resume;
-  byId("stats").replaceChildren(...content.stats.map((stat) => h("div", {}, h("dt", {}, stat.label), h("dd", {}, stat.value))));
-  ui.suggestions.replaceChildren(
-    ...content.questions.map((question) => h("li", {}, h("button", { type: "button", onClick: () => void ask(question) }, question))),
-  );
-  byId("proof-list").replaceChildren(
-    ...content.proof.map((item) => h("li", {}, h("div", {}, h("h3", {}, item.title), h("p", { class: "result" }, item.result)), h("p", { class: "detail" }, item.detail))),
-  );
-  byId("project-list").replaceChildren(
-    ...content.projects.map((project) =>
-      h(
-        "a",
-        { class: "project", href: project.url, rel: "noopener noreferrer", target: "_blank" },
-        h("h3", {}, project.name),
-        h("p", {}, project.summary),
-        h("span", { class: "tags" }, ...project.tags.map((tag) => h("span", {}, tag))),
-      ),
-    ),
-  );
-  byId("skill-list").replaceChildren(...content.skills.map((skill) => h("div", {}, h("dt", {}, skill.group), h("dd", {}, skill.items.join(" · ")))));
-  const email = byId<HTMLAnchorElement>("contact-email");
-  email.href = `mailto:${content.links.email}`;
-  email.textContent = content.links.email;
-  byId("contact-links").replaceChildren(
-    ...[
-      ["Website", content.links.site],
-      ["LinkedIn", content.links.linkedin],
-      ["GitHub", content.links.github],
-      ["Résumé", content.links.resume],
-    ].map(([label, href]) => h("li", {}, externalLink(href as string, label as string))),
-  );
-}
-
-/** Loads public profile content. The ask experience still works if this fails. */
-async function loadProfile(): Promise<void> {
+/**
+ * Reads the profile data built into the page and attaches its controls. Rendering matches the built
+ * HTML, so nothing moves. The ask experience still works if the data is missing.
+ */
+function loadProfile(): void {
   try {
-    const response = await fetch("/site.json");
-    if (!response.ok) throw new Error("Profile unavailable");
-    site = (await response.json()) as SiteContent;
-    renderProfile(site);
+    site = JSON.parse(byId("site-data").textContent ?? "") as SiteContent;
+    renderProfile(site, (question) => void ask(question));
   } catch {
     site = null;
     setText("name", "Ask about this work");
     byId("load-error").hidden = false;
   }
-  render();
 }
 
 /** Applies a theme and labels the toggle with the theme it will switch to. */
@@ -459,6 +378,6 @@ ui.form.addEventListener("submit", (event) => {
 });
 ui.mic.addEventListener("click", () => void toggleRecording());
 
+loadProfile();
 render();
-void loadProfile();
 connect();
