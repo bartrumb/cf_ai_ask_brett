@@ -1,15 +1,12 @@
 export const MAX_INPUT_CHARS = 40_000;
 export const MAX_INPUT_LINES = 4_000;
+export const MAX_LINE_CHARS = 2_000;
 export const MAX_QUESTION_CHARS = 2_000;
 export const MIN_REASON_CHARS = 10;
 export const MAX_REASON_CHARS = 500;
 
 export const SUMMARY_PATH = "(summary)";
 export const PREAMBLE_PATH = "(preamble)";
-
-export type Validated =
-  | { ok: true; text: string }
-  | { ok: false; error: string };
 
 export interface ChangeLine {
   line: number;
@@ -33,59 +30,10 @@ export type ParseResult =
   | { ok: false; error: string };
 
 const INVISIBLE = /[­​-‏‪-‮⁠-⁤﻿]/g;
-// eslint-disable-next-line no-control-regex
-const FORBIDDEN_CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 
 /** Removes characters that can hide text from people and from pattern matching. */
 export function normalizeText(text: string): string {
   return text.normalize("NFKC").replace(INVISIBLE, "");
-}
-
-function validateText(raw: unknown, label: string, maxChars: number): Validated {
-  if (typeof raw !== "string") return { ok: false, error: `${label} must be text.` };
-  const text = raw.replace(/\r\n?/g, "\n");
-  if (text.trim().length === 0) return { ok: false, error: `${label} is empty.` };
-  if (text.length > maxChars) {
-    return {
-      ok: false,
-      error: `${label} is ${text.length.toLocaleString("en-US")} characters. The limit is ${maxChars.toLocaleString("en-US")}. Split the change and review it in parts.`,
-    };
-  }
-  if (FORBIDDEN_CONTROL.test(text)) {
-    return { ok: false, error: `${label} contains binary or control characters.` };
-  }
-  return { ok: true, text };
-}
-
-/**
- * Oversized input is rejected, never truncated. Truncating would let a risky
- * line sit past the cap while the rule engine reports a clean result.
- */
-export function validateChangeInput(raw: unknown): Validated {
-  const result = validateText(raw, "The change", MAX_INPUT_CHARS);
-  if (!result.ok) return result;
-  const lines = result.text.split("\n").length;
-  if (lines > MAX_INPUT_LINES) {
-    return {
-      ok: false,
-      error: `The change has ${lines.toLocaleString("en-US")} lines. The limit is ${MAX_INPUT_LINES.toLocaleString("en-US")}.`,
-    };
-  }
-  return result;
-}
-
-export function validateQuestion(raw: unknown): Validated {
-  return validateText(raw, "The question", MAX_QUESTION_CHARS);
-}
-
-export function validateReason(raw: unknown): Validated {
-  const result = validateText(raw, "The reason", MAX_REASON_CHARS);
-  if (!result.ok) return result;
-  const text = normalizeText(result.text).trim();
-  if (text.length < MIN_REASON_CHARS) {
-    return { ok: false, error: `Give a reason of at least ${MIN_REASON_CHARS} characters.` };
-  }
-  return { ok: true, text };
 }
 
 const DIFF_MARKER = /^(diff --git |--- \S.*\n\+\+\+ \S|@@ -\d)/m;

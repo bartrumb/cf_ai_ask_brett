@@ -1,12 +1,10 @@
 import { describe, expect, it } from "vitest";
-import {
-  MAX_INPUT_CHARS,
-  MAX_INPUT_LINES,
-  parseChange,
-  validateChangeInput,
-  validateReason,
-} from "../src/domain/input";
+import { MAX_INPUT_CHARS, MAX_INPUT_LINES, MAX_LINE_CHARS, parseChange } from "../src/domain/input";
+import { changeTextSchema, parseInput, reasonSchema } from "../src/domain/schemas";
 import { diffFor, parsed } from "./fixtures";
+
+const validateChangeInput = (value: unknown) => parseInput(changeTextSchema, value);
+const validateReason = (value: unknown) => parseInput(reasonSchema, value);
 
 describe("input limits", () => {
   it.each([[null], [undefined], [42], [{ text: "x" }], [["x"]]])("rejects non-text input %j", (value) => {
@@ -20,11 +18,15 @@ describe("input limits", () => {
   it("rejects oversized input instead of truncating it", () => {
     const result = validateChangeInput("x".repeat(MAX_INPUT_CHARS + 1));
     expect(result).toMatchObject({ ok: false });
-    expect(validateChangeInput("x".repeat(MAX_INPUT_CHARS)).ok).toBe(true);
+    expect(validateChangeInput(`${"x".repeat(99)}\n`.repeat(MAX_INPUT_CHARS / 100)).ok).toBe(true);
   });
 
   it("rejects too many lines", () => {
     expect(validateChangeInput("x\n".repeat(MAX_INPUT_LINES)).ok).toBe(false);
+  });
+
+  it("rejects very long lines that could make pattern matching expensive", () => {
+    expect(validateChangeInput("a-".repeat(MAX_LINE_CHARS)).ok).toBe(false);
   });
 
   it("rejects binary control characters", () => {
@@ -32,7 +34,7 @@ describe("input limits", () => {
   });
 
   it("normalizes Windows line endings", () => {
-    expect(validateChangeInput("a\r\nb")).toEqual({ ok: true, text: "a\nb" });
+    expect(validateChangeInput("a\r\nb")).toEqual({ ok: true, data: "a\nb" });
   });
 
   it("requires a meaningful exception reason", () => {

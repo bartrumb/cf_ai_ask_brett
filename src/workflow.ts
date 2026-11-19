@@ -1,10 +1,11 @@
-import { AgentWorkflow } from "agents/workflows";
-import type { AgentWorkflowEvent, AgentWorkflowStep } from "agents/workflows";
+import { ThinkWorkflow, type ThinkWorkflowStep } from "@cloudflare/think/workflows";
+import type { AgentWorkflowEvent } from "agents/workflows";
 import { NonRetryableError } from "cloudflare:workflows";
 import type { CodexGuardAgent } from "./agent";
 import { parseChange } from "./domain/input";
 import { auditCommentary, buildReviewPrompt, offlineCommentary } from "./domain/prompt";
 import { buildExcerpt, evaluateChange, redactSecrets } from "./domain/rules";
+import { reviewParamsSchema } from "./domain/schemas";
 import type { CommentarySource, LiveMessage, RuleResult, StepName, StepStatus } from "./domain/types";
 import { isGuardrailBlock } from "./gateway";
 import { generateText } from "./llm";
@@ -30,9 +31,9 @@ interface Commentary {
 
 const FLUSH_INTERVAL_MS = 80;
 
-export class ReviewWorkflow extends AgentWorkflow<CodexGuardAgent, ReviewParams, ReviewProgress, Env> {
-  override async run(event: AgentWorkflowEvent<ReviewParams>, step: AgentWorkflowStep) {
-    const { reviewId, repository } = event.payload;
+export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams, ReviewProgress, Env> {
+  override async run(event: AgentWorkflowEvent<ReviewParams>, step: ThinkWorkflowStep) {
+    const { reviewId, repository } = reviewParamsSchema.parse(event.payload);
 
     await this.reportProgress({ step: "intake", status: "complete" });
     await this.reportProgress({ step: "rules", status: "running" });

@@ -26,6 +26,22 @@ export function isOffline(env: Pick<Env, "AI_MODE">): boolean {
   return env.AI_MODE === "offline";
 }
 
+/** Builds the primary model, with the secondary as a gateway-routed fallback. */
+export function createLanguageModel(env: Pick<LlmEnv, "AI" | "AI_GATEWAY_ID">, gateway: GatewayContext) {
+  const ai = createAI({
+    binding: env.AI,
+    id: env.AI_GATEWAY_ID,
+    skipCache: true,
+    collectLog: true,
+    metadata: gatewayMetadata(gateway),
+  });
+  return ai(MODELS.llm.primary, {
+    reasoningEffort: "low",
+    // Used only when the primary fails before producing any output.
+    fallback: [ai(MODELS.llm.secondary, { reasoningEffort: "low" })],
+  });
+}
+
 async function streamOffline(text: string, onDelta: GenerateOptions["onDelta"]): Promise<void> {
   for (const piece of text.match(/\S+\s*/g) ?? []) {
     await onDelta(piece);
@@ -33,26 +49,16 @@ async function streamOffline(text: string, onDelta: GenerateOptions["onDelta"]):
   }
 }
 
+/** Generates review commentary inside a retried Workflow step. */
 export async function generateText(env: LlmEnv, options: GenerateOptions): Promise<Generated> {
   if (isOffline(env)) {
     await streamOffline(options.offlineText, options.onDelta);
     return { text: options.offlineText, source: "offline", model: null };
   }
 
-  const ai = createAI({
-    binding: env.AI,
-    id: env.AI_GATEWAY_ID,
-    skipCache: true,
-    collectLog: true,
-    metadata: gatewayMetadata(options.gateway),
-  });
   let streamError: unknown;
   const result = streamText({
-    model: ai(MODELS.llm.primary, {
-      reasoningEffort: "low",
-      // Used only when the primary fails before producing any output.
-      fallback: [ai(MODELS.llm.secondary, { reasoningEffort: "low" })],
-    }),
+    model: createLanguageModel(env, options.gateway),
     messages: options.messages,
     temperature: 0.2,
     maxOutputTokens: options.maxOutputTokens,

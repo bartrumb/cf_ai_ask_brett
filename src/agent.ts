@@ -1,8 +1,20 @@
-import { Agent, callable, type StreamingResponse } from "agents";
-import { buildSpokenReview, decodeWavInput, toSpokenText } from "./domain/audio";
-import { normalizeText, parseChange, validateChangeInput, validateQuestion, validateReason } from "./domain/input";
+import { Think, type ChatResponseResult, type StepContext, type TurnConfig, type TurnContext } from "@cloudflare/think";
+import { callable, type Connection, type WSMessage } from "agents";
+import { buildSpokenReview, decodeWav, toSpokenText } from "./domain/audio";
+import { normalizeText, parseChange } from "./domain/input";
 import { buildQuestionPrompt, offlineAnswer } from "./domain/prompt";
 import { containsInjectionLanguage, describeChange, redactSecrets } from "./domain/rules";
+import {
+  acceptExceptionSchema,
+  isAllowedClientFrame,
+  parseInput,
+  questionRequestSchema,
+  reviewRequestSchema,
+  revokeExceptionSchema,
+  setStandardSchema,
+  speakRequestSchema,
+  transcribeSchema,
+} from "./domain/schemas";
 import { findStandard, SAMPLE_STANDARDS } from "./domain/standards";
 import type {
   ActionResult,
@@ -11,6 +23,7 @@ import type {
   CommentarySource,
   ExceptionRecord,
   GuardState,
+  LiveMessage,
   ReviewRecord,
   RuleResult,
   Snapshot,
@@ -18,15 +31,19 @@ import type {
   StepName,
   StepStatus,
 } from "./domain/types";
-import { generateText, isOffline } from "./llm";
+import type { GatewayContext } from "./gateway";
+import { createLanguageModel, isOffline } from "./llm";
 import { MODELS } from "./models";
+import { createOfflineModel } from "./offline-model";
 import { synthesizeSpeech, transcribeAudio, type SpokenAudio, type Transcript } from "./speech";
 
 const MAX_STORED_REVIEWS = 50;
 const MAX_REVIEWS_PER_HOUR = 30;
 const MAX_AI_ACTIONS_PER_HOUR = 60;
 const STALE_REVIEW_MS = 10 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
 const STEP_NAMES: readonly StepName[] = ["intake", "rules", "commentary", "save"];
+const UNAVAILABLE_ANSWER = "The model is unavailable right now. Rule results are unaffected.";
 
 type Row = Record<string, string | number | null>;
 
@@ -60,16 +77,56 @@ function toException(row: Row): ExceptionRecord {
   };
 }
 
-/** One instance per repository. All of its memory lives in this Durable Object. */
-export class CodexGuardAgent extends Agent<Env, GuardState> {
-  override initialState: GuardState = { revision: 0, active: null };
+function toMessage(row: Row): ChatMessage {
+  return {
+    id: Number(row.id),
+    role: row.role as ChatMessage["role"],
+    kind: row.kind as ChatMessage["kind"],
+    text: String(row.text),
+    reviewId: (row.review_id as string | null) ?? null,
+    source: (row.source as CommentarySource | null) ?? null,
+    model: (row.model as string | null) ?? null,
+    createdAt: Number(row.created_at),
+  };
+}
+
+function lastUserText(messages: TurnContext["messages"]): string {
+  const message = [...messages].reverse().find((item) => item.role === "user");
+  if (!message) return "";
+  if (typeof message.content === "string") return message.content;
+  return message.content.map((part) => (part.type === "text" ? part.text : "")).join(" ");
+}
+
+/**
+ * One durable Think agent per repository. Think owns the question inbox, turn
+ * recovery and transcript. SQLite tables below hold the review domain data.
+ */
+export class CodexGuardAgent extends Think<Env, GuardState> {
+  override initialState: GuardState = { revision: 0, active: null, activeQuestion: null };
+  override maxSteps = 1;
+  override sendReasoning = false;
+  private answerModel: string | null = null;
+
+  /**
+   * Think installs its chat protocol handler immediately before calling
+   * onStart. Wrapping here keeps this allowlist in front of that handler.
+   */
+  private installClientFrameFilter(): void {
+    const handleMessage = this.onMessage.bind(this);
+    this.onMessage = async (connection: Connection, message: WSMessage) => {
+      if (isAllowedClientFrame(message)) await handleMessage(connection, message);
+      else console.warn("rejected client frame");
+    };
+  }
 
   override async onStart(): Promise<void> {
+    this.installClientFrameFilter();
     this.sql`CREATE TABLE IF NOT EXISTS standard_settings (
       id TEXT PRIMARY KEY, enabled INTEGER NOT NULL)`;
     this.sql`CREATE TABLE IF NOT EXISTS reviews (
-      id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, status TEXT NOT NULL, title TEXT NOT NULL,
-      result_json TEXT, commentary TEXT NOT NULL DEFAULT '', commentary_source TEXT,
+      id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL,
+      status TEXT NOT NULL, title TEXT NOT NULL, workflow_started INTEGER NOT NULL DEFAULT 0,
+      result_json TEXT, commentary TEXT NOT NULL DEFAULT '', commentary_source TEXT, model TEXT,
       warnings_json TEXT NOT NULL DEFAULT '[]', error TEXT)`;
     this.sql`CREATE TABLE IF NOT EXISTS pending_inputs (
       review_id TEXT PRIMARY KEY, text TEXT NOT NULL)`;
@@ -77,22 +134,91 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
       id TEXT PRIMARY KEY, standard_id TEXT NOT NULL, path TEXT NOT NULL, reason TEXT NOT NULL,
       review_id TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE (standard_id, path))`;
     this.sql`CREATE TABLE IF NOT EXISTS messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
-      review_id TEXT, source TEXT, created_at INTEGER NOT NULL)`;
+      id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe_key TEXT NOT NULL UNIQUE, role TEXT NOT NULL,
+      kind TEXT NOT NULL, text TEXT NOT NULL, review_id TEXT, source TEXT, model TEXT,
+      created_at INTEGER NOT NULL)`;
     this.sql`CREATE TABLE IF NOT EXISTS ai_actions (created_at INTEGER NOT NULL)`;
-    if (!this.sql`SELECT name FROM pragma_table_info('reviews') WHERE name = 'model'`.length) {
-      this.sql`ALTER TABLE reviews ADD COLUMN model TEXT`;
-    }
-    if (!this.sql`SELECT name FROM pragma_table_info('messages') WHERE name = 'model'`.length) {
-      this.sql`ALTER TABLE messages ADD COLUMN model TEXT`;
-    }
+
+    const [waiting] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews
+      WHERE status = 'running' AND workflow_started = 0`;
+    if ((waiting?.count ?? 0) > 0) await this.schedule(0, "resumeUnstartedReviews", {});
   }
 
-  // Called from the browser ---------------------------------------------------
+  /** Browser clients can never write agent state directly. */
+  override validateStateChange(_next: GuardState, source: Connection | "server"): void {
+    if (source !== "server") throw new Error("Agent state is read-only for clients.");
+  }
+
+  // Think turn configuration --------------------------------------------------
+
+  override getModel() {
+    if (isOffline(this.env)) return createOfflineModel(offlineAnswer(this.latestResult()));
+    return createLanguageModel(this.env, { repository: this.name, feature: "question" });
+  }
+
+  override getSystemPrompt(): string {
+    return "You answer questions about Codex Guard rule results. You cannot change those results.";
+  }
+
+  /**
+   * Every turn is rebuilt from stored rule results and the newest question. It
+   * has no tools and no earlier model text, which limits prompt-injection reach.
+   */
+  override beforeTurn(context: TurnContext): TurnConfig {
+    this.answerModel = null;
+    this.sendLive({ type: "answer-reset" });
+    const question = lastUserText(context.messages);
+    const result = this.latestResult();
+    const nonce = crypto.randomUUID().replaceAll("-", "");
+    const [system, user] = buildQuestionPrompt(question, result, nonce);
+    const gateway: GatewayContext = {
+      repository: this.name,
+      feature: "question",
+      ruleFlaggedInjection: containsInjectionLanguage(question),
+    };
+    return {
+      model: isOffline(this.env) ? createOfflineModel(offlineAnswer(result)) : createLanguageModel(this.env, gateway),
+      instructions: system?.content ?? this.getSystemPrompt(),
+      messages: [{ role: "user", content: user?.content ?? "" }],
+      activeTools: [],
+      maxSteps: 1,
+      maxOutputTokens: 700,
+      temperature: 0.2,
+      sendReasoning: false,
+    };
+  }
+
+  override onChunk(context: Parameters<Think<Env, GuardState>["onChunk"]>[0]): void {
+    if (context.chunk.type === "text-delta") this.sendLive({ type: "answer-delta", delta: context.chunk.text });
+  }
+
+  override onStepEnd(context: StepContext): void {
+    const model = context.providerMetadata?.cloudflare?.model;
+    if (typeof model === "string") this.answerModel = model;
+  }
+
+  /** Recovery can repeat this hook, so the stored answer is keyed by request. */
+  override onChatResponse(result: ChatResponseResult): void {
+    const answer = result.message.parts
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("")
+      .trim();
+    const succeeded = result.status === "completed" && answer.length > 0;
+    const offline = isOffline(this.env);
+    const text = succeeded ? redactSecrets(answer) : UNAVAILABLE_ANSWER;
+    const source: CommentarySource = !succeeded ? "unavailable" : offline ? "offline" : "workers-ai";
+    const model = succeeded && !offline ? (this.answerModel ?? MODELS.llm.primary) : null;
+    this.sql`INSERT OR IGNORE INTO messages (dedupe_key, role, kind, text, source, model, created_at)
+      VALUES (${`answer:${result.requestId}`}, 'assistant', 'text', ${text}, ${source}, ${model}, ${Date.now()})`;
+    this.publish({ activeQuestion: null });
+  }
+
+  // Browser methods. schemas.ts lists the names that clients may call ----------
 
   @callable()
-  getSnapshot(): Snapshot {
+  async getSnapshot(): Promise<Snapshot> {
     this.failStaleReviews();
+    await this.clearFinishedQuestion();
     const reviews = this.sql<Row>`SELECT * FROM reviews ORDER BY created_at DESC LIMIT ${MAX_STORED_REVIEWS}`;
     const messages = this.sql<Row>`SELECT * FROM messages ORDER BY id DESC LIMIT 200`;
     return {
@@ -101,33 +227,26 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
       standards: this.readStandards(),
       exceptions: this.readExceptions(),
       reviews: reviews.map(toReview),
-      messages: messages.reverse().map(
-        (row): ChatMessage => ({
-          id: Number(row.id),
-          role: row.role as ChatMessage["role"],
-          kind: row.kind as ChatMessage["kind"],
-          text: String(row.text),
-          reviewId: (row.review_id as string | null) ?? null,
-          source: (row.source as CommentarySource | null) ?? null,
-          model: (row.model as string | null) ?? null,
-          createdAt: Number(row.created_at),
-        }),
-      ),
+      messages: messages.reverse().map(toMessage),
     };
   }
 
+  /** Repeating a request ID returns the original review instead of a new one. */
   @callable()
   async startReview(raw: unknown): Promise<ActionResult<{ reviewId: string }>> {
-    const input = validateChangeInput(raw);
+    const input = parseInput(reviewRequestSchema, raw);
     if (!input.ok) return input;
-    const parsed = parseChange(input.text);
+    const { text, requestId } = input.data;
+    const [existing] = this.sql<{ id: string }>`SELECT id FROM reviews WHERE request_id = ${requestId}`;
+    if (existing) return { ok: true, reviewId: existing.id };
+    const parsed = parseChange(text);
     if (!parsed.ok) return parsed;
 
     this.failStaleReviews();
     const [running] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews WHERE status = 'running'`;
     if ((running?.count ?? 0) > 0) return { ok: false, error: "A review is already running for this repository." };
 
-    const hourAgo = Date.now() - 60 * 60 * 1000;
+    const hourAgo = Date.now() - HOUR_MS;
     const [recent] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews WHERE created_at > ${hourAgo}`;
     if ((recent?.count ?? 0) >= MAX_REVIEWS_PER_HOUR) {
       return { ok: false, error: "This repository reached its hourly review limit. Try again later." };
@@ -135,45 +254,37 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
 
     const reviewId = crypto.randomUUID();
     const now = Date.now();
-    const title = describeChange(parsed.change, input.text);
-    const preview = redactSecrets(normalizeText(input.text)).slice(0, 280);
-    this.sql`INSERT INTO reviews (id, created_at, status, title) VALUES (${reviewId}, ${now}, 'running', ${title})`;
-    this.sql`INSERT INTO pending_inputs (review_id, text) VALUES (${reviewId}, ${input.text})`;
-    this.sql`INSERT INTO messages (role, kind, text, review_id, created_at)
-      VALUES ('user', 'review', ${preview}, ${reviewId}, ${now})`;
-    this.publish({ reviewId, steps: initialSteps() });
+    const title = describeChange(parsed.change, text);
+    const preview = redactSecrets(normalizeText(text)).slice(0, 280);
+    this.sql`INSERT INTO reviews (id, request_id, created_at, status, title)
+      VALUES (${reviewId}, ${requestId}, ${now}, 'running', ${title})`;
+    this.sql`INSERT INTO pending_inputs (review_id, text) VALUES (${reviewId}, ${text})`;
+    this.sql`INSERT INTO messages (dedupe_key, role, kind, text, review_id, created_at)
+      VALUES (${`review:${requestId}`}, 'user', 'review', ${preview}, ${reviewId}, ${now})`;
+    this.publish({ active: { reviewId, steps: initialSteps() } });
 
-    try {
-      await this.runWorkflow("REVIEW_WORKFLOW", { reviewId, repository: this.name }, { id: reviewId });
-    } catch (error) {
-      console.error("workflow start failed", error instanceof Error ? error.message : "unknown error");
-      this.markFailed(reviewId, "The review could not start. Try again.");
-      return { ok: false, error: "The review could not start. Try again." };
-    }
-    return { ok: true, reviewId };
+    return (await this.launchReview(reviewId))
+      ? { ok: true, reviewId }
+      : { ok: false, error: "The review could not start. Try again." };
   }
 
   /** The finding is looked up on the server, so a client cannot invent one. */
   @callable()
-  acceptException(reviewId: unknown, findingId: unknown, rawReason: unknown): ActionResult<{ exception: ExceptionRecord }> {
-    if (typeof reviewId !== "string" || typeof findingId !== "string") {
-      return { ok: false, error: "That finding was not found." };
-    }
-    const reason = validateReason(rawReason);
-    if (!reason.ok) return reason;
-
+  acceptException(raw: unknown): ActionResult<{ exception: ExceptionRecord }> {
+    const input = parseInput(acceptExceptionSchema, raw);
+    if (!input.ok) return input;
+    const { reviewId, findingId, reason } = input.data;
     const [row] = this.sql<Row>`SELECT * FROM reviews WHERE id = ${reviewId}`;
     const finding = row ? toReview(row).result?.findings.find((item) => item.id === findingId) : undefined;
     if (!finding) return { ok: false, error: "That finding was not found." };
     if (!findStandard(finding.standardId)?.waivable) {
       return { ok: false, error: `${finding.standardId} cannot be waived. Fix the change instead.` };
     }
-
     const exception: ExceptionRecord = {
       id: crypto.randomUUID(),
       standardId: finding.standardId,
       path: finding.path,
-      reason: redactSecrets(reason.text),
+      reason: redactSecrets(reason),
       reviewId,
       createdAt: Date.now(),
     };
@@ -187,18 +298,19 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
   }
 
   @callable()
-  revokeException(id: unknown): ActionResult {
-    if (typeof id !== "string") return { ok: false, error: "That exception was not found." };
-    this.sql`DELETE FROM exceptions WHERE id = ${id}`;
+  revokeException(raw: unknown): ActionResult {
+    const input = parseInput(revokeExceptionSchema, raw);
+    if (!input.ok) return input;
+    this.sql`DELETE FROM exceptions WHERE id = ${input.data.id}`;
     this.publish();
     return { ok: true };
   }
 
   @callable()
-  setStandardEnabled(id: unknown, enabled: unknown): ActionResult {
-    if (typeof id !== "string" || typeof enabled !== "boolean" || !findStandard(id)) {
-      return { ok: false, error: "That standard was not found." };
-    }
+  setStandardEnabled(raw: unknown): ActionResult {
+    const input = parseInput(setStandardSchema, raw);
+    if (!input.ok) return input;
+    const { id, enabled } = input.data;
     if (!enabled && !findStandard(id)?.waivable) {
       return { ok: false, error: `${id} is mandatory and cannot be turned off.` };
     }
@@ -209,60 +321,43 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
     return { ok: true };
   }
 
-  @callable({ streaming: true })
-  async ask(stream: StreamingResponse, raw: unknown): Promise<void> {
-    const question = validateQuestion(raw);
-    if (!question.ok) {
-      stream.error(question.error);
-      return;
+  /**
+   * Adds a question to Think's durable inbox and returns immediately. The
+   * idempotency key makes reconnect retries safe and prevents a second paid turn.
+   */
+  @callable()
+  async ask(raw: unknown): Promise<ActionResult<{ submissionId: string; accepted: boolean }>> {
+    const input = parseInput(questionRequestSchema, raw);
+    if (!input.ok) return input;
+    const { question, requestId } = input.data;
+    await this.clearFinishedQuestion();
+    const idempotencyKey = `question:${requestId}`;
+    const [known] = this.sql`SELECT id FROM messages WHERE dedupe_key = ${idempotencyKey}`;
+    if (!known) {
+      if (this.state.activeQuestion) return { ok: false, error: "The previous question is still being answered." };
+      if (!this.reserveAiAction()) return { ok: false, error: "This repository reached its hourly AI limit." };
     }
-    if (!this.reserveAiAction()) {
-      stream.error("This repository reached its hourly AI limit. Try again later.");
-      return;
-    }
-    const now = Date.now();
-    const shown = redactSecrets(normalizeText(question.text));
-    this.sql`INSERT INTO messages (role, kind, text, created_at) VALUES ('user', 'text', ${shown}, ${now})`;
-    this.publish();
-
-    const [latest] = this.sql<Row>`SELECT * FROM reviews WHERE result_json IS NOT NULL ORDER BY created_at DESC LIMIT 1`;
-    const result = latest ? toReview(latest).result : null;
-    try {
-      const answer = await generateText(this.env, {
-        messages: buildQuestionPrompt(question.text, result, crypto.randomUUID().replaceAll("-", "")),
-        offlineText: offlineAnswer(result),
-        maxOutputTokens: 700,
-        gateway: {
-          repository: this.name,
-          feature: "question",
-          ruleFlaggedInjection: containsInjectionLanguage(question.text),
-        },
-        onDelta: (delta) => {
-          stream.send({ delta });
-        },
-      });
-      const text = redactSecrets(answer.text);
-      this.sql`INSERT INTO messages (role, kind, text, source, model, created_at)
-        VALUES ('assistant', 'text', ${text}, ${answer.source}, ${answer.model}, ${Date.now()})`;
-      this.publish();
-      stream.end({ source: answer.source });
-    } catch (error) {
-      console.error("question failed", error instanceof Error ? error.message : "unknown error");
-      stream.error("The model is unavailable right now. Rule results are unaffected.");
-    }
+    const text = redactSecrets(normalizeText(question));
+    const submission = await this.submitMessages(
+      [{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] }],
+      { idempotencyKey, metadata: { feature: "question" } },
+    );
+    this.sql`INSERT OR IGNORE INTO messages (dedupe_key, role, kind, text, created_at)
+      VALUES (${idempotencyKey}, 'user', 'text', ${text}, ${Date.now()})`;
+    if (submission.accepted) this.publish({ activeQuestion: { submissionId: submission.submissionId } });
+    return { ok: true, submissionId: submission.submissionId, accepted: submission.accepted };
   }
 
   /** The transcript returns to the composer, so the user can check it first. */
   @callable()
   async transcribe(raw: unknown): Promise<ActionResult<Transcript>> {
-    const audio = decodeWavInput(raw);
+    const input = parseInput(transcribeSchema, raw);
+    if (!input.ok) return input;
+    const audio = decodeWav(input.data.audio);
     if (!audio.ok) return audio;
     if (!this.reserveAiAction()) return { ok: false, error: "This repository reached its hourly AI limit." };
     try {
-      const transcript = await transcribeAudio(this.env, audio.bytes, {
-        repository: this.name,
-        feature: "transcription",
-      });
+      const transcript = await transcribeAudio(this.env, audio.bytes, { repository: this.name, feature: "transcription" });
       return { ok: true, ...transcript, text: redactSecrets(normalizeText(transcript.text)) };
     } catch (error) {
       console.error("transcription failed", error instanceof Error ? error.message : "unknown error");
@@ -272,8 +367,10 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
 
   /** Speaks stored content only, so this cannot become a general speech API. */
   @callable()
-  async speak(kind: unknown, id: unknown): Promise<ActionResult<SpokenAudio>> {
-    const target = this.readSpokenTarget(kind, id);
+  async speak(raw: unknown): Promise<ActionResult<SpokenAudio>> {
+    const input = parseInput(speakRequestSchema, raw);
+    if (!input.ok) return input;
+    const target = this.readSpokenTarget(input.data);
     if (!target) return { ok: false, error: "There is nothing to read aloud yet." };
     if (!this.reserveAiAction()) return { ok: false, error: "This repository reached its hourly AI limit." };
     try {
@@ -289,7 +386,13 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
     }
   }
 
-  // Called by ReviewWorkflow. Not @callable, so browsers cannot reach these ---
+  // Durable callbacks and Workflow RPC. These are not client-callable ----------
+
+  /** Starts reviews whose row was saved before an interruption stopped launch. */
+  async resumeUnstartedReviews(): Promise<void> {
+    const rows = this.sql<{ id: string }>`SELECT id FROM reviews WHERE status = 'running' AND workflow_started = 0`;
+    for (const { id } of rows) await this.launchReview(id);
+  }
 
   loadReviewInput(reviewId: string): { text: string; standards: StandardSetting[]; exceptions: ExceptionRecord[] } {
     const [row] = this.sql<{ text: string }>`SELECT text FROM pending_inputs WHERE review_id = ${reviewId}`;
@@ -314,17 +417,15 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
     // Kept until now so a retried rules step can read it again.
     this.sql`DELETE FROM pending_inputs WHERE review_id = ${reviewId}`;
     this.prune();
-    this.publish(null);
+    this.publish({ active: null });
   }
-
-  // Workflow lifecycle --------------------------------------------------------
 
   override async onWorkflowProgress(_name: string, instanceId: string, progress: unknown): Promise<void> {
     const active = this.state.active;
     const update = progress as { step?: StepName; status?: StepStatus };
     if (active?.reviewId !== instanceId || !update.step || !update.status) return;
     if (!STEP_NAMES.includes(update.step)) return;
-    this.publish({ reviewId: instanceId, steps: { ...active.steps, [update.step]: update.status } });
+    this.publish({ active: { reviewId: instanceId, steps: { ...active.steps, [update.step]: update.status } } });
   }
 
   override async onWorkflowError(_name: string, instanceId: string, error: string): Promise<void> {
@@ -334,11 +435,36 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
 
   // Internals -----------------------------------------------------------------
 
-  private publish(active: GuardState["active"] | undefined = undefined): void {
-    this.setState({
-      revision: this.state.revision + 1,
-      active: active === undefined ? this.state.active : active,
-    });
+  private sendLive(message: LiveMessage): void {
+    this.broadcast(JSON.stringify(message));
+  }
+
+  private publish(change: Partial<Pick<GuardState, "active" | "activeQuestion">> = {}): void {
+    this.setState({ ...this.state, ...change, revision: this.state.revision + 1 });
+  }
+
+  private latestResult(): RuleResult | null {
+    const [latest] = this.sql<Row>`SELECT * FROM reviews WHERE result_json IS NOT NULL ORDER BY created_at DESC LIMIT 1`;
+    return latest ? toReview(latest).result : null;
+  }
+
+  private async launchReview(reviewId: string): Promise<boolean> {
+    try {
+      await this.runWorkflow("REVIEW_WORKFLOW", { reviewId, repository: this.name }, { id: reviewId });
+      this.sql`UPDATE reviews SET workflow_started = 1 WHERE id = ${reviewId}`;
+      return true;
+    } catch (error) {
+      console.error("workflow start failed", error instanceof Error ? error.message : "unknown error");
+      this.markFailed(reviewId, "The review could not start. Try again.");
+      return false;
+    }
+  }
+
+  private async clearFinishedQuestion(): Promise<void> {
+    const active = this.state.activeQuestion;
+    if (!active) return;
+    const submission = await this.inspectSubmission(active.submissionId);
+    if (!submission || !["pending", "running"].includes(submission.status)) this.publish({ activeQuestion: null });
   }
 
   private readRouting(): AiRouting {
@@ -353,23 +479,20 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
     };
   }
 
-  private readSpokenTarget(kind: unknown, id: unknown): { text: string; reviewId?: string } | null {
-    if (kind === "review" && typeof id === "string") {
-      const [row] = this.sql<Row>`SELECT * FROM reviews WHERE id = ${id}`;
+  private readSpokenTarget(target: { kind: "review"; id: string } | { kind: "message"; id: number }) {
+    if (target.kind === "review") {
+      const [row] = this.sql<Row>`SELECT * FROM reviews WHERE id = ${target.id}`;
       const review = row ? toReview(row) : null;
-      return review?.result ? { text: buildSpokenReview(review.result, review.commentary), reviewId: id } : null;
+      return review?.result ? { text: buildSpokenReview(review.result, review.commentary), reviewId: target.id } : null;
     }
-    if (kind === "message" && typeof id === "number") {
-      const [row] = this.sql<{ text: string }>`SELECT text FROM messages WHERE id = ${id} AND role = 'assistant'`;
-      const text = row ? toSpokenText(row.text) : "";
-      return text ? { text } : null;
-    }
-    return null;
+    const [row] = this.sql<{ text: string }>`SELECT text FROM messages WHERE id = ${target.id} AND role = 'assistant'`;
+    const text = row ? toSpokenText(row.text) : "";
+    return text ? { text, reviewId: undefined } : null;
   }
 
   /** A per-repository brake. AI Gateway limits are the account-level control. */
   private reserveAiAction(): boolean {
-    const hourAgo = Date.now() - 60 * 60 * 1000;
+    const hourAgo = Date.now() - HOUR_MS;
     this.sql`DELETE FROM ai_actions WHERE created_at <= ${hourAgo}`;
     const [used] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM ai_actions`;
     if ((used?.count ?? 0) >= MAX_AI_ACTIONS_PER_HOUR) return false;
@@ -394,7 +517,8 @@ export class CodexGuardAgent extends Agent<Env, GuardState> {
     this.sql`UPDATE reviews SET status = 'failed', error = ${message}
       WHERE id = ${reviewId} AND status = 'running'`;
     this.sql`DELETE FROM pending_inputs WHERE review_id = ${reviewId}`;
-    this.publish(this.state.active?.reviewId === reviewId ? null : this.state.active);
+    if (this.state.active?.reviewId === reviewId) this.publish({ active: null });
+    else this.publish();
   }
 
   private failStaleReviews(): void {

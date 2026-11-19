@@ -77,7 +77,8 @@ let client: AgentClient<unknown, GuardState> | null = null;
 let snapshot: Snapshot | null = null;
 let guardState: GuardState | null = null;
 let seenRevision = -1;
-let pendingAnswer: { question: string; text: string } | null = null;
+let liveAnswer = "";
+let submittingQuestion = false;
 let exceptionTarget: { reviewId: string; finding: Finding } | null = null;
 let recording: Recording | null = null;
 let transcribing = false;
@@ -124,7 +125,7 @@ function scrollToEnd(): void {
 }
 
 function isBusy(): boolean {
-  return Boolean(guardState?.active) || pendingAnswer !== null;
+  return Boolean(guardState?.active || guardState?.activeQuestion) || submittingQuestion;
 }
 
 function updateComposer(): void {
@@ -315,12 +316,9 @@ function render(): void {
   const follow = isNearBottom();
   const reviews = new Map(snapshot.reviews.map((review) => [review.id, review]));
   const nodes = snapshot.messages.flatMap((message) => messageNode(message, reviews)).filter((node): node is Node | string => Boolean(node));
-  if (pendingAnswer) {
+  if (guardState?.activeQuestion) {
     const body = h("div", { class: "commentary" });
-    renderCommentary(body, pendingAnswer.text || "Thinking…");
-    if (!snapshot.messages.some((m) => m.role === "user" && m.kind === "text" && m.text === pendingAnswer?.question)) {
-      nodes.push(h("div", { class: "bubble user" }, pendingAnswer.question));
-    }
+    renderCommentary(body, liveAnswer || "Thinking…");
     nodes.push(h("div", { class: "bubble assistant", id: "pending-answer" }, h("span", { class: "bubble-label" }, "AI answer"), body));
   }
   ui.timeline.replaceChildren(...(nodes.length ? nodes : [emptyState()]));
@@ -420,7 +418,8 @@ async function submitReview(): Promise<void> {
   setNotice("");
   ui.review.disabled = true;
   try {
-    const result = (await client.call("startReview", [ui.input.value])) as ActionResult;
+    const request = { text: ui.input.value, requestId: crypto.randomUUID() };
+    const result = (await client.call("startReview", [request])) as ActionResult;
     if (!result.ok) setNotice(result.error);
     else ui.input.value = "";
   } catch (error) {
@@ -429,36 +428,24 @@ async function submitReview(): Promise<void> {
   updateComposer();
 }
 
-function submitQuestion(): void {
+/** Questions enter the agent's durable inbox, so they finish if this tab closes. */
+async function submitQuestion(): Promise<void> {
   if (!client || ui.ask.disabled) return;
   setNotice("");
-  const question = ui.input.value.trim();
-  pendingAnswer = { question, text: "" };
-  ui.input.value = "";
-  render();
-  scrollToEnd();
-  const finish = () => {
-    pendingAnswer = null;
-    void refresh().catch(reportFailure);
-  };
-  client
-    .call("ask", [question], {
-      stream: {
-        onChunk: (chunk) => {
-          if (!pendingAnswer) return;
-          pendingAnswer.text += (chunk as { delta?: string }).delta ?? "";
-          const body = document.querySelector<HTMLElement>("#pending-answer .commentary");
-          if (body) renderCommentary(body, pendingAnswer.text);
-          scrollToEnd();
-        },
-        onDone: finish,
-        onError: (message) => {
-          setNotice(message);
-          finish();
-        },
-      },
-    })
-    .catch(reportFailure);
+  submittingQuestion = true;
+  liveAnswer = "";
+  updateComposer();
+  try {
+    const request = { question: ui.input.value.trim(), requestId: crypto.randomUUID() };
+    const result = (await client.call("ask", [request])) as ActionResult;
+    if (!result.ok) setNotice(result.error);
+    else ui.input.value = "";
+  } catch (error) {
+    reportFailure(error);
+  } finally {
+    submittingQuestion = false;
+    updateComposer();
+  }
 }
 
 async function toggleRecording(): Promise<void> {
@@ -476,7 +463,7 @@ async function toggleRecording(): Promise<void> {
     transcribing = true;
     updateComposer();
     if (!client) return;
-    const result = (await client.call("transcribe", [audio])) as unknown as ActionResult<TranscriptResult>;
+    const result = (await client.call("transcribe", [{ audio }])) as unknown as ActionResult<TranscriptResult>;
     if (!result.ok) {
       setNotice(result.error);
     } else if (!result.text) {
@@ -509,7 +496,7 @@ async function toggleSpeech(kind: "review" | "message", id: string | number): Pr
   speakingKey = key;
   render();
   try {
-    const result = (await client.call("speak", [kind, id])) as unknown as ActionResult<SpeechResult>;
+    const result = (await client.call("speak", [{ kind, id }])) as unknown as ActionResult<SpeechResult>;
     if (speakingKey !== key) return;
     if (!result.ok) throw new Error(result.error);
     if (result.source === "offline") setNotice("Offline mode plays a test tone instead of speech.");
@@ -537,7 +524,7 @@ async function saveException(): Promise<void> {
   if (!client || !exceptionTarget) return;
   const { reviewId, finding } = exceptionTarget;
   try {
-    const result = (await client.call("acceptException", [reviewId, finding.id, ui.dialogReason.value])) as ActionResult;
+    const result = (await client.call("acceptException", [{ reviewId, findingId: finding.id, reason: ui.dialogReason.value }])) as ActionResult;
     if (result.ok) ui.dialog.close();
     else ui.dialogError.textContent = result.error;
   } catch (error) {
@@ -558,10 +545,17 @@ async function runAction(method: string, args: unknown[]): Promise<void> {
   }
 }
 
-const toggleStandard = (id: string, enabled: boolean) => void runAction("setStandardEnabled", [id, enabled]);
-const revokeException = (id: string) => void runAction("revokeException", [id]);
+const toggleStandard = (id: string, enabled: boolean) => void runAction("setStandardEnabled", [{ id, enabled }]);
+const revokeException = (id: string) => void runAction("revokeException", [{ id }]);
 
 function handleLiveMessage(message: LiveMessage): void {
+  if (message.type === "answer-reset" || message.type === "answer-delta") {
+    liveAnswer = message.type === "answer-reset" ? "" : liveAnswer + message.delta;
+    const answer = document.querySelector<HTMLElement>("#pending-answer .commentary");
+    if (answer && liveAnswer) renderCommentary(answer, liveAnswer);
+    if (isNearBottom()) scrollToEnd();
+    return;
+  }
   const previous = message.type === "commentary-delta" ? (liveCommentary.get(message.reviewId) ?? "") : "";
   const text = message.type === "commentary-delta" ? previous + message.delta : "";
   liveCommentary.set(message.reviewId, text);
@@ -585,7 +579,8 @@ function connect(repository: string): void {
   snapshot = null;
   guardState = null;
   seenRevision = -1;
-  pendingAnswer = null;
+  liveAnswer = "";
+  submittingQuestion = false;
   liveCommentary.clear();
   ui.repoInput.value = repository;
   ui.timeline.replaceChildren();
@@ -622,10 +617,10 @@ function connect(repository: string): void {
     if (client === next) setConnection("Reconnecting", "connecting");
   });
   next.addEventListener("message", (event) => {
-    if (typeof event.data !== "string" || !event.data.includes('"commentary-')) return;
+    if (typeof event.data !== "string" || !/"(commentary|answer)-(delta|reset)"/.test(event.data)) return;
     try {
       const message = JSON.parse(event.data) as LiveMessage;
-      if (message.type === "commentary-delta" || message.type === "commentary-reset") handleLiveMessage(message);
+      if (["commentary-delta", "commentary-reset", "answer-delta", "answer-reset"].includes(message.type)) handleLiveMessage(message);
     } catch {
       // Ignore frames that are not application messages.
     }
@@ -659,7 +654,7 @@ ui.input.addEventListener("keydown", (event) => {
   }
 });
 ui.review.addEventListener("click", () => void submitReview());
-ui.ask.addEventListener("click", submitQuestion);
+ui.ask.addEventListener("click", () => void submitQuestion());
 ui.mic.addEventListener("click", () => void toggleRecording());
 ui.repoForm.addEventListener("submit", (event) => {
   event.preventDefault();

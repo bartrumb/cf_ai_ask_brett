@@ -10,7 +10,6 @@ export const MODELS = {
   },
   tts: {
     primary: "@cf/deepgram/aura-2-en",
-    // Cloudflare lists this model for removal on 2026-11-20.
-    secondary: "@cf/myshell-ai/melotts",
+    secondary: "@cf/deepgram/aura-1",
   },
 } as const;

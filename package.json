@@ -14,20 +14,29 @@
     "types": "wrangler types src/worker-configuration.d.ts --include-runtime=false --strict-vars=false",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p client/tsconfig.json",
     "test": "vitest run",
-    "check": "npm run typecheck && npm test"
+    "test:coverage": "vitest run --coverage",
+    "check": "npm run typecheck && npm run test:coverage"
   },
   "dependencies": {
     "@ai-sdk/provider": "^4.0.39",
+    "@cloudflare/computer": "^0.8.0",
+    "@cloudflare/think": "^0.23.0",
     "agents": "0.33.0",
     "ai": "^7.0.177",
+    "just-bash": "^3.6.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.5",
     "@cloudflare/workers-types": "^5.20261118.1",
+    "@vitest/coverage-istanbul": "^4.1.12",
     "esbuild": "^0.28.2",
+    "happy-dom": "^21.0.4",
     "typescript": "^7.0.2",
     "vitest": "^4.1.12",
     "wrangler": "4.165.0"
+  },
+  "overrides": {
+    "undici": "^7.30.1"
   }
 }

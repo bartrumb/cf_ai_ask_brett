@@ -71,13 +71,6 @@ export async function transcribeAudio(env: SpeechEnv, wav: Uint8Array, context: 
 async function readAudioResponse(output: unknown): Promise<string> {
   const response = output instanceof Response ? output : new Response(output as BodyInit);
   if (!response.ok) throw new Error(`Speech request failed with status ${response.status}.`);
-  const contentType = response.headers.get("content-type") ?? "";
-  if (contentType.includes("application/json")) {
-    const body = (await response.json()) as { audio?: unknown; result?: { audio?: unknown } };
-    const audio = body.audio ?? body.result?.audio;
-    if (typeof audio !== "string" || !audio) throw new Error("Unexpected speech response.");
-    return audio;
-  }
   const bytes = new Uint8Array(await response.arrayBuffer());
   if (bytes.length === 0) throw new Error("The speech response was empty.");
   return Buffer.from(bytes).toString("base64");
@@ -111,12 +104,17 @@ export async function synthesizeSpeech(env: SpeechEnv, text: string, context: Ga
 
   const run = runner(env);
   const options = { gateway: gatewayOptions(env, context), returnRawResponse: true };
+  const input = { text, speaker: "luna", encoding: "mp3" };
+  const speak = async (model: string): Promise<SpokenAudio> => ({
+    audio: await readAudioResponse(await run(model, input, options)),
+    mimeType: "audio/mpeg",
+    source: "workers-ai",
+    model,
+  });
   try {
-    const output = await run(MODELS.tts.primary, { text, speaker: "luna", encoding: "mp3" }, options);
-    return { audio: await readAudioResponse(output), mimeType: "audio/mpeg", source: "workers-ai", model: MODELS.tts.primary };
+    return await speak(MODELS.tts.primary);
   } catch (error) {
     console.warn("primary speech failed", error instanceof Error ? error.message : "unknown error");
   }
-  const output = await run(MODELS.tts.secondary, { prompt: text, lang: "en" }, options);
-  return { audio: await readAudioResponse(output), mimeType: "audio/mpeg", source: "workers-ai", model: MODELS.tts.secondary };
+  return speak(MODELS.tts.secondary);
 }

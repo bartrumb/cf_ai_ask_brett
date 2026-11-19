@@ -27,5 +27,13 @@
       "class_name": "ReviewWorkflow"
     }
   ],
-  "observability": { "enabled": true }
+  // Limits how quickly one address can open agent connections.
+  "ratelimits": [
+    { "name": "CONNECT_LIMIT", "namespace_id": "1101", "simple": { "limit": 30, "period": 60 } }
+  ],
+  // Think emits turn and model spans when traces are enabled.
+  "observability": {
+    "traces": { "enabled": true, "head_sampling_rate": 1 },
+    "logs": { "enabled": true, "head_sampling_rate": 1, "invocation_logs": true }
+  }
 }

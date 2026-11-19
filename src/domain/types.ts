@@ -58,6 +58,8 @@ export interface GuardState {
   /** Increments whenever stored data changes, so clients know to refetch. */
   revision: number;
   active: { reviewId: string; steps: Record<StepName, StepStatus> } | null;
+  /** The durable question currently waiting for or receiving an answer. */
+  activeQuestion: { submissionId: string } | null;
 }
 
 export type CommentarySource = "workers-ai" | "offline" | "unavailable";
@@ -108,4 +110,6 @@ export type ActionResult<T = object> =
 /** Messages broadcast to connected clients while commentary is generated. */
 export type LiveMessage =
   | { type: "commentary-delta"; reviewId: string; delta: string }
-  | { type: "commentary-reset"; reviewId: string };
+  | { type: "commentary-reset"; reviewId: string }
+  | { type: "answer-delta"; delta: string }
+  | { type: "answer-reset" };
