@@ -3,7 +3,7 @@
  * in `domain/gateway-config.ts`.
  */
 /** App feature recorded with each gateway request. */
-export type AiFeature = "question" | "transcription" | "speech";
+export type AiFeature = "question" | "transcription" | "speech" | "screening";
 
 /** Per-request details used for gateway log filtering. */
 export interface GatewayContext {

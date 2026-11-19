@@ -6,6 +6,8 @@ import { z } from "zod";
 
 /** Gateway name used when `AI_GATEWAY_ID` is not set. Matches `wrangler.jsonc`. */
 export const DEFAULT_GATEWAY_ID = "codex-guard";
+/** Screening gateway name used when `SCREEN_GATEWAY_ID` is not set. Matches `wrangler.jsonc`. */
+export const DEFAULT_SCREEN_GATEWAY_ID = "ask-brett-screen";
 
 /** Action AI Gateway Guardrails takes for a category. */
 type GuardrailAction = "FLAG" | "BLOCK";
@@ -40,38 +42,69 @@ export const gatewayEnvironmentSchema = z.object({
     .string()
     .regex(/^[a-z0-9][a-z0-9-]{0,63}$/, { error: "AI_GATEWAY_ID may use lowercase letters, numbers and dashes." })
     .default(DEFAULT_GATEWAY_ID),
+  SCREEN_GATEWAY_ID: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9-]{0,63}$/, { error: "SCREEN_GATEWAY_ID may use lowercase letters, numbers and dashes." })
+    .default(DEFAULT_SCREEN_GATEWAY_ID),
 });
 
 /** Fields the API returns but does not accept back on update. */
 const READ_ONLY_FIELDS = ["id", "account_id", "account_tag", "internal_id", "created_at", "modified_at"];
 
+/** Copies settings the update API will accept back, dropping read-only and null fields. */
+function carryOver(existing?: Record<string, unknown>): Record<string, unknown> {
+  const current = { ...existing };
+  for (const field of READ_ONLY_FIELDS) delete current[field];
+  // The API reports an unset limit as null, which must not override the safe defaults.
+  for (const [field, value] of Object.entries(current)) if (value === null) delete current[field];
+  return current;
+}
+
+/** Defaults shared by both gateways: no response cache and a per-minute ceiling. */
+const BASE_SETTINGS = {
+  cache_invalidate_on_update: false,
+  cache_ttl: 0,
+  rate_limiting_interval: 60,
+  rate_limiting_limit: 120,
+  rate_limiting_technique: "sliding",
+};
+
 /**
- * Prompt injection (P1) is flagged, not blocked. Topic guards answer obvious attempts
- * before any model call, and a false block here would fail an ordinary visitor question.
- * The update API replaces settings, so anything already configured is carried over.
- * Log collection is always forced on. Existing guardrail choices win, including one for P1.
+ * The main gateway, which carries every model call. It has no prompt-injection check (P1):
+ * Guardrails scans the whole prompt, and this app's system prompt contains anti-injection rules
+ * that the detector reads as an attack, so it flagged every request and cost time on each one.
+ * Injection is screened on the visitor's own words through the screening gateway instead.
+ * The update API replaces settings, so anything else already configured is carried over, and log
+ * collection is always forced on.
  *
  * @param existing - Settings returned by the API, or nothing for a new gateway.
  * @returns The complete settings to send.
  */
 export function desiredGateway(existing?: Record<string, unknown>): GatewaySettings {
-  const current = { ...existing };
-  for (const field of READ_ONLY_FIELDS) delete current[field];
-  // The API reports an unset limit as null, which must not override the safe defaults.
-  for (const [field, value] of Object.entries(current)) if (value === null) delete current[field];
+  const current = carryOver(existing);
   const guardrails = (current.guardrails ?? {}) as Partial<GatewaySettings["guardrails"]>;
+  const { P1: _removed, ...prompt } = guardrails.prompt ?? {};
   return {
-    cache_invalidate_on_update: false,
-    cache_ttl: 0,
-    rate_limiting_interval: 60,
-    rate_limiting_limit: 120,
-    rate_limiting_technique: "sliding",
+    ...BASE_SETTINGS,
     ...current,
     collect_logs: true,
-    guardrails: {
-      prompt: { P1: "FLAG", ...guardrails.prompt },
-      response: { ...guardrails.response },
-    },
+    guardrails: { prompt, response: { ...guardrails.response } },
+  };
+}
+
+/**
+ * The screening gateway. It sees only a visitor's question, never the system prompt, and blocks
+ * on prompt injection (P1), so a blocked call is the signal. Nothing it passes is used, so other
+ * categories and response checks are left off.
+ *
+ * @param existing - Settings returned by the API, or nothing for a new gateway.
+ */
+export function desiredScreenGateway(existing?: Record<string, unknown>): GatewaySettings {
+  return {
+    ...BASE_SETTINGS,
+    ...carryOver(existing),
+    collect_logs: true,
+    guardrails: { prompt: { P1: "BLOCK" }, response: {} },
   };
 }
 
@@ -82,19 +115,25 @@ interface ApiResult {
   body: { success?: boolean; result?: Record<string, unknown>; errors?: { message?: string }[] };
 }
 
+/** Outcome for each gateway. */
+export interface GatewayOutcome {
+  main: "created" | "updated";
+  screen: "created" | "updated";
+}
+
 /**
- * Creates or updates the gateway. The token is only placed in the request
+ * Creates or updates both gateways. The token is only placed in the request
  * header, and error messages contain only what the Cloudflare API returns.
  *
  * @param rawEnvironment - Usually `process.env`; validated before any request.
  * @param fetcher - Replaceable for tests.
- * @returns Whether the gateway was created or updated.
+ * @returns Whether each gateway was created or updated.
  * @throws Error for invalid configuration or a failed API call.
  */
-export async function applyGateway(rawEnvironment: unknown, fetcher: typeof fetch = fetch): Promise<"created" | "updated"> {
+export async function applyGateway(rawEnvironment: unknown, fetcher: typeof fetch = fetch): Promise<GatewayOutcome> {
   const parsed = gatewayEnvironmentSchema.safeParse(rawEnvironment);
   if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? "The environment is not valid.");
-  const { CLOUDFLARE_ACCOUNT_ID: accountId, CLOUDFLARE_API_TOKEN: token, AI_GATEWAY_ID: gatewayId } = parsed.data;
+  const { CLOUDFLARE_ACCOUNT_ID: accountId, CLOUDFLARE_API_TOKEN: token, AI_GATEWAY_ID: mainId, SCREEN_GATEWAY_ID: screenId } = parsed.data;
   const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai-gateway/gateways`;
 
   const request = async (path: string, init: RequestInit = {}): Promise<ApiResult> => {
@@ -113,14 +152,17 @@ export async function applyGateway(rawEnvironment: unknown, fetcher: typeof fetc
   };
 
   // Reading first lets the update preserve settings made outside this script.
-  const existing = await request(`/${gatewayId}`);
-  if (existing.status === 404) {
-    const body = JSON.stringify({ id: gatewayId, ...desiredGateway() });
-    requireSuccess(await request("", { method: "POST", body }), "create the gateway");
-    return "created";
-  }
-  requireSuccess(existing, "read the gateway");
-  const body = JSON.stringify(desiredGateway(existing.body.result));
-  requireSuccess(await request(`/${gatewayId}`, { method: "PUT", body }), "update the gateway");
-  return "updated";
+  const upsert = async (gatewayId: string, desired: (existing?: Record<string, unknown>) => GatewaySettings) => {
+    const existing = await request(`/${gatewayId}`);
+    if (existing.status === 404) {
+      const body = JSON.stringify({ id: gatewayId, ...desired() });
+      requireSuccess(await request("", { method: "POST", body }), `create the gateway "${gatewayId}"`);
+      return "created" as const;
+    }
+    requireSuccess(existing, `read the gateway "${gatewayId}"`);
+    const body = JSON.stringify(desired(existing.body.result));
+    requireSuccess(await request(`/${gatewayId}`, { method: "PUT", body }), `update the gateway "${gatewayId}"`);
+    return "updated" as const;
+  };
+  return { main: await upsert(mainId, desiredGateway), screen: await upsert(screenId, desiredScreenGateway) };
 }

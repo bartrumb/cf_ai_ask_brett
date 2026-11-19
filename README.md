@@ -11,7 +11,7 @@
 [![Live site](https://img.shields.io/badge/live-ask--brett.shopdawg.workers.dev-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](https://ask-brett.shopdawg.workers.dev)
 [![CI](https://img.shields.io/github/actions/workflow/status/bartrumb/cf_ai_ask_brett/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/bartrumb/cf_ai_ask_brett/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-95.5%25-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
-[![Tests](https://img.shields.io/badge/tests-368%20passing-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
+[![Tests](https://img.shields.io/badge/tests-372%20passing-2EA043?style=for-the-badge&logo=vitest&logoColor=white)](#quality)
 
 [![Lighthouse mobile](https://img.shields.io/badge/Lighthouse%20mobile-99%20%C2%B7%20100%20%C2%B7%20100%20%C2%B7%20100-0CCE6B?logo=lighthouse&logoColor=white)](#quality)
 [![Lighthouse desktop](https://img.shields.io/badge/Lighthouse%20desktop-100%20%C2%B7%20100%20%C2%B7%20100%20%C2%B7%20100-0CCE6B?logo=lighthouse&logoColor=white)](#quality)
@@ -71,7 +71,8 @@ flowchart LR
   W --> A["ShowcaseAgent<br/>Durable Object per conversation"]
   A --> SQL[("SQLite<br/>redacted messages")]
   A --> B["Budget instance<br/>daily limits"]
-  A --> G["AI Gateway<br/>logs, spend limit, guardrails"]
+  A --> G["AI Gateway<br/>logs, spend limit"]
+  A -.->|"question only,<br/>in the background"| SG["Screening gateway<br/>prompt-injection check"]
   G --> LLM["Workers AI<br/>language models"]
   G --> STT["Workers AI<br/>speech to text"]
   G --> FB["Workers AI<br/>Aura-1 voice fallback"]
@@ -80,7 +81,7 @@ flowchart LR
   classDef cf fill:#F38020,stroke:#B85F10,color:#fff
   classDef store fill:#1F2937,stroke:#6B7280,color:#fff
   classDef ext fill:#8B6CFF,stroke:#5B3FD6,color:#fff
-  class W,A,B,G,LLM,STT,FB cf
+  class W,A,B,G,SG,LLM,STT,FB cf
   class SQL store
   class EL ext
 ```
@@ -254,7 +255,7 @@ Alerts: with the optional `POSTHOG_PROJECT_KEY` secret set, every refusal also s
 
 | Check | Result |
 | --- | --- |
-| Tests | 368 passing across 17 files, in the Workers runtime and a simulated DOM |
+| Tests | 372 passing across 18 files, in the Workers runtime and a simulated DOM |
 | Statements | 95.5% |
 | Branches | 85.9% |
 | Functions | 96.0% |

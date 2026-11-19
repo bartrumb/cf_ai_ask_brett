@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { decodeWav, MAX_SPOKEN_CHARS, toSpokenText } from "../src/domain/audio";
-import { applyGateway, desiredGateway } from "../src/domain/gateway-config";
+import { applyGateway, desiredGateway, desiredScreenGateway } from "../src/domain/gateway-config";
 import { MAX_AUDIO_BYTES, parseInput, transcribeSchema } from "../src/domain/schemas";
 import { gatewayMetadata } from "../src/gateway";
 import { MODELS, TTS_SPEAKERS } from "../src/models";
@@ -256,25 +256,29 @@ describe("gateway configuration", () => {
     expect(Object.keys(metadata).length).toBeLessThanOrEqual(5);
   });
 
-  it("flags prompt injection and keeps logs on for a new gateway", () => {
-    expect(desiredGateway()).toMatchObject({ collect_logs: true, guardrails: { prompt: { P1: "FLAG" } } });
+  it("keeps logs on and leaves prompt injection to the screening gateway", () => {
+    expect(desiredGateway()).toMatchObject({ collect_logs: true, guardrails: { prompt: {}, response: {} } });
+    expect(desiredGateway().guardrails.prompt).not.toHaveProperty("P1");
+    expect(desiredScreenGateway()).toMatchObject({ collect_logs: true, cache_ttl: 0, guardrails: { prompt: { P1: "BLOCK" }, response: {} } });
   });
 
-  it("preserves existing settings and removes read-only fields", () => {
+  it("preserves existing settings, removes read-only fields and drops the old whole-prompt P1 check", () => {
     const settings = desiredGateway({
       id: "existing",
       created_at: "now",
       cache_ttl: 30,
       collect_logs: false,
-      guardrails: { prompt: { P1: "BLOCK", S9: "FLAG" }, response: { S9: "BLOCK" } },
+      guardrails: { prompt: { P1: "FLAG", S9: "FLAG" }, response: { S9: "BLOCK" } },
     });
     expect(settings).not.toHaveProperty("id");
     expect(settings).not.toHaveProperty("created_at");
     expect(settings).toMatchObject({
       cache_ttl: 30,
       collect_logs: true,
-      guardrails: { prompt: { P1: "BLOCK", S9: "FLAG" }, response: { S9: "BLOCK" } },
+      guardrails: { prompt: { S9: "FLAG" }, response: { S9: "BLOCK" } },
     });
+    expect(settings.guardrails.prompt).not.toHaveProperty("P1");
+    expect(desiredScreenGateway({ id: "screen", guardrails: { prompt: { S1: "FLAG" } } }).guardrails).toEqual({ prompt: { P1: "BLOCK" }, response: {} });
   });
 
   describe("setup", () => {
@@ -290,8 +294,9 @@ describe("gateway configuration", () => {
         requests.push({ url, init });
         return requests.length === 1 ? reply(404, { success: false }) : reply(200, { success: true });
       }) as unknown as typeof fetch;
-      await expect(applyGateway(environment, fetcher)).resolves.toBe("created");
+      await expect(applyGateway(environment, fetcher)).resolves.toEqual({ main: "created", screen: "updated" });
       expect(requests[1]?.init?.method).toBe("POST");
+      expect(requests[2]?.url).toContain("/ask-brett-screen");
       expect(JSON.stringify(requests.map(({ url, init }) => [url, init?.body]))).not.toContain(environment.CLOUDFLARE_API_TOKEN);
     });
 
@@ -301,8 +306,9 @@ describe("gateway configuration", () => {
         if (init?.body) bodies.push(String(init.body));
         return reply(200, { success: true, result: { id: "existing", cache_ttl: 9 } });
       }) as unknown as typeof fetch;
-      await expect(applyGateway(environment, fetcher)).resolves.toBe("updated");
-      expect(JSON.parse(bodies[0] ?? "{}")).toMatchObject({ cache_ttl: 9, guardrails: { prompt: { P1: "FLAG" } } });
+      await expect(applyGateway(environment, fetcher)).resolves.toEqual({ main: "updated", screen: "updated" });
+      expect(JSON.parse(bodies[0] ?? "{}")).toMatchObject({ cache_ttl: 9, guardrails: { prompt: {} } });
+      expect(JSON.parse(bodies[1] ?? "{}")).toMatchObject({ guardrails: { prompt: { P1: "BLOCK" } } });
     });
 
     it("reports API failures", async () => {
@@ -314,6 +320,7 @@ describe("gateway configuration", () => {
       [{ ...environment, CLOUDFLARE_ACCOUNT_ID: "../../other" }],
       [{ ...environment, CLOUDFLARE_API_TOKEN: "short" }],
       [{ ...environment, AI_GATEWAY_ID: "../bad" }],
+      [{ ...environment, SCREEN_GATEWAY_ID: "../bad" }],
       [{}],
     ])("rejects unsafe settings before any request", async (value) => {
       const fetcher = (async () => { throw new Error("must not be called"); }) as unknown as typeof fetch;

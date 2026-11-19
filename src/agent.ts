@@ -15,7 +15,8 @@ import { allowedClientFrameId, parseInput, questionRequestSchema, speakRequestSc
 import type { ActionResult, AnswerSource, ChatMessage, LiveMessage, ShowcaseState, Snapshot } from "./domain/types";
 import type { GatewayContext } from "./gateway";
 import { KNOWLEDGE_SECTIONS, PROFILE } from "./generated/knowledge";
-import { reportBudgetRefusal, type BudgetLimit } from "./alerts";
+import { reportBudgetRefusal, reportInjectionFlag, type BudgetLimit } from "./alerts";
+import { screenQuestion } from "./screening";
 import { createLanguageModel, isOffline } from "./llm";
 import { createOfflineModel } from "./offline-model";
 import { streamSpeech, transcribeAudio, type Transcript } from "./speech";
@@ -365,8 +366,11 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
         console.error("question submission failed", error instanceof Error ? error.message : "unknown error");
         return { ok: false, error: "The question could not be sent. Please try again." };
       }
-      if (submission.accepted) this.publish({ activeQuestion: { submissionId: submission.submissionId } });
-      else this.publish();
+      if (submission.accepted) {
+        this.publish({ activeQuestion: { submissionId: submission.submissionId } });
+        // Background only: the answer neither waits for nor depends on the result.
+        this.ctx.waitUntil(this.screen(text));
+      } else this.publish();
       return { ok: true, submissionId: submission.submissionId, accepted: submission.accepted };
     } finally {
       if (!known) this.submittingQuestion = false;
@@ -577,6 +581,17 @@ export class ShowcaseAgent extends Think<Env, ShowcaseState> {
     if (await this.allowSharedAiSpend(units, exempt)) return true;
     this.sql`DELETE FROM ai_actions WHERE rowid = ${slot?.rowid ?? -1}`;
     return false;
+  }
+
+  /** Screens a question for prompt injection and reports a flag. Offline mode has no gateway to ask. */
+  private async screen(question: string): Promise<void> {
+    if (isOffline(this.env)) return;
+    const env = this.env as Env & { SCREEN_GATEWAY_ID?: string; POSTHOG_PROJECT_KEY?: string };
+    const result = await screenQuestion(env, question, this.name);
+    console.log("question screened", { result });
+    if (result !== "flagged") return;
+    console.warn("injection flagged", { conversation: this.name, length: question.length });
+    await reportInjectionFlag(env, question.length);
   }
 
   /** Logs a refused action and sends the alert event without delaying the visitor's reply. */

@@ -16,11 +16,10 @@ export type BudgetLimit = "per-minute" | "conversation-hourly" | "guarded-hourly
 type AlertEnv = { POSTHOG_PROJECT_KEY?: string };
 
 /**
- * Sends one refusal event. Never throws: an alert that fails must not change the visitor's answer.
- *
- * @param used - Units already counted against the limit, where known.
+ * Sends one server event. Never throws: an alert that fails must not change the visitor's answer.
+ * Callers pass only non-identifying properties.
  */
-export async function reportBudgetRefusal(env: AlertEnv, limit: BudgetLimit, used?: number): Promise<void> {
+async function reportEvent(env: AlertEnv, event: string, properties: Record<string, string | number>): Promise<void> {
   const key = env.POSTHOG_PROJECT_KEY;
   if (!key) return;
   try {
@@ -29,12 +28,29 @@ export async function reportBudgetRefusal(env: AlertEnv, limit: BudgetLimit, use
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         api_key: key,
-        event: "ask_budget_refused",
+        event,
         distinct_id: DISTINCT_ID,
-        properties: { limit, ...(used === undefined ? {} : { used }), $process_person_profile: false, $lib: "ask-brett-worker" },
+        properties: { ...properties, $process_person_profile: false, $lib: "ask-brett-worker" },
       }),
     });
   } catch (error) {
-    console.warn("budget alert failed", error instanceof Error ? error.message : "unknown error");
+    console.warn("alert failed", error instanceof Error ? error.message : "unknown error");
   }
+}
+
+/**
+ * Reports a refused action.
+ *
+ * @param used - Units already counted against the limit, where known.
+ */
+export function reportBudgetRefusal(env: AlertEnv, limit: BudgetLimit, used?: number): Promise<void> {
+  return reportEvent(env, "ask_budget_refused", { limit, ...(used === undefined ? {} : { used }) });
+}
+
+/**
+ * Reports a question the screening gateway blocked as prompt injection. Only its length is sent;
+ * the text stays in the gateway log, found by the conversation ID in the Worker log.
+ */
+export function reportInjectionFlag(env: AlertEnv, length: number): Promise<void> {
+  return reportEvent(env, "ask_injection_flagged", { length });
 }

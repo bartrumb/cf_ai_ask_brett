@@ -18,6 +18,8 @@
   "vars": {
     "AI_MODE": "workers-ai",
     "AI_GATEWAY_ID": "codex-guard",
+    // Sees only visitors' questions and blocks on prompt injection; a block is the alert signal.
+    "SCREEN_GATEWAY_ID": "ask-brett-screen",
     // Real model mode refuses connections until both Access values are set.
     "ACCESS_TEAM_DOMAIN": "",
     "ACCESS_AUD": "",

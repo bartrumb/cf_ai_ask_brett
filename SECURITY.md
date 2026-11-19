@@ -36,7 +36,8 @@ Ask about Brett is a public site. Every question, transcript and model response 
 - The conversation ID in `localStorage` is a bearer value for that conversation. Anyone with it can read that conversation.
 - Set an AI Gateway spend limit. Application limits count actions, and one action can call a primary and a fallback model.
 - With `ELEVENLABS_API_KEY` or `DEEPGRAM_API_KEY` set, stored answers are sent directly to that vendor for speech. The gateway spend limit and logs do not cover those calls. The application's speech limits still apply, so also set a credit limit on the ElevenLabs key and a usage limit or low balance in Deepgram.
-- Guardrails does not enforce responses on streamed requests.
+- Prompt-injection screening is a signal, not a block. Each accepted question is sent alone, in the background, through the `ask-brett-screen` gateway, whose Guardrails blocks prompt injection (P1). A block is logged and sent to PostHog as `ask_injection_flagged`, but the answer has already been requested, so the guards, the delimited prompt and output masking remain the defences. The main gateway has no P1 check, because Guardrails scans the whole prompt and the system prompt's own anti-injection rules made it flag every request.
+- Live dictation streams audio to Deepgram Flux over a Workers AI WebSocket, which does not pass through AI Gateway, so the gateway spend limit and logs do not cover it. Each session is capped at 60 seconds and one budget unit.
 - Speech-to-text requests ask the gateway not to store audio payloads. Confirm this in gateway logs.
 
 ## Handling tokens
