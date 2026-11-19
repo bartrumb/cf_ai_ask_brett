@@ -410,3 +410,15 @@ Fix them
 ````
 
 **Produced:** narrower financials and age patterns in `src/domain/guards.ts`, with guard and eval regression cases for both directions. The eval runner now also fails any link that does not appear in the profile facts, after the post-fix rerun showed a misspelled LinkedIn handle that no check caught, and it stops at the first budget refusal instead of scoring refusals as failed answers. The Worker was redeployed.
+
+---
+
+## Prompt 24
+
+This request came from the Claude Code session I use for résumé and site review. It suggested answering contact questions with a fixed reply after the eval caught a misspelled LinkedIn handle, and I answered:
+
+````text
+Fix it now
+````
+
+**Produced:** contact guard patterns for ordinary "how do I reach him" and LinkedIn-link questions, and a fixed contact reply that includes the profile's LinkedIn link when one is set. Eval and guard cases cover both directions, including LinkedIn and "get in touch" questions that must still reach the model. The sample profile's "How do I reach Avery?" suggestion was replaced, because suggested questions must reach the model. The Worker was redeployed.

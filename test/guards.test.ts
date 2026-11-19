@@ -26,6 +26,12 @@ describe("guarded topics", () => {
     ["contact", "Can I text him?"],
     ["contact", "What's his home address?"],
     ["contact", "Give me his personal email"],
+    ["contact", "What's the best way to get in touch with him?"],
+    ["contact", "How do I contact Avery?"],
+    ["contact", "Where can a recruiter reach him?"],
+    ["contact", "What's his LinkedIn?"],
+    ["contact", "Send me his LinkedIn profile link"],
+    ["contact", "What is his contact info?"],
     ["personal", "Does he have any health issues?".replace("any health issues", "a disability")],
     ["personal", "Is he married?"],
     ["personal", "How many kids does he have?"],
@@ -78,6 +84,9 @@ describe("guarded topics", () => {
     "How does he keep AI costs down?",
     "What has he done to cut cloud costs?",
     "How old were the legacy systems he migrated?",
+    "Has he written anything on LinkedIn?",
+    "How does ShopTalk help shops get in touch with customers?",
+    "How does he reach consensus with security teams?",
   ])("does not guard: %s", (question) => {
     expect(classifyQuestion(question)).toBeNull();
   });
@@ -90,5 +99,8 @@ describe("guarded topics", () => {
       expect(answer).not.toMatch(/\$\d|\d{3}-\d{4}/);
     }
     expect(guardedAnswer("contact", profile)).toContain(profile.links.email);
+    expect(guardedAnswer("contact", profile)).not.toContain("LinkedIn");
+    const withLinkedin = { ...profile, links: { ...profile.links, linkedin: "https://www.example.com/in/avery" } };
+    expect(guardedAnswer("contact", withLinkedin)).toContain("LinkedIn at https://www.example.com/in/avery.");
   });
 });

@@ -11,7 +11,7 @@ export type GuardCategory = "instructions" | "compensation" | "financials" | "co
 /** Public contact details used in fixed answers. */
 export interface GuardProfile {
   name: string;
-  links: { email: string; site: string };
+  links: { email: string; site: string; linkedin?: string };
 }
 
 /** A person reference in questions, such as "he" or "the candidate". */
@@ -63,6 +63,12 @@ const GUARD_PATTERNS: readonly (readonly [GuardCategory, readonly RegExp[]])[] =
       new RegExp(String.raw`\b${PERSON}(?:'s)?\s+(?:phone|cell|mobile|whatsapp|home address|street address|address)\b`),
       new RegExp(String.raw`\b(?:call|text|sms)\s+${PERSON}\b`),
       /\bhome address\b|\bstreet address\b|\bwhatsapp\b|\b(?:personal|private)\s+(?:e-?mail|contact|number|address)\b/,
+      // Ordinary "how do I reach him" questions also get the fixed reply, so links are always exact.
+      // The model once misspelled the LinkedIn handle in an answer to one of these.
+      new RegExp(String.raw`\b(?:how|where)\s+(?:do|can|could|should|would|might)\s+(?:i|we|you|someone|one|a recruiter)\s+(?:reach|contact|email|message|connect with|get in touch with|get (?:a ?)?hold of|find)\s+${PERSON}\b`),
+      new RegExp(String.raw`\b(?:best|easiest|quickest|fastest|preferred) way to (?:reach|contact|get in touch|connect|get (?:a ?)?hold)\b|\bget in touch with\s+${PERSON}\b`),
+      /\bcontact (?:info|information|details)\b|\blinked\s?in (?:profile|url|link|page|handle)\b/,
+      new RegExp(String.raw`\b(?:what(?:'s| is)|share|send|give me)\s+(?:${PERSON}(?:'s)?)\s+linked\s?in\b`),
     ],
   ],
   [
@@ -137,12 +143,13 @@ export function classifyQuestion(question: string): GuardCategory | null {
 /** Returns the fixed reply for a guarded topic. */
 export function guardedAnswer(category: GuardCategory, profile: GuardProfile): string {
   const first = profile.name.split(" ")[0] ?? profile.name;
-  const { email, site } = profile.links;
+  const { email, site, linkedin } = profile.links;
+  const linkedinText = linkedin ? ` ${first} is also on LinkedIn at ${linkedin}.` : "";
   const answers: Record<GuardCategory, string> = {
     instructions: `I can't share or change how I work, but I'm glad to talk about ${first}'s projects, results and experience. What would you like to know?`,
     compensation: `${first} is happy to discuss compensation directly. You can reach out at ${email}.`,
     financials: `I don't share company financials or pricing details. I can explain what ${first} built and how the results were measured, or you can ask directly at ${email}.`,
-    contact: `The best way to reach ${first} is ${email}. More public contact options are at ${site}.`,
+    contact: `The best way to reach ${first} is ${email}.${linkedinText} More public contact options are at ${site}.`,
     personal: `I keep to ${first}'s professional work here. I'm happy to talk about projects, skills or how ${first} approaches engineering.`,
     "job-search": `I can tell you the kinds of roles ${first} is seeking, but not details of any search. For anything more, please write to ${email}.`,
     government: `I don't discuss that area here. I'm happy to cover the work on this site, and you can ask ${first} directly at ${email}.`,
