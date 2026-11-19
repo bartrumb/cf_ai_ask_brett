@@ -18,6 +18,7 @@ Prompt 1 is a brief written by another Claude Code session that was helping me p
 | 11–14 | Voice selection, then live testing and repairs from Worker logs |
 | 15–18 | Lighthouse tuning, public release preparation, final polish and publishing |
 | 19 | Streaming speech after reading live Worker logs |
+| 20 | Accuracy and confidentiality edits to the private knowledge base, relayed from my planning session |
 
 This file holds the prompts and their outcomes. The raw session transcript is not published because it also contains unrelated private material, such as personal career notes and local machine details.
 
@@ -352,3 +353,23 @@ Check the traces the tts still isn't working, perhaps we should switch to a stre
 ````
 
 **Produced:** a live log check showing ElevenLabs succeeded but took about 12 seconds per answer, then streamed speech: a short first sentence plays within seconds while later parts are generated in parallel, through an audio element unlocked by the tap for Safari and iPhones.
+
+---
+
+## Prompt 20
+
+This request came from the Claude Code session I use for résumé and site review, relaying two fixes I had approved there.
+
+````text
+Brett approved two fixes to the live "Ask about Brett" answers; please update the private knowledge base, redeploy only the `ask-brett` Worker, and verify live.
+
+1. AI Change Review approval wording: everywhere the knowledge base or any fixed reply says "InfoSec and compliance" sign-off or approval, change it to "approved by Legal and InfoSec". Brett's confirmed facts are: concept to production in under three months; approved by Legal and InfoSec; both teams commended how thorough his documentation and security practices were, without being asked. Remove "security named it the template for future AI projects" unless Brett confirms it to you.
+
+2. Trim current-employer internals from public answers. Keep the public story: AI Change Review risk-checks changes before people approve them, deterministic rules decide risk, agents only advise, humans approve, PII masking and workload identity federation, audit trail, five change advisory boards, 1,900+ reviews, under three months to production. Remove or generalize: [REDACTED: names of the employer's internal systems and data sources, internal milestones and plans, and a company spend figure]. Keep general skills such as Azure, Kubernetes and observability. Shepherd details can stay.
+
+Apply the same edits to the deployed source `content/knowledge-base.md` and the private copy at [REDACTED: local path]. Do not commit private content to the public repo. Add tests or prompt guards if a public file needs changing, and keep `PROMPTS.md` accurate with this request in it.
+
+Then run tests, redeploy, and live-check at least these: "How did he get AI Change Review past InfoSec?", "Has he shipped AI in production?", and "Walk me through in full detail how AI Change Review works." Confirm that no answer says "compliance sign-off" or names the removed internal systems. If you push, keep CI green. Report what changed and the live results. Do not change secrets, Access, the gateway or anything else.
+````
+
+**Produced:** edits to the gitignored knowledge base and site content only: the approval wording, the employer details removed or generalized, and company cost figures dropped. No public source file changed apart from this log.
