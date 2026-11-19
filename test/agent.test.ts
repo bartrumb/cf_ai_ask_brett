@@ -238,7 +238,7 @@ describe("durable questions through Think", () => {
     await runInDurableObject(agent, async (instance) => {
       (instance as unknown as { env: Env }).env = { ...instance["env"], AI_MODE: "workers-ai" };
       const broadcast = vi.spyOn(instance, "broadcast");
-      instance.onChunk({ chunk: { type: "text-delta", id: "1", text: `${"word ".repeat(80)}` } } as never);
+      instance.onChunk({ chunk: { type: "text-delta", id: "1", text: "word ".repeat(200) } } as never);
       instance.onChunk({ chunk: { type: "reasoning-delta", id: "1", text: "hidden" } } as never);
       expect(broadcast).toHaveBeenCalledTimes(1);
       instance.onStepEnd({ providerMetadata: { cloudflare: { model: MODELS.llm.secondary } } } as never);

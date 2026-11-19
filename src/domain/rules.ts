@@ -3,7 +3,7 @@
  * and recorded exceptions, it produces every finding and the risk level. It has no I/O and never
  * receives model output. Add a standard in `standards.ts` and its detection here.
  */
-import { CHANGE_PATH, normalizeText, PREAMBLE_PATH, SUMMARY_PATH, type ChangeLine, type ParsedChange } from "./input";
+import { CHANGE_PATH, normalizeText, PREAMBLE_PATH, SUMMARY_PATH, type ChangedFile, type ChangeLine, type ParsedChange } from "./input";
 import {
   SEVERITIES,
   type ExceptionRecord,
@@ -21,37 +21,55 @@ const MAX_REPORTED_FINDINGS = 50;
 /** Longest evidence snippet stored with a finding. */
 const MAX_EVIDENCE_CHARS = 160;
 
+/** Credential-like names. Common non-secret forms such as `token_count` are excluded. */
+const SECRET_WORD = String.raw`(?:api[_-]?key|auth[_-]?key|private[_-]?key|secret|token(?!iz|s\b|[_-](?:count|type|limit|url|endpoint))|(?<![a-z])pass(?:word|wd|phrase)?|passw(?:or)?d|credential)`;
 /** A credential-like name followed by an assignment operator. Quantifiers are bounded. */
-const SECRET_NAME = String.raw`\b[\w-]{0,40}(?:api[_-]?key|secret|token|passw(?:or)?d|credential)[\w-]{0,40}["']?\s{0,5}(?::=|=>|[:=])\s{0,5}`;
+const SECRET_NAME = String.raw`\b[\w-]{0,40}${SECRET_WORD}[\w-]{0,40}["']?\s{0,5}(?::=|=>|[:=])\s{0,5}`;
 /** A quoted value, excluding template placeholders. */
 const QUOTED_SECRET = String.raw`(["'])(?!\$\{|\{\{|<)(?:(?!\2).){8,400}?\2`;
-/** An unquoted value with a digit or symbol, which avoids matching ordinary identifiers. */
-const UNQUOTED_SECRET = String.raw`(?=[^\s"',;]{0,200}[\d!@#%^&*+/=~-])[^\s"',;()$<>{}.[\]]{8,200}(?=$|[\s,;])`;
+/** End of an unquoted value. */
+const VALUE_END = String.raw`(?=$|[\s,;])`;
+/** Unquoted forms that are references to values: variables, properties, calls and numbers. */
+const CODE_VALUE = String.raw`\$[A-Za-z_{]|\{\{|<|arn:|\d+${VALUE_END}|[A-Za-z_$][\w$]*(?:\.[\w$]+)+${VALUE_END}|[\w$.]+\([^\s]{0,100}\)${VALUE_END}`;
+/** An unquoted value with a digit or symbol, or a long lowercase passphrase. */
+const UNQUOTED_SECRET = String.raw`(?!${CODE_VALUE})(?:(?=[^\s"',;]{0,200}[\d!@#%^&*+/=~$-])[^\s"',;]{8,200}|[a-z]{16,200})${VALUE_END}`;
 /** Named assignments. Group 1 is the name and operator, and group 2 is any opening quote. */
 const SECRET_ASSIGNMENT = String.raw`(${SECRET_NAME})(?:${QUOTED_SECRET}|${UNQUOTED_SECRET})`;
 /** Credentials recognizable by format alone. */
 const SECRET_TOKENS = [
   String.raw`\bAKIA[0-9A-Z]{16}\b`,
+  String.raw`\bAIza[0-9A-Za-z_-]{30,60}`,
   String.raw`\bgh[pousr]_[A-Za-z0-9]{20,255}\b`,
   String.raw`\bgithub_pat_[A-Za-z0-9_]{20,255}\b`,
+  String.raw`\bglpat-[\w-]{16,100}`,
+  String.raw`\bnpm_[A-Za-z0-9]{30,100}\b`,
   String.raw`\bsk-[A-Za-z0-9_-]{16,255}\b`,
+  String.raw`\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,255}\b`,
   String.raw`\bxox[abeoprs]-[A-Za-z0-9-]{10,255}\b`,
+  String.raw`https://hooks\.slack\.com/services/[A-Za-z0-9/]{20,200}`,
   String.raw`\beyJ[\w-]{8,1000}\.eyJ[\w-]{8,1000}\.[\w-]{8,1000}`,
 ];
 /** An HTTP bearer credential. */
 const BEARER_TOKEN = String.raw`\bBearer\s{1,5}[A-Za-z0-9._~+/-]{20,1000}`;
+/** An authorization header value. Group 1 keeps the header name and scheme. */
+const AUTH_HEADER = String.raw`(\bauthorization["']?\s{0,5}[:=]\s{0,5}["']?(?:bearer|basic)\s{1,5})[^\s"']{8,1000}`;
 /** A password in a URL. Group 1 is the scheme and user, and group 2 precedes the host. */
-const URL_CREDENTIAL = String.raw`(\b[a-z][a-z0-9+.-]{1,20}://[^\s:/@]{1,100}:)[^\s/@]{1,200}(@)`;
-/** First line of a private key block. */
-const PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----/;
+const URL_CREDENTIAL = String.raw`(\b[a-z][a-z0-9+.-]{1,20}://[^\s:/@]{1,100}:)(?!\d{1,5}(?:/|@))[^\s@]{1,200}(@)`;
+/** Mixed-case base64-like text. It is masked but not reported, because hashes also match. */
+const OPAQUE_VALUE = String.raw`\b(?=[A-Za-z0-9+/]{0,200}\d)(?=[A-Za-z0-9+/]{0,200}[A-Z])(?=[A-Za-z0-9+/]{0,200}[a-z])[A-Za-z0-9+/]{40,1000}={0,2}`;
+/** First line of a private key block, including PGP blocks. */
+const PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----/;
 /** Last line of a private key block. */
-const PRIVATE_KEY_END = /-----END [A-Z ]{0,40}PRIVATE KEY-----/;
+const PRIVATE_KEY_END = /-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----/;
+/** Replacement shown for every part of a private key. */
+const PRIVATE_KEY_MASK = "[REDACTED PRIVATE KEY]";
 
 /** Detection for STD-SEC-01. It shares its sources with `redactSecrets`. */
 const SECRET_PATTERNS: readonly RegExp[] = [
   new RegExp(SECRET_ASSIGNMENT, "i"),
   ...SECRET_TOKENS.map((source) => new RegExp(source)),
-  new RegExp(BEARER_TOKEN),
+  new RegExp(BEARER_TOKEN, "i"),
+  new RegExp(AUTH_HEADER, "i"),
   new RegExp(URL_CREDENTIAL, "i"),
   PRIVATE_KEY_BEGIN,
 ];
@@ -187,13 +205,34 @@ export function redactSecrets(text: string): string {
   );
   for (const source of SECRET_TOKENS) redacted = redacted.replace(new RegExp(source, "g"), "[REDACTED]");
   return redacted
-    .replace(new RegExp(BEARER_TOKEN, "g"), "Bearer [REDACTED]")
+    .replace(new RegExp(AUTH_HEADER, "gi"), "$1[REDACTED]")
+    .replace(new RegExp(BEARER_TOKEN, "gi"), "Bearer [REDACTED]")
     .replace(new RegExp(URL_CREDENTIAL, "gi"), "$1[REDACTED]$2")
-    .replace(/-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]{0,40}PRIVATE KEY-----|$)/g, "[REDACTED PRIVATE KEY]");
+    .replace(/-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----|$)/g, PRIVATE_KEY_MASK)
+    .replace(new RegExp(OPAQUE_VALUE, "g"), "[REDACTED]");
 }
 
-/** Characters held back so a secret split across stream chunks can still be masked. */
-const STREAM_HOLDBACK_CHARS = 240;
+/**
+ * Finds new-file line numbers inside private key blocks. Context lines are included because a key
+ * rotation can change only the body while its BEGIN and END markers stay unchanged.
+ */
+function privateKeyLines(file: ChangedFile): Set<number> {
+  const inside = new Set<number>();
+  let open = false;
+  for (const { line, text } of [...file.additions, ...file.context].sort((a, b) => a.line - b.line)) {
+    const normalized = normalizeText(text);
+    const begins = PRIVATE_KEY_BEGIN.test(normalized);
+    if (begins || open) inside.add(line);
+    if (begins) open = true;
+    if (PRIVATE_KEY_END.test(normalized)) open = false;
+  }
+  return inside;
+}
+
+/** Redacted characters held back, because a later chunk can complete a secret. */
+const STREAM_HOLDBACK_CHARS = 512;
+/** New characters collected before the accumulated text is redacted again. */
+const STREAM_RECHECK_CHARS = 64;
 
 /** Incrementally redacts model text before it is shown live. */
 export interface StreamRedactor {
@@ -203,22 +242,32 @@ export interface StreamRedactor {
   finish(): string;
 }
 
-/** Creates a redactor that releases text only at whitespace behind the holdback window. */
+/**
+ * Creates a stream redactor. Redaction always runs over the whole accumulated text, so a credential
+ * name and value are still seen together when they arrive in different chunks.
+ */
 export function createStreamRedactor(): StreamRedactor {
-  let pending = "";
+  let raw = "";
+  let sent = 0;
+  let unchecked = 0;
   return {
     push(delta) {
-      pending += delta;
-      const limit = pending.length - STREAM_HOLDBACK_CHARS;
-      const boundary = limit > 0 ? pending.lastIndexOf(" ", limit) : -1;
-      if (boundary < 0) return "";
-      const ready = pending.slice(0, boundary + 1);
-      pending = pending.slice(boundary + 1);
-      return redactSecrets(ready);
+      raw += delta;
+      unchecked += delta.length;
+      if (unchecked < STREAM_RECHECK_CHARS) return "";
+      unchecked = 0;
+      const clean = redactSecrets(raw);
+      const stable = clean.length - STREAM_HOLDBACK_CHARS;
+      if (stable <= sent) return "";
+      const ready = clean.slice(sent, stable);
+      sent = stable;
+      return ready;
     },
     finish() {
-      const rest = redactSecrets(pending);
-      pending = "";
+      const rest = redactSecrets(raw).slice(sent);
+      raw = "";
+      sent = 0;
+      unchecked = 0;
       return rest;
     },
   };
@@ -240,6 +289,14 @@ function highestSeverity(findings: readonly Finding[]): Severity {
     (highest, finding) => (severityRank(finding.severity) > severityRank(highest) ? finding.severity : highest),
     "low",
   );
+}
+
+/**
+ * True when an exception can target this path. Pseudo-paths would cover unrelated changes, and a
+ * redacted path could match a different file.
+ */
+export function isExceptionPath(path: string): boolean {
+  return path !== SUMMARY_PATH && path !== CHANGE_PATH && !path.includes("[REDACTED");
 }
 
 /** Repository settings that affect one evaluation. */
@@ -300,12 +357,12 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
       // A preamble alone does not make a standard count as checked.
       if (file.path !== PREAMBLE_PATH) applicable.add(rule.standardId);
       const lines: ChangeLine[] = rule.scanContext ? [...file.additions, ...file.context] : file.additions;
+      const keyLines = rule.standardId === "STD-SEC-01" ? privateKeyLines(file) : new Set<number>();
       for (const { line, text } of lines) {
         // Match the normalized form so invisible characters cannot split a keyword.
         const normalized = normalizeText(text);
-        if (patterns.some((pattern) => pattern.test(normalized))) {
-          record(rule.standardId, file.path, line, text);
-        }
+        if (keyLines.has(line)) record(rule.standardId, file.path, line, PRIVATE_KEY_MASK);
+        else if (patterns.some((pattern) => pattern.test(normalized))) record(rule.standardId, file.path, line, text);
       }
       if (rule.scanPath && file.path !== PREAMBLE_PATH && file.path !== SUMMARY_PATH) {
         const path = normalizeText(file.path);
@@ -338,7 +395,7 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
 
   // Stored exceptions are ignored for standards that cannot be waived.
   const exceptionFor = (draft: Draft) =>
-    draft.waivable
+    draft.waivable && isExceptionPath(draft.path)
       ? context.exceptions.find((e) => e.standardId === draft.standardId && e.path === draft.path)
       : undefined;
 
@@ -392,7 +449,7 @@ export function describeChange(change: ParsedChange, text: string): string {
 
 /**
  * A bounded view of added lines that gives the model code context. Paths and lines are redacted,
- * and everything from a private key's BEGIN marker through its END marker is replaced. Output stops
+ * and each changed run inside a private key block becomes one mask. Output stops
  * at the first entry that would exceed the limit.
  *
  * @param maxChars - Approximate limit on the returned text.
@@ -402,17 +459,16 @@ export function buildExcerpt(change: ParsedChange, maxChars = 5_000): string {
   let used = 0;
   for (const file of change.files) {
     const path = redactSecrets(file.path);
-    let insidePrivateKey = false;
+    const keyLines = privateKeyLines(file);
+    let maskedKey = false;
     for (const { line, text } of file.additions) {
-      const normalized = normalizeText(text);
-      if (insidePrivateKey) {
-        insidePrivateKey = !PRIVATE_KEY_END.test(normalized);
-        continue;
-      }
-      let content = redactSecrets(normalized).slice(0, 200);
-      if (PRIVATE_KEY_BEGIN.test(normalized)) {
-        insidePrivateKey = !PRIVATE_KEY_END.test(normalized);
-        content = "[REDACTED PRIVATE KEY]";
+      let content = redactSecrets(normalizeText(text)).slice(0, 200);
+      if (keyLines.has(line)) {
+        if (maskedKey) continue;
+        maskedKey = true;
+        content = PRIVATE_KEY_MASK;
+      } else {
+        maskedKey = false;
       }
       const entry = `${path}:${line}: ${content}`;
       if (used + entry.length > maxChars) return parts.join("\n");

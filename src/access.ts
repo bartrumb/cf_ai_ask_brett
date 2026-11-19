@@ -6,6 +6,15 @@ import { z } from "zod";
 
 /** How long fetched signing keys are reused within one isolate. */
 const KEY_CACHE_MS = 10 * 60 * 1000;
+/** How long a failed key download is remembered, so an outage cannot multiply requests. */
+const KEY_FAILURE_CACHE_MS = 30 * 1000;
+/** Minimum key age before an unknown key ID may trigger one refresh. */
+const KEY_REFRESH_MIN_AGE_MS = 60 * 1000;
+
+/** Set by the Worker for the agent. Client-supplied values are always removed first. */
+export const ACCESS_EXPIRES_HEADER = "x-codex-guard-access-expires";
+/** Carries the verified Access email to the agent. */
+export const ACCESS_EMAIL_HEADER = "x-codex-guard-access-email";
 
 const jwtHeaderSchema = z.object({ alg: z.literal("RS256"), kid: z.string().min(1).max(200) });
 const jwtPayloadSchema = z.object({
@@ -13,6 +22,7 @@ const jwtPayloadSchema = z.object({
   iss: z.string(),
   exp: z.number(),
   nbf: z.number().optional(),
+  email: z.email().max(254).optional(),
 });
 const certificatesSchema = z.object({
   keys: z.array(z.looseObject({ kid: z.string(), kty: z.literal("RSA") })).max(20),
@@ -26,7 +36,15 @@ export interface AccessConfig {
   audience: string;
 }
 
-let cachedKeys: { teamDomain: string; expires: number; keys: z.infer<typeof certificatesSchema>["keys"] } | null = null;
+/** Verified facts from an Access token. */
+export interface AccessIdentity {
+  /** Token expiry in Unix seconds. */
+  expiresAt: number;
+  email: string | null;
+}
+
+type SigningKeys = z.infer<typeof certificatesSchema>["keys"];
+let cachedKeys: { teamDomain: string; fetchedAt: number; expires: number; keys: SigningKeys | null } | null = null;
 
 /** Clears cached signing keys. Tests use this between key pairs. */
 export function resetAccessKeyCache(): void {
@@ -44,43 +62,62 @@ function decodeJson(segment: string): unknown {
   return JSON.parse(new TextDecoder().decode(decodeSegment(segment)));
 }
 
-/** Loads the team's public signing keys, using the short-lived cache when possible. */
-async function loadKeys(teamDomain: string, fetcher: typeof fetch) {
-  if (cachedKeys?.teamDomain === teamDomain && cachedKeys.expires > Date.now()) return cachedKeys.keys;
-  const response = await fetcher(`https://${teamDomain}.cloudflareaccess.com/cdn-cgi/access/certs`);
-  if (!response.ok) throw new Error("Access signing keys are unavailable.");
-  const { keys } = certificatesSchema.parse(await response.json());
-  cachedKeys = { teamDomain, keys, expires: Date.now() + KEY_CACHE_MS };
-  return keys;
+/** Downloads signing keys and remembers either the keys or the failure. */
+async function fetchKeys(teamDomain: string, fetcher: typeof fetch): Promise<SigningKeys> {
+  const now = Date.now();
+  try {
+    const response = await fetcher(`https://${teamDomain}.cloudflareaccess.com/cdn-cgi/access/certs`);
+    if (!response.ok) throw new Error("Access signing keys are unavailable.");
+    const { keys } = certificatesSchema.parse(await response.json());
+    cachedKeys = { teamDomain, keys, fetchedAt: now, expires: now + KEY_CACHE_MS };
+    return keys;
+  } catch (error) {
+    cachedKeys = { teamDomain, keys: null, fetchedAt: now, expires: now + KEY_FAILURE_CACHE_MS };
+    throw error;
+  }
+}
+
+/**
+ * Finds a signing key. An unknown ID causes at most one refresh per minute, so rotated keys work
+ * quickly while made-up IDs cannot force repeated downloads.
+ */
+async function findKey(teamDomain: string, kid: string, fetcher: typeof fetch) {
+  const cached = cachedKeys?.teamDomain === teamDomain && cachedKeys.expires > Date.now() ? cachedKeys : null;
+  if (cached && !cached.keys) throw new Error("Access signing keys are unavailable.");
+  const keys = cached?.keys ?? (await fetchKeys(teamDomain, fetcher));
+  const key = keys.find((item) => item.kid === kid);
+  if (key || !cached || Date.now() - cached.fetchedAt < KEY_REFRESH_MIN_AGE_MS) return key;
+  return (await fetchKeys(teamDomain, fetcher)).find((item) => item.kid === kid);
 }
 
 /**
  * Checks signature, issuer, audience and time limits.
  *
- * @returns True only for a currently valid token. Malformed tokens and key failures return false,
- * so every failure denies access.
+ * @returns The verified identity, or null for any invalid token or key failure, so every failure
+ * denies access.
  */
-export async function verifyAccessToken(token: string | null, config: AccessConfig, fetcher: typeof fetch = fetch): Promise<boolean> {
-  if (!token || token.length > 8_192) return false;
+export async function verifyAccessToken(token: string | null, config: AccessConfig, fetcher: typeof fetch = fetch): Promise<AccessIdentity | null> {
+  if (!token || token.length > 8_192) return null;
   try {
     const teamDomain = teamDomainSchema.parse(config.teamDomain);
     const [rawHeader, rawPayload, rawSignature, extra] = token.split(".");
-    if (!rawHeader || !rawPayload || !rawSignature || extra !== undefined) return false;
+    if (!rawHeader || !rawPayload || !rawSignature || extra !== undefined) return null;
     const header = jwtHeaderSchema.parse(decodeJson(rawHeader));
     const payload = jwtPayloadSchema.parse(decodeJson(rawPayload));
 
     const now = Date.now() / 1000;
     const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-    if (payload.exp <= now || (payload.nbf ?? 0) > now + 60) return false;
-    if (payload.iss !== `https://${teamDomain}.cloudflareaccess.com` || !audiences.includes(config.audience)) return false;
+    if (payload.exp <= now || (payload.nbf ?? 0) > now + 60) return null;
+    if (payload.iss !== `https://${teamDomain}.cloudflareaccess.com` || !audiences.includes(config.audience)) return null;
 
-    const jwk = (await loadKeys(teamDomain, fetcher)).find((key) => key.kid === header.kid);
-    if (!jwk) return false;
+    const jwk = await findKey(teamDomain, header.kid, fetcher);
+    if (!jwk) return null;
     const algorithm = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
     const key = await crypto.subtle.importKey("jwk", jwk as JsonWebKey, algorithm, false, ["verify"]);
     const signed = new TextEncoder().encode(`${rawHeader}.${rawPayload}`);
-    return await crypto.subtle.verify(algorithm, key, decodeSegment(rawSignature), signed);
+    const valid = await crypto.subtle.verify(algorithm, key, decodeSegment(rawSignature), signed);
+    return valid ? { expiresAt: payload.exp, email: payload.email ?? null } : null;
   } catch {
-    return false;
+    return null;
   }
 }

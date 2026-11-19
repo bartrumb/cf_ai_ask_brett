@@ -258,6 +258,8 @@ function findingRow(review: ReviewRecord, finding: Finding): HTMLElement {
     action = h("span", { class: "finding-state" }, reason ? `Exception applied: ${reason}` : "Exception applied");
   } else if (!finding.waivable) {
     action = h("span", { class: "finding-state" }, "Cannot be waived");
+  } else if (finding.path.startsWith("(") || finding.path.includes("[REDACTED")) {
+    action = h("span", { class: "finding-state" }, "Fix the change to resolve this finding.");
   } else if (hasExceptionOnFile(finding)) {
     action = h("span", { class: "finding-state" }, "Exception recorded. It applies from the next review.");
   } else {
@@ -492,7 +494,8 @@ async function refresh(): Promise<void> {
     refreshInFlight = false;
     if (refreshQueued) {
       refreshQueued = false;
-      void refresh().catch(reportFailure);
+      // Bursts of changes are limited to about four refreshes each second.
+      setTimeout(() => void refresh().catch(reportFailure), 250);
     }
   }
 }

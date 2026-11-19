@@ -3,7 +3,7 @@
  * Wrangler binds. Static assets are served by the platform; only `/agents/*` reaches this code.
  */
 import { routeAgentRequest } from "agents";
-import { verifyAccessToken } from "./access";
+import { ACCESS_EMAIL_HEADER, ACCESS_EXPIRES_HEADER, verifyAccessToken, type AccessIdentity } from "./access";
 import { repositoryNameSchema } from "./domain/schemas";
 import { isOffline } from "./llm";
 
@@ -34,14 +34,26 @@ function hasAllowedOrigin(request: Request, url: URL): boolean {
  * offline mode or an explicit local override may connect, so a deployment that can spend money and
  * expose repository memory fails closed.
  */
-async function authorize(request: Request, env: Env): Promise<Response | null> {
+async function authorize(request: Request, env: Env): Promise<{ denied: Response } | { identity: AccessIdentity | null }> {
   if (env.ACCESS_TEAM_DOMAIN && env.ACCESS_AUD) {
     const token = request.headers.get("Cf-Access-Jwt-Assertion");
-    const valid = await verifyAccessToken(token, { teamDomain: env.ACCESS_TEAM_DOMAIN, audience: env.ACCESS_AUD });
-    return valid ? null : new Response("Unauthorized", { status: 401 });
+    const identity = await verifyAccessToken(token, { teamDomain: env.ACCESS_TEAM_DOMAIN, audience: env.ACCESS_AUD });
+    return identity ? { identity } : { denied: new Response("Unauthorized", { status: 401 }) };
   }
-  if (isOffline(env) || env.ALLOW_UNAUTHENTICATED_AI === "true") return null;
-  return new Response("Cloudflare Access is not configured", { status: 503 });
+  if (isOffline(env) || env.ALLOW_UNAUTHENTICATED_AI === "true") return { identity: null };
+  return { denied: new Response("Cloudflare Access is not configured", { status: 503 }) };
+}
+
+/**
+ * Rebuilds the request for the agent. Client values for internal headers and the SDK's lifecycle
+ * header are removed, so only the Worker can supply identity to the Durable Object.
+ */
+function forwardRequest(request: Request, identity: AccessIdentity | null): Request {
+  const headers = new Headers(request.headers);
+  for (const name of [ACCESS_EXPIRES_HEADER, ACCESS_EMAIL_HEADER, "x-agents-lifecycle-props"]) headers.delete(name);
+  if (identity) headers.set(ACCESS_EXPIRES_HEADER, String(identity.expiresAt));
+  if (identity?.email) headers.set(ACCESS_EMAIL_HEADER, identity.email);
+  return new Request(request, { headers });
 }
 
 /**
@@ -61,14 +73,15 @@ export default {
       return new Response("WebSocket required", { status: 426 });
     }
     if (!hasAllowedOrigin(request, url)) return new Response("Forbidden", { status: 403 });
-    const denied = await authorize(request, env);
-    if (denied) return denied;
 
     // The header is absent in local development, where all connections share one key.
     const client = request.headers.get("CF-Connecting-IP") ?? "local";
     const { success } = await env.CONNECT_LIMIT.limit({ key: client });
     if (!success) return new Response("Too many connections", { status: 429 });
 
-    return (await routeAgentRequest(request, env)) ?? new Response("Not found", { status: 404 });
+    const access = await authorize(request, env);
+    if ("denied" in access) return access.denied;
+
+    return (await routeAgentRequest(forwardRequest(request, access.identity), env)) ?? new Response("Not found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;

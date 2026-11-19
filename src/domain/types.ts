@@ -31,6 +31,8 @@ export interface ExceptionRecord {
   reason: string;
   reviewId: string;
   createdAt: number;
+  /** Verified Access email of the person who accepted it, when available. */
+  createdBy?: string | null;
 }
 
 /** One standard matched on one path. `id` is unique only within its review. */

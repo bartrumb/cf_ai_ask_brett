@@ -7,11 +7,12 @@
  * only the `@callable` methods allowed by `domain/schemas.ts`; the Workflow calls the others.
  */
 import { Think, type ChatResponseResult, type StepContext, type TurnConfig, type TurnContext } from "@cloudflare/think";
-import { callable, getAgentByName, type Connection, type WSMessage } from "agents";
+import { callable, getAgentByName, getCurrentAgent, type Connection, type ConnectionContext, type WSMessage } from "agents";
+import { ACCESS_EMAIL_HEADER, ACCESS_EXPIRES_HEADER } from "./access";
 import { buildSpokenReview, decodeWav, toSpokenText } from "./domain/audio";
 import { normalizeText, parseChange } from "./domain/input";
 import { buildQuestionPrompt, offlineAnswer } from "./domain/prompt";
-import { containsInjectionLanguage, createStreamRedactor, describeChange, redactSecrets } from "./domain/rules";
+import { containsInjectionLanguage, createStreamRedactor, describeChange, isExceptionPath, redactSecrets } from "./domain/rules";
 import {
   acceptExceptionSchema,
   allowedClientFrameId,
@@ -76,6 +77,15 @@ const FRAME_BURST = 60;
 const FRAME_REFILL_PER_SECOND = 6;
 /** Think chat frames. This client does not use them, and they would carry raw model output. */
 const CHAT_PROTOCOL_FRAME = /^\{"type":"cf_agent_(?:use_chat|chat)_/;
+/** Completed Think submissions are kept this long so retries stay idempotent. */
+const SUBMISSION_RETENTION_MS = 7 * 24 * HOUR_MS;
+/** Snapshot reads have their own budget, so background refreshes cannot block user actions. */
+const SNAPSHOT_FRAME = /"method":"getSnapshot"/;
+/** Identity saved on a connection by the Worker's verified headers. */
+interface ConnectionIdentity {
+  accessExpiresAt?: number;
+  accessEmail?: string | null;
+}
 const STEP_NAMES: readonly StepName[] = ["intake", "rules", "commentary", "save"];
 /** Stored as the answer when a question turn fails or produces no text. */
 const UNAVAILABLE_ANSWER = "The model is unavailable right now. Rule results are unaffected.";
@@ -117,6 +127,7 @@ function toException(row: Row): ExceptionRecord {
     reason: String(row.reason),
     reviewId: String(row.review_id),
     createdAt: Number(row.created_at),
+    createdBy: (row.created_by as string | null) ?? null,
   };
 }
 
@@ -167,7 +178,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   /** Blocks a second question while the first is being written to Think's inbox. */
   private submittingQuestion = false;
   /** Per-connection call budgets. They are advisory and reset if the object is evicted. */
-  private frameBudgets = new WeakMap<Connection, { tokens: number; updatedAt: number }>();
+  private frameBudgets = new WeakMap<Connection, Record<"action" | "read", { tokens: number; updatedAt: number }>>();
 
   /**
    * Think installs its chat protocol handler immediately before calling
@@ -175,11 +186,31 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
    * Rejected frames get no reply. Allowed calls over the connection budget get an RPC error.
    */
   private installClientFrameFilter(): void {
+    const handleConnect = this.onConnect.bind(this);
+    this.onConnect = async (connection: Connection, context: ConnectionContext) => {
+      // Think sends its transcript directly on connect, so broadcast filtering does not cover it.
+      const send = connection.send.bind(connection);
+      connection.send = (message) => {
+        if (typeof message !== "string" || !CHAT_PROTOCOL_FRAME.test(message)) send(message);
+      };
+      const expires = Number(context.request.headers.get(ACCESS_EXPIRES_HEADER));
+      if (expires > 0) {
+        connection.setState({ accessExpiresAt: expires, accessEmail: context.request.headers.get(ACCESS_EMAIL_HEADER) });
+      }
+      return handleConnect(connection, context);
+    };
+
     const handleMessage = this.onMessage.bind(this);
     this.onMessage = async (connection: Connection, message: WSMessage) => {
+      const identity = connection.state as ConnectionIdentity | null;
+      if (identity?.accessExpiresAt && identity.accessExpiresAt <= Date.now() / 1000) {
+        connection.close(4401, "Access expired");
+        return;
+      }
+      const small = typeof message === "string" && message.length <= MAX_REJECTED_FRAME_CHARS;
+      const kind = small && SNAPSHOT_FRAME.test(message) ? "read" : "action";
       // The budget is checked first so an over-limit connection cannot force large frames to parse.
-      if (!this.takeFrameToken(connection)) {
-        const small = typeof message === "string" && message.length <= MAX_REJECTED_FRAME_CHARS;
+      if (!this.takeFrameToken(connection, kind)) {
         const id = small ? allowedClientFrameId(message) : null;
         if (id !== null) connection.send(JSON.stringify({ type: "rpc", id, success: false, error: "Too many requests." }));
         return;
@@ -189,13 +220,17 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     };
   }
 
-  /** Spends one token from the connection's refilling budget. */
-  private takeFrameToken(connection: Connection): boolean {
+  /** Spends one token from the connection's refilling budget for this kind of call. */
+  private takeFrameToken(connection: Connection, kind: "action" | "read"): boolean {
     const now = Date.now();
-    const budget = this.frameBudgets.get(connection) ?? { tokens: FRAME_BURST, updatedAt: now };
+    const budgets = this.frameBudgets.get(connection) ?? {
+      action: { tokens: FRAME_BURST, updatedAt: now },
+      read: { tokens: FRAME_BURST, updatedAt: now },
+    };
+    this.frameBudgets.set(connection, budgets);
+    const budget = budgets[kind];
     budget.tokens = Math.min(FRAME_BURST, budget.tokens + ((now - budget.updatedAt) / 1000) * FRAME_REFILL_PER_SECOND);
     budget.updatedAt = now;
-    this.frameBudgets.set(connection, budget);
     if (budget.tokens < 1) return false;
     budget.tokens -= 1;
     return true;
@@ -224,7 +259,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
       review_id TEXT PRIMARY KEY, text TEXT NOT NULL)`;
     this.sql`CREATE TABLE IF NOT EXISTS exceptions (
       id TEXT PRIMARY KEY, standard_id TEXT NOT NULL, path TEXT NOT NULL, reason TEXT NOT NULL,
-      review_id TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE (standard_id, path))`;
+      review_id TEXT NOT NULL, created_at INTEGER NOT NULL, created_by TEXT, UNIQUE (standard_id, path))`;
     this.sql`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe_key TEXT NOT NULL UNIQUE, role TEXT NOT NULL,
       kind TEXT NOT NULL, text TEXT NOT NULL, review_id TEXT, source TEXT, model TEXT,
@@ -336,6 +371,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     this.sql`INSERT OR IGNORE INTO messages (dedupe_key, role, kind, text, source, model, created_at)
       VALUES (${`answer:${result.requestId}`}, 'assistant', 'text', ${text}, ${source}, ${model}, ${Date.now()})`;
     this.publish({ activeQuestion: null });
+    this.prune();
     await this.schedule(1, "clearTranscript", {});
   }
 
@@ -385,12 +421,18 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     const [running] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews WHERE status = 'running'`;
     if ((running?.count ?? 0) > 0) return { ok: false, error: "A review is already running for this repository." };
 
-    if (!(await this.allowSharedAiSpend())) return { ok: false, error: "The service is busy. Try again shortly." };
     const hourAgo = Date.now() - HOUR_MS;
     const [recent] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews WHERE created_at > ${hourAgo}`;
     if ((recent?.count ?? 0) >= MAX_REVIEWS_PER_HOUR) {
       return { ok: false, error: "This repository reached its hourly review limit. Try again later." };
     }
+    if (!(await this.allowSharedAiSpend())) return { ok: false, error: "The service is busy. Try again shortly." };
+
+    // Other requests can run during the await above, so both start conditions are checked again.
+    const [raced] = this.sql<{ id: string }>`SELECT id FROM reviews WHERE request_id = ${requestId}`;
+    if (raced) return { ok: true, reviewId: raced.id };
+    const [runningNow] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews WHERE status = 'running'`;
+    if ((runningNow?.count ?? 0) > 0) return { ok: false, error: "A review is already running for this repository." };
 
     const reviewId = crypto.randomUUID();
     const now = Date.now();
@@ -432,6 +474,10 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     if (!findStandard(finding.standardId)?.waivable) {
       return { ok: false, error: `${finding.standardId} cannot be waived. Fix the change instead.` };
     }
+    if (!isExceptionPath(finding.path)) {
+      return { ok: false, error: "This finding has no specific file to except. Fix the change instead." };
+    }
+    const actor = getCurrentAgent().connection?.state as ConnectionIdentity | null | undefined;
     const exception: ExceptionRecord = {
       id: crypto.randomUUID(),
       standardId: finding.standardId,
@@ -439,12 +485,14 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
       reason: redactSecrets(reason),
       reviewId,
       createdAt: Date.now(),
+      createdBy: actor?.accessEmail ?? null,
     };
-    this.sql`INSERT INTO exceptions (id, standard_id, path, reason, review_id, created_at)
+    this.sql`INSERT INTO exceptions (id, standard_id, path, reason, review_id, created_at, created_by)
       VALUES (${exception.id}, ${exception.standardId}, ${exception.path}, ${exception.reason},
-              ${exception.reviewId}, ${exception.createdAt})
+              ${exception.reviewId}, ${exception.createdAt}, ${exception.createdBy ?? null})
       ON CONFLICT (standard_id, path) DO UPDATE SET
-        id = excluded.id, reason = excluded.reason, review_id = excluded.review_id, created_at = excluded.created_at`;
+        id = excluded.id, reason = excluded.reason, review_id = excluded.review_id,
+        created_at = excluded.created_at, created_by = excluded.created_by`;
     this.publish();
     return { ok: true, exception };
   }
@@ -458,6 +506,8 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   revokeException(raw: unknown): ActionResult {
     const input = parseInput(revokeExceptionSchema, raw);
     if (!input.ok) return input;
+    const [existing] = this.sql`SELECT id FROM exceptions WHERE id = ${input.data.id}`;
+    if (!existing) return { ok: true };
     this.sql`DELETE FROM exceptions WHERE id = ${input.data.id}`;
     this.publish();
     return { ok: true };
@@ -503,7 +553,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
         return { ok: false, error: "The previous question is still being answered." };
       }
     }
-    this.submittingQuestion = true;
+    if (!known) this.submittingQuestion = true;
     try {
       if (!known && !(await this.reserveAiAction())) {
         return { ok: false, error: "This repository reached its hourly AI limit." };
@@ -519,7 +569,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
       if (submission.accepted) this.publish({ activeQuestion: { submissionId: submission.submissionId } });
       return { ok: true, submissionId: submission.submissionId, accepted: submission.accepted };
     } finally {
-      this.submittingQuestion = false;
+      if (!known) this.submittingQuestion = false;
     }
   }
 
@@ -584,6 +634,11 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     for (const { id } of rows) await this.launchReview(id, true);
   }
 
+  /** Charges a commentary retry, because each attempt can make new model calls. */
+  allowCommentaryRetry(): Promise<boolean> {
+    return this.allowSharedAiSpend();
+  }
+
   /**
    * Claims one unit of today's account-wide AI budget. Runs only on the internal budget instance,
    * and is not client-callable.
@@ -614,7 +669,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
       await this.schedule(IDLE_CHECK_SECONDS, "expireIdleData", {});
       return;
     }
-    for (const submission of await this.listSubmissions()) await this.deleteSubmission(submission.submissionId);
+    while ((await this.deleteSubmissions({ limit: 100 })) > 0);
     await this.session.clearMessages();
     await this.syncMessagesFromStorage();
     this.sql`DELETE FROM reviews`;
@@ -637,6 +692,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
       await this.schedule(5, "clearTranscript", {});
       return;
     }
+    await this.deleteSubmissions({ completedBefore: new Date(Date.now() - SUBMISSION_RETENTION_MS) });
     await this.session.clearMessages();
     await this.syncMessagesFromStorage();
   }
@@ -809,16 +865,17 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   }
 
   /**
-   * Claims one slot in the repository's hourly budget and in the shared per-minute ceiling.
+   * Claims one slot in the repository's hourly budget and then the shared budgets. Local refusal
+   * comes first, so a repository at its limit cannot drain the shared budget.
    *
    * @returns False when either budget is used up. A claimed slot is never returned.
    */
   private async reserveAiAction(): Promise<boolean> {
-    if (!(await this.allowSharedAiSpend())) return false;
     const hourAgo = Date.now() - HOUR_MS;
     this.sql`DELETE FROM ai_actions WHERE created_at <= ${hourAgo}`;
     const [used] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM ai_actions`;
     if ((used?.count ?? 0) >= MAX_AI_ACTIONS_PER_HOUR) return false;
+    if (!(await this.allowSharedAiSpend())) return false;
     this.sql`INSERT INTO ai_actions (created_at) VALUES (${Date.now()})`;
     return true;
   }

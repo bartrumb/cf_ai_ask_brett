@@ -79,11 +79,56 @@ describe("secret detection and redaction", () => {
     expect(excerpt).toContain("key.pem:4: after");
   });
 
-  it("masks secrets split across streamed chunks", () => {
-    const redactor = createStreamRedactor();
-    const output = [redactor.push(`${"safe ".repeat(60)}token = "abcd`), redactor.push(`efghijkl" ${"more ".repeat(60)}`), redactor.finish()].join("");
-    expect(output).not.toContain("abcdefghijkl");
-    expect(output).toContain("[REDACTED]");
+  it.each([
+    ["Bearer", `Authorization: Bearer ${"a".repeat(32)}`, "a".repeat(32)],
+    ["a password", "password = hunter2hunter2", "hunter2hunter2"],
+    ["a quoted token", 'token: "abcdefghijkl"', "abcdefghijkl"],
+    ["a private key", `-----BEGIN ${"PRIVATE"} KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw`, "MIIEvQIBADAN"],
+  ])("masks %s split across streamed chunks", (_name, secret, value) => {
+    for (const size of [1, 5, 13]) {
+      const text = `${"safe ".repeat(150)}${secret} ${"more ".repeat(150)}`;
+      const redactor = createStreamRedactor();
+      let output = "";
+      for (let index = 0; index < text.length; index += size) output += redactor.push(text.slice(index, index + size));
+      output += redactor.finish();
+      expect(output).not.toContain(value);
+    }
+  });
+
+  it.each([
+    ["a rotated key", ` -----BEGIN ${"PRIVATE"} KEY-----`, "-OLDVALUE", "+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw", ` -----END ${"PRIVATE"} KEY-----`],
+    ["a rotated PGP key", ` -----BEGIN PGP ${"PRIVATE"} KEY BLOCK-----`, "-OLDVALUE", "+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw", ` -----END PGP ${"PRIVATE"} KEY BLOCK-----`],
+  ])("flags and hides %s", (_name, begin, removed, added, end) => {
+    const text = ["--- a/key.pem", "+++ b/key.pem", "@@ -1,3 +1,3 @@", begin, removed, added, end].join("\n");
+    const change = parsed(text);
+    const result = evaluateChange(change, context);
+    expect(result).toMatchObject({ risk: "critical" });
+    expect(JSON.stringify(result)).not.toContain("MIIEvQIBADAN");
+    expect(buildExcerpt(change)).not.toContain("MIIEvQIBADAN");
+  });
+
+  it.each([
+    ["DB_PASS=Hunter2Hunter2"],
+    ["PRIVATE_KEY=abc123def456ghi789"],
+    ["password=Pa$$w0rd12345"],
+    ["API_KEY=abc.def-1234567890"],
+    ["secret=foo(bar)12345678"],
+    ["password=correcthorsebatterystaple"],
+    [`sk_live_${"a".repeat(24)}`],
+    [`AIza${"a".repeat(35)}`],
+    [`glpat-${"a".repeat(20)}`],
+    [`npm_${"a".repeat(36)}`],
+    [`https://hooks.slack.com/services/${"A".repeat(24)}`],
+    [`authorization: bearer ${"a".repeat(24)}`],
+    ["Authorization: Basic dXNlcjpwYXNz"],
+    ["postgres://admin:p/ss1234@db/x"],
+  ])("flags and masks additional format %s", (line) => {
+    expect(ids(diffFor("src/config.txt", [line]))).toContain("STD-SEC-01");
+    expect(redactSecrets(line)).not.toBe(line);
+  });
+
+  it.each([["bypass_mode = strict-all"], ["token_count = 12345678"], ["tokenizer: gpt2-large"], ["registry = https://host:443/@scope/pkg"]])("does not flag %s", (line) => {
+    expect(ids(diffFor("src/config.txt", [line]))).toEqual([]);
   });
 });
 
@@ -190,8 +235,8 @@ describe("Cloudflare Access", () => {
 
   it("accepts a valid token and caches signing keys", async () => {
     const { fetcher, sign } = await setup();
-    expect(await verifyAccessToken(await sign(), config, fetcher)).toBe(true);
-    expect(await verifyAccessToken(await sign({ aud: config.audience }), config, fetcher)).toBe(true);
+    expect(await verifyAccessToken(await sign({ email: "person@example.com" }), config, fetcher)).toMatchObject({ email: "person@example.com" });
+    expect(await verifyAccessToken(await sign({ aud: config.audience }), config, fetcher)).toMatchObject({ email: null });
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
@@ -204,20 +249,52 @@ describe("Cloudflare Access", () => {
     ["an unsigned algorithm", {}, { alg: "none" }],
   ])("rejects %s", async (_name, claims, header) => {
     const { fetcher, sign } = await setup();
-    expect(await verifyAccessToken(await sign(claims, header), config, fetcher)).toBe(false);
+    expect(await verifyAccessToken(await sign(claims, header), config, fetcher)).toBeNull();
   });
 
   it("rejects tampering, malformed tokens, unsafe teams and key failures", async () => {
     const { fetcher, sign } = await setup();
     const [head, , signature] = (await sign()).split(".");
-    expect(await verifyAccessToken(`${head}.${encode({ aud: config.audience })}.${signature}`, config, fetcher)).toBe(false);
-    expect(await verifyAccessToken(null, config, fetcher)).toBe(false);
-    expect(await verifyAccessToken("a.b", config, fetcher)).toBe(false);
-    expect(await verifyAccessToken("a.b.c.d", config, fetcher)).toBe(false);
-    expect(await verifyAccessToken(await sign(), { ...config, teamDomain: "evil.example/x" }, fetcher)).toBe(false);
+    expect(await verifyAccessToken(`${head}.${encode({ aud: config.audience })}.${signature}`, config, fetcher)).toBeNull();
+    expect(await verifyAccessToken(null, config, fetcher)).toBeNull();
+    expect(await verifyAccessToken("a.b", config, fetcher)).toBeNull();
+    expect(await verifyAccessToken("a.b.c.d", config, fetcher)).toBeNull();
+    expect(await verifyAccessToken(await sign(), { ...config, teamDomain: "evil.example/x" }, fetcher)).toBeNull();
     resetAccessKeyCache();
     const failing = (async () => new Response("no", { status: 500 })) as unknown as typeof fetch;
-    expect(await verifyAccessToken(await sign(), config, failing)).toBe(false);
+    expect(await verifyAccessToken(await sign(), config, failing)).toBeNull();
+    const counted = vi.fn(failing);
+    expect(await verifyAccessToken(await sign(), config, counted as unknown as typeof fetch)).toBeNull();
+    expect(counted).not.toHaveBeenCalled();
+  });
+
+  it("closes a connection when its Access token expires and ignores spoofed identity", async () => {
+    const access = { ACCESS_TEAM_DOMAIN: config.teamDomain, ACCESS_AUD: config.audience };
+    const { fetcher, sign } = await setup();
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetcher);
+    const token = await sign({ exp: Date.now() / 1000 + 1.5, email: "person@example.com" });
+    const response = await connect(access, { "Cf-Access-Jwt-Assertion": token, "x-codex-guard-access-expires": "9999999999" });
+    const socket = response.webSocket;
+    if (!socket) throw new Error("Expected a WebSocket.");
+    let closed = 0;
+    socket.addEventListener("close", (event) => { closed = event.code; });
+    socket.accept();
+    await new Promise((resolve) => setTimeout(resolve, 1_700));
+    socket.send(JSON.stringify({ type: "rpc", id: "late", method: "getSnapshot", args: [] }));
+    await until(() => closed === 4401);
+  });
+
+  it("does not accept lifecycle or identity headers from clients", async () => {
+    const response = await connect({}, { "x-agents-lifecycle-props": "{bad", "x-codex-guard-access-expires": "1" });
+    expect(response.status).toBe(101);
+    const socket = response.webSocket;
+    if (!socket) throw new Error("Expected a WebSocket.");
+    const frames: string[] = [];
+    socket.addEventListener("message", (event) => frames.push(String(event.data)));
+    socket.accept();
+    socket.send(JSON.stringify({ type: "rpc", id: "ok", method: "getSnapshot", args: [] }));
+    await until(() => frames.some((frame) => frame.includes('"id":"ok"') && frame.includes('"success":true')));
+    socket.close();
   });
 
   const connect = (overrides: Partial<Env>, headers: Record<string, string> = {}) =>
@@ -333,6 +410,41 @@ describe("agent hardening", () => {
       expect(state.storage.sql.exec("SELECT id FROM messages").toArray()).toHaveLength(0);
       expect(await instance.listSubmissions()).toEqual([]);
       await instance.expireIdleData();
+    });
+  });
+
+  it("starts one review from concurrent requests", async () => {
+    const agent = await agentFor();
+    const results = await Promise.all([
+      agent.startReview({ text: OPEN_INGRESS, requestId: crypto.randomUUID() }),
+      agent.startReview({ text: OPEN_INGRESS, requestId: crypto.randomUUID() }),
+    ]);
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    await until(async () => (await agent.getSnapshot()).reviews.every((review) => review.status === "complete"));
+  });
+
+  it("does not spend shared budget once a repository is at its limit", async () => {
+    const agent = await agentFor();
+    const audio = wavBase64();
+    await runInDurableObject(agent, async (instance, state) => {
+      for (let index = 0; index < 60; index += 1) state.storage.sql.exec("INSERT INTO ai_actions (created_at) VALUES (?)", Date.now());
+      const limit = vi.fn(async () => ({ success: true }));
+      (instance as unknown as { env: Env }).env = { ...instance["env"], AI_ACTION_LIMIT: { limit } as never };
+      expect((await instance.transcribe({ audio })).ok).toBe(false);
+      expect(limit).not.toHaveBeenCalled();
+    });
+  });
+
+  it("refuses broad exceptions and does not publish unknown revocations", async () => {
+    const agent = await agentFor();
+    await runInDurableObject(agent, async (instance, state) => {
+      const result = { kind: "summary", risk: "high", riskBeforeExceptions: "high", applicableStandards: [], stats: { files: 0, additions: 0, deletions: 0 }, notes: [], findings: [{ id: "F1", standardId: "STD-DB-01", standardTitle: "x", severity: "high", path: "(summary)", line: 1, evidence: "x", occurrences: 1, waivable: true, status: "open", exceptionId: null }] };
+      const reviewId = crypto.randomUUID();
+      state.storage.sql.exec("INSERT INTO reviews (id, request_id, created_at, status, title, result_json) VALUES (?, ?, ?, 'complete', 'x', ?)", reviewId, crypto.randomUUID(), Date.now(), JSON.stringify(result));
+      expect((instance.acceptException({ reviewId, findingId: "F1", reason: "Broad exception attempt." })).ok).toBe(false);
+      const before = instance.state.revision;
+      expect(instance.revokeException({ id: crypto.randomUUID() }).ok).toBe(true);
+      expect(instance.state.revision).toBe(before);
     });
   });
 

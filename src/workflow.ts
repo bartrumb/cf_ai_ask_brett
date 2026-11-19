@@ -85,7 +85,12 @@ export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams,
       commentary = await step.do(
         "write-ai-commentary",
         { retries: { limit: 2, delay: "2 seconds", backoff: "exponential" }, timeout: "3 minutes" },
-        () => this.writeCommentary(reviewId, repository, result, rules.excerpt),
+        async (context) => {
+          if (context.attempt > 1 && !(await this.agent.allowCommentaryRetry())) {
+            throw new NonRetryableError("The AI budget does not allow another attempt.");
+          }
+          return this.writeCommentary(reviewId, repository, result, rules.excerpt);
+        },
       );
     } catch (error) {
       console.error("commentary failed", error instanceof Error ? error.message : "unknown error");
