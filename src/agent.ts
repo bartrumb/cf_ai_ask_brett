@@ -7,7 +7,7 @@
  * only the `@callable` methods allowed by `domain/schemas.ts`; the Workflow calls the others.
  */
 import { Think, type ChatResponseResult, type StepContext, type TurnConfig, type TurnContext } from "@cloudflare/think";
-import { callable, type Connection, type WSMessage } from "agents";
+import { callable, getAgentByName, type Connection, type WSMessage } from "agents";
 import { buildSpokenReview, decodeWav, toSpokenText } from "./domain/audio";
 import { normalizeText, parseChange } from "./domain/input";
 import { buildQuestionPrompt, offlineAnswer } from "./domain/prompt";
@@ -58,6 +58,16 @@ const STALE_REVIEW_MS = 20 * 60 * 1000;
 /** Length of the rolling rate-limit window. */
 const HOUR_MS = 60 * 60 * 1000;
 /** Progress steps accepted from Workflow callbacks. */
+/** Exceptions stop applying after this long and must be accepted again. */
+const EXCEPTION_LIFETIME_MS = 90 * 24 * HOUR_MS;
+/** Repository data is deleted after this long without activity. */
+const IDLE_RETENTION_MS = 30 * 24 * HOUR_MS;
+/** How often a repository with data checks whether it has gone idle. */
+const IDLE_CHECK_SECONDS = 24 * 60 * 60;
+/** Internal instance holding the daily budget. The leading underscore is not routable. */
+const BUDGET_INSTANCE = "_daily-budget";
+/** Longest over-budget frame that is parsed in order to send an error reply. */
+const MAX_REJECTED_FRAME_CHARS = 1_024;
 /** Plain chat rows kept per repository. */
 const MAX_STORED_MESSAGES = 500;
 /** Burst of client calls allowed per connection. */
@@ -167,14 +177,15 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   private installClientFrameFilter(): void {
     const handleMessage = this.onMessage.bind(this);
     this.onMessage = async (connection: Connection, message: WSMessage) => {
-      const id = allowedClientFrameId(message);
-      if (id === null) {
-        console.warn("rejected client frame");
-      } else if (this.takeFrameToken(connection)) {
-        await handleMessage(connection, message);
-      } else {
-        connection.send(JSON.stringify({ type: "rpc", id, success: false, error: "Too many requests." }));
+      // The budget is checked first so an over-limit connection cannot force large frames to parse.
+      if (!this.takeFrameToken(connection)) {
+        const small = typeof message === "string" && message.length <= MAX_REJECTED_FRAME_CHARS;
+        const id = small ? allowedClientFrameId(message) : null;
+        if (id !== null) connection.send(JSON.stringify({ type: "rpc", id, success: false, error: "Too many requests." }));
+        return;
       }
+      if (allowedClientFrameId(message) === null) console.warn("rejected client frame");
+      else await handleMessage(connection, message);
     };
   }
 
@@ -219,6 +230,10 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
       kind TEXT NOT NULL, text TEXT NOT NULL, review_id TEXT, source TEXT, model TEXT,
       created_at INTEGER NOT NULL)`;
     this.sql`CREATE TABLE IF NOT EXISTS ai_actions (created_at INTEGER NOT NULL)`;
+    this.sql`CREATE TABLE IF NOT EXISTS daily_budget (day TEXT PRIMARY KEY, used INTEGER NOT NULL)`;
+    if (!this.getSchedules().some((schedule) => schedule.callback === "expireIdleData")) {
+      await this.schedule(IDLE_CHECK_SECONDS, "expireIdleData", {});
+    }
 
     // A review saved just before an eviction may have no Workflow yet. The launch runs as a
     // scheduled callback, so startup does not wait for Workflow creation.
@@ -370,9 +385,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     const [running] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews WHERE status = 'running'`;
     if ((running?.count ?? 0) > 0) return { ok: false, error: "A review is already running for this repository." };
 
-    if (!(await this.env.AI_ACTION_LIMIT.limit({ key: "global" })).success) {
-      return { ok: false, error: "The service is busy. Try again shortly." };
-    }
+    if (!(await this.allowSharedAiSpend())) return { ok: false, error: "The service is busy. Try again shortly." };
     const hourAgo = Date.now() - HOUR_MS;
     const [recent] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews WHERE created_at > ${hourAgo}`;
     if ((recent?.count ?? 0) >= MAX_REVIEWS_PER_HOUR) {
@@ -572,6 +585,48 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   }
 
   /**
+   * Claims one unit of today's account-wide AI budget. Runs only on the internal budget instance,
+   * and is not client-callable.
+   *
+   * @returns False when the limit has been reached.
+   */
+  consumeDailyBudget(limit: number): boolean {
+    const day = new Date().toISOString().slice(0, 10);
+    this.sql`DELETE FROM daily_budget WHERE day <> ${day}`;
+    const [row] = this.sql<{ used: number }>`SELECT used FROM daily_budget WHERE day = ${day}`;
+    if ((row?.used ?? 0) >= limit) return false;
+    this.sql`INSERT INTO daily_budget (day, used) VALUES (${day}, 1)
+      ON CONFLICT (day) DO UPDATE SET used = used + 1`;
+    return true;
+  }
+
+  /**
+   * Deletes repository data after a long idle period. Empty repositories stop checking, so unused
+   * names do not wake forever. A later connection schedules the check again.
+   */
+  async expireIdleData(): Promise<void> {
+    const [latest] = this.sql<{ at: number | null }>`SELECT MAX(at) AS at FROM (
+      SELECT MAX(created_at) AS at FROM reviews
+      UNION ALL SELECT MAX(created_at) FROM messages
+      UNION ALL SELECT MAX(created_at) FROM exceptions)`;
+    if (latest?.at == null) return;
+    if (Date.now() - latest.at < IDLE_RETENTION_MS) {
+      await this.schedule(IDLE_CHECK_SECONDS, "expireIdleData", {});
+      return;
+    }
+    for (const submission of await this.listSubmissions()) await this.deleteSubmission(submission.submissionId);
+    await this.session.clearMessages();
+    await this.syncMessagesFromStorage();
+    this.sql`DELETE FROM reviews`;
+    this.sql`DELETE FROM pending_inputs`;
+    this.sql`DELETE FROM exceptions`;
+    this.sql`DELETE FROM messages`;
+    this.sql`DELETE FROM standard_settings`;
+    this.sql`DELETE FROM ai_actions`;
+    this.publish({ active: null, activeQuestion: null });
+  }
+
+  /**
    * Removes Think's copy of finished turns. Answers are rebuilt from rule results, and the redacted
    * conversation lives in `messages`, so this keeps raw model text from being replayed or retained.
    * Think keeps submission records separately, so idempotency still works.
@@ -684,6 +739,25 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     return true;
   }
 
+  /**
+   * Applies shared limits across every repository name: a per-minute ceiling always, and a daily
+   * budget for real model calls. Budget failures deny the action.
+   */
+  private async allowSharedAiSpend(): Promise<boolean> {
+    if (!(await this.env.AI_ACTION_LIMIT.limit({ key: "global" })).success) return false;
+    if (isOffline(this.env)) return true;
+    const limit = Number(this.env.DAILY_AI_ACTION_LIMIT);
+    if (!Number.isFinite(limit) || limit <= 0) return false;
+    try {
+      const namespace = this.env.CodexGuardAgent as unknown as DurableObjectNamespace<CodexGuardAgent>;
+      const budget = await getAgentByName<Env, CodexGuardAgent>(namespace, BUDGET_INSTANCE);
+      return await budget.consumeDailyBudget(limit);
+    } catch (error) {
+      console.error("daily budget check failed", error instanceof Error ? error.message : "unknown error");
+      return false;
+    }
+  }
+
   /** True when a Workflow instance with this ID already exists. */
   private async workflowExists(reviewId: string): Promise<boolean> {
     try {
@@ -740,7 +814,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
    * @returns False when either budget is used up. A claimed slot is never returned.
    */
   private async reserveAiAction(): Promise<boolean> {
-    if (!(await this.env.AI_ACTION_LIMIT.limit({ key: "global" })).success) return false;
+    if (!(await this.allowSharedAiSpend())) return false;
     const hourAgo = Date.now() - HOUR_MS;
     this.sql`DELETE FROM ai_actions WHERE created_at <= ${hourAgo}`;
     const [used] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM ai_actions`;
@@ -764,6 +838,8 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
 
   /** Returns every recorded exception, newest first. */
   private readExceptions(): ExceptionRecord[] {
+    const cutoff = Date.now() - EXCEPTION_LIFETIME_MS;
+    this.sql`DELETE FROM exceptions WHERE created_at <= ${cutoff}`;
     return this.sql<Row>`SELECT * FROM exceptions ORDER BY created_at DESC`.map(toException);
   }
 

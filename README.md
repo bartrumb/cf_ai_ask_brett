@@ -164,4 +164,4 @@ Security details and remaining risks are in [`SECURITY.md`](./SECURITY.md).
 - Rules use patterns. They can miss a violation or flag a harmless line, so they support human review.
 - A plain-language summary is checked by its wording only, and the UI says so.
 - Everyone admitted by the Access application shares access to every repository name.
-- Exceptions match an exact standard and file path, and they do not expire on their own.
+- Exceptions match an exact standard and file path, and they expire after 90 days.

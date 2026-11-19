@@ -296,6 +296,46 @@ describe("agent hardening", () => {
     });
   });
 
+  it("stops applying exceptions after 90 days", async () => {
+    const agent = await agentFor();
+    await runInDurableObject(agent, async (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO exceptions (id, standard_id, path, reason, review_id, created_at) VALUES ('e', 'STD-SEC-02', 'infra/network.tf', 'Old approval', 'r', ?)",
+        Date.now() - 91 * 24 * 60 * 60 * 1000,
+      );
+    });
+    expect((await agent.getSnapshot()).exceptions).toEqual([]);
+  });
+
+  it("enforces the daily budget for real model calls and fails closed", async () => {
+    const agent = await agentFor();
+    const audio = wavBase64();
+    await runInDurableObject(agent, async (instance) => {
+      expect(instance.consumeDailyBudget(1)).toBe(true);
+      expect(instance.consumeDailyBudget(1)).toBe(false);
+      const setEnv = (values: Partial<Env>) => { (instance as unknown as { env: Env }).env = { ...instance["env"], ...values }; };
+      setEnv({ AI_MODE: "workers-ai", DAILY_AI_ACTION_LIMIT: "0" });
+      expect((await instance.transcribe({ audio })).ok).toBe(false);
+      setEnv({ DAILY_AI_ACTION_LIMIT: "5", CodexGuardAgent: { idFromName: () => { throw new Error("offline"); } } as never });
+      expect((await instance.transcribe({ audio })).ok).toBe(false);
+    });
+  });
+
+  it("deletes idle repository data and keeps recent data", async () => {
+    const agent = await agentFor();
+    await agent.ask({ question: "What is open?", requestId: crypto.randomUUID() });
+    await until(async () => (await agent.getSnapshot()).messages.some((message) => message.role === "assistant"));
+    await runInDurableObject(agent, async (instance, state) => {
+      await instance.expireIdleData();
+      expect(state.storage.sql.exec("SELECT id FROM messages").toArray()).toHaveLength(2);
+      state.storage.sql.exec("UPDATE messages SET created_at = ?", Date.now() - 31 * 24 * 60 * 60 * 1000);
+      await instance.expireIdleData();
+      expect(state.storage.sql.exec("SELECT id FROM messages").toArray()).toHaveLength(0);
+      expect(await instance.listSubmissions()).toEqual([]);
+      await instance.expireIdleData();
+    });
+  });
+
   it("allows only one new question at a time", async () => {
     const agent = await agentFor();
     const results = await Promise.all([

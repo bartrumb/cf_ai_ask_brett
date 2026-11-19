@@ -21,7 +21,9 @@
     // Real model mode refuses connections until both Access values are set.
     "ACCESS_TEAM_DOMAIN": "",
     "ACCESS_AUD": "",
-    "ALLOW_UNAUTHENTICATED_AI": "false"
+    "ALLOW_UNAUTHENTICATED_AI": "false",
+    // Account-wide count of metered AI actions allowed per UTC day.
+    "DAILY_AI_ACTION_LIMIT": "2000"
   },
   "durable_objects": {
     "bindings": [{ "name": "CodexGuardAgent", "class_name": "CodexGuardAgent" }]

@@ -14,7 +14,8 @@ Codex Guard treats every submitted change, transcript and model response as untr
 | Secret exposure | One shared pattern set drives detection and redaction for stored data, prompts, evidence, titles, live text and speech |
 | Raw input retention | Workflow parameters hold only IDs, and pending input is deleted when a review ends |
 | Expensive input | Input, line, path, question and audio sizes are capped. Audio must be 30 seconds or less of 16 kHz mono PCM |
-| Cost abuse | Connection, per-connection, per-repository and shared per-minute limits apply, with AI Gateway limits above them |
+| Cost abuse | Connection, per-connection, per-repository, shared per-minute and shared daily limits apply, with AI Gateway limits above them |
+| Stale authorization and data | Exceptions expire after 90 days, and repository data is deleted after 30 idle days |
 | Script injection | The UI renders text nodes only, under a restrictive Content Security Policy |
 
 ## Remaining risks
@@ -23,7 +24,6 @@ Codex Guard treats every submitted change, transcript and model response as untr
 - AI Gateway logs contain redacted prompts. Pattern-based redaction can miss an unfamiliar secret format, so do not submit real credentials.
 - Guardrails is set to flag prompt injection. It does not enforce responses on streamed requests.
 - Set an AI Gateway spend limit. The application limits slow usage but are not a dollar budget.
-- Repository data has no automatic expiry beyond the stored review and message caps.
 - Speech-to-text requests ask the gateway not to store audio payloads. Confirm this in gateway logs before handling sensitive audio.
 
 ## Handling tokens
