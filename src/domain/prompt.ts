@@ -26,7 +26,7 @@ function untrustedBlock(nonce: string, body: string): string {
 
 /**
  * Selects the rule data placed outside the untrusted block. Evidence is deliberately left out.
- * `path` is included here even though it comes from the submitted diff.
+ * File paths are also left out because the submitted diff controls them.
  */
 function trustedFacts(result: RuleResult) {
   return {
@@ -41,8 +41,6 @@ function trustedFacts(result: RuleResult) {
         standardText: standard?.summary,
         approvedFix: standard?.guidance,
         severity: finding.severity,
-        path: finding.path,
-        line: finding.line,
         occurrences: finding.occurrences,
         status: finding.status,
       };
@@ -68,7 +66,9 @@ function ground(nonce: string): string {
  * @param nonce - Delimiter suffix for the untrusted blocks.
  */
 export function buildReviewPrompt(result: RuleResult, excerpt: string, nonce: string): PromptMessage[] {
-  const evidence = result.findings.map((finding) => `${finding.id}: ${finding.evidence}`).join("\n");
+  const evidence = result.findings
+    .map((finding) => `${finding.id} at ${finding.path}${finding.line ? `:${finding.line}` : ""}: ${finding.evidence}`)
+    .join("\n");
   return [
     {
       role: "system",
@@ -170,7 +170,7 @@ export function auditCommentary(text: string, result: RuleResult): string[] {
     if (!allowed.has(id)) warnings.push(`Cites ${id}, which is not part of the rule result.`);
   }
   for (const finding of result.findings) {
-    if (finding.status === "open" && !text.includes(finding.id)) {
+    if (finding.status === "open" && !new RegExp(`\\b${finding.id}\\b`).test(text)) {
       warnings.push(`Does not address ${finding.id}.`);
     }
   }

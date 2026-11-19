@@ -10,7 +10,7 @@ import { NonRetryableError } from "cloudflare:workflows";
 import type { CodexGuardAgent } from "./agent";
 import { parseChange } from "./domain/input";
 import { auditCommentary, buildReviewPrompt, offlineCommentary } from "./domain/prompt";
-import { buildExcerpt, evaluateChange, redactSecrets } from "./domain/rules";
+import { buildExcerpt, createStreamRedactor, evaluateChange, redactSecrets } from "./domain/rules";
 import { reviewParamsSchema } from "./domain/schemas";
 import type { CommentarySource, LiveMessage, RuleResult, StepName, StepStatus } from "./domain/types";
 import { isGuardrailBlock } from "./gateway";
@@ -112,8 +112,8 @@ export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams,
   /**
    * Generates commentary while streaming batched deltas to clients.
    *
-   * Each retry starts by resetting the client's partial text. Live deltas are raw model output; only
-   * the returned text is redacted and audited.
+   * Each retry starts by resetting the client's partial text. Live and stored text are both redacted.
+   * A Guardrails block is not retried, because the same prompt would be blocked again.
    *
    * @returns Commentary ready to store, with warnings from `auditCommentary`.
    * @throws Any model failure, so the surrounding step can retry.
@@ -128,6 +128,7 @@ export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams,
     const send = (message: LiveMessage) => this.broadcastToClients(message);
     await send({ type: "commentary-reset", reviewId });
 
+    const redactor = createStreamRedactor();
     let pending = "";
     let lastFlush = 0;
     const flush = async () => {
@@ -150,11 +151,15 @@ export class ReviewWorkflow extends ThinkWorkflow<CodexGuardAgent, ReviewParams,
         ruleFlaggedInjection: result.findings.some((finding) => finding.standardId === "STD-AGT-01"),
       },
       onDelta: async (delta) => {
-        pending += delta;
+        pending += redactor.push(delta);
         if (Date.now() - lastFlush >= FLUSH_INTERVAL_MS) await flush();
       },
+    }).catch((error: unknown) => {
+      if (isGuardrailBlock(error)) throw new NonRetryableError("Prompt blocked due to security configurations");
+      throw error;
     });
-    // Sends text still held back by the flush interval.
+    // Sends text still held back by the redactor and the flush interval.
+    pending += redactor.finish();
     await flush();
 
     const text = redactSecrets(generated.text);

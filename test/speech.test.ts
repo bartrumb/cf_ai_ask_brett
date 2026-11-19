@@ -7,16 +7,9 @@ import { evaluateChange } from "../src/domain/rules";
 import { gatewayMetadata, isGuardrailBlock } from "../src/gateway";
 import { MODELS } from "../src/models";
 import { synthesizeSpeech, transcribeAudio } from "../src/speech";
-import { allStandards, FAKE_SECRET, OPEN_INGRESS, parsed } from "./fixtures";
+import { allStandards, FAKE_SECRET, OPEN_INGRESS, parsed, wavBase64 } from "./fixtures";
 
 const context = { repository: "sample-repo", feature: "speech" } as const;
-
-function wavBase64(extraBytes = 16): string {
-  const bytes = Buffer.alloc(44 + extraBytes);
-  bytes.write("RIFF", 0, "ascii");
-  bytes.write("WAVE", 8, "ascii");
-  return bytes.toString("base64");
-}
 
 interface Call {
   model: string;

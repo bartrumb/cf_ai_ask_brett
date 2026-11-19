@@ -15,7 +15,14 @@
   // Workers AI always runs on Cloudflare. `npm run dev` passes --local and
   // AI_MODE=offline so local work never reaches an account or incurs charges.
   "ai": { "binding": "AI", "remote": true },
-  "vars": { "AI_MODE": "workers-ai", "AI_GATEWAY_ID": "codex-guard" },
+  "vars": {
+    "AI_MODE": "workers-ai",
+    "AI_GATEWAY_ID": "codex-guard",
+    // Real model mode refuses connections until both Access values are set.
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": "",
+    "ALLOW_UNAUTHENTICATED_AI": "false"
+  },
   "durable_objects": {
     "bindings": [{ "name": "CodexGuardAgent", "class_name": "CodexGuardAgent" }]
   },
@@ -29,7 +36,9 @@
   ],
   // Limits how quickly one address can open agent connections.
   "ratelimits": [
-    { "name": "CONNECT_LIMIT", "namespace_id": "1101", "simple": { "limit": 30, "period": 60 } }
+    { "name": "CONNECT_LIMIT", "namespace_id": "1101", "simple": { "limit": 30, "period": 60 } },
+    // A shared ceiling on metered AI work across all repository names.
+    { "name": "AI_ACTION_LIMIT", "namespace_id": "1102", "simple": { "limit": 300, "period": 60 } }
   ],
   // Think emits turn and model spans when traces are enabled.
   "observability": {

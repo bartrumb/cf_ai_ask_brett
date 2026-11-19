@@ -43,10 +43,10 @@ export function gatewayOptions(env: Pick<Env, "AI_GATEWAY_ID">, context: Gateway
 
 /**
  * Recognizes an AI Gateway Guardrails block from error text.
- * It matches codes 2016 and 2017 as whole words anywhere in the message or its cause, or the
- * standard block wording.
+ * It matches a labeled or leading code 2016 or 2017, or the standard block wording, so a bare year
+ * in an unrelated error does not count.
  */
 export function isGuardrailBlock(error: unknown): boolean {
   const message = error instanceof Error ? `${error.message} ${String(error.cause ?? "")}` : String(error);
-  return /\b(2016|2017)\b/.test(message) || /blocked due to security configurations/i.test(message);
+  return /\bcode\D{0,3}(?:2016|2017)\b|^\s*(?:2016|2017)\b/i.test(message) || /blocked due to security configurations/i.test(message);
 }

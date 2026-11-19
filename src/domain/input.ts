@@ -19,6 +19,12 @@ export const MAX_REASON_CHARS = 500;
 export const SUMMARY_PATH = "(summary)";
 /** Pseudo-path for text before the first diff header, such as a commit message. */
 export const PREAMBLE_PATH = "(preamble)";
+/** Pseudo-path for findings about the change as a whole. */
+export const CHANGE_PATH = "(whole change)";
+/** Longest accepted file path. Longer paths fail instead of being cut, which could change rule scope. */
+const MAX_PATH_CHARS = 200;
+/** Internal names that a submitted file may not use. */
+const RESERVED_PATHS = new Set([SUMMARY_PATH, PREAMBLE_PATH, CHANGE_PATH]);
 
 /** One line of a change. `line` is its new-file number, or its input line outside hunks. */
 export interface ChangeLine {
@@ -60,17 +66,20 @@ export function normalizeText(text: string): string {
 const DIFF_MARKER = /^(diff --git |--- \S.*\n\+\+\+ \S|@@ -\d)/m;
 /** Captures the old count, new start and new count. Omitted counts mean 1. */
 const HUNK_HEADER = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
-/** Git header lines that carry nothing the rules inspect. */
+/** Git header lines allowed between files. Their text is kept for injection scanning. */
 const FILE_METADATA =
   /^(index |new file mode |deleted file mode |old mode |new mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to |Binary files )/;
 
-/**
- * Normalizes a path from a diff header and strips its `a/` or `b/` prefix. Paths are capped at 200.
- */
+/** Normalizes a path from a diff header and strips its `a/` or `b/` prefix. */
 function cleanPath(raw: string): string {
   const withoutTab = raw.split("\t")[0] ?? "";
   const unquoted = withoutTab.trim().replace(/^"|"$/g, "");
-  return normalizeText(unquoted).replace(/^[ab]\//, "").slice(0, 200) || "(unknown)";
+  return normalizeText(unquoted).replace(/^[ab]\//, "");
+}
+
+/** True when a submitted path can safely identify a file for rule scoping. */
+function isAcceptablePath(path: string): boolean {
+  return path.length > 0 && path.length <= MAX_PATH_CHARS && !RESERVED_PATHS.has(path);
 }
 
 /** Creates an empty file record. */
@@ -96,7 +105,8 @@ function parseSummary(text: string): ParseResult {
  * Hunk line counts decide what is content, so a content line such as
  * `+++ b/other` cannot pose as a file header. Anything unexpected fails closed:
  * ignoring it could hide added lines from the rules.
- * Blank lines and git metadata lines outside hunks are skipped and are not scanned.
+ * Git metadata and text outside hunks are kept as preamble context, so reviewer-directed text
+ * cannot hide there. Oversized or reserved file paths are rejected.
  *
  * @param text - Input with line endings already normalized by the request schema.
  * @returns A diff or summary, or an error naming the first malformed line.
@@ -157,13 +167,16 @@ export function parseChange(text: string): ParseResult {
     if (line.startsWith("diff --git ")) {
       const match = /^diff --git (?:"?a\/.*?"?) "?b\/(.*?)"?$/.exec(line);
       if (!match?.[1]) return malformed(lineNumber, "invalid diff --git header.");
-      startFile(cleanPath(match[1]));
+      const path = cleanPath(match[1]);
+      if (!isAcceptablePath(path)) return malformed(lineNumber, "the file path is too long or reserved.");
+      startFile(path);
     } else if (line.startsWith("--- ")) {
       const next = lines[index + 1] ?? "";
       if (!next.startsWith("+++ ")) return malformed(lineNumber, "a --- header must be followed by +++.");
       const oldPath = cleanPath(line.slice(4));
       const newPath = cleanPath(next.slice(4));
       const path = newPath === "/dev/null" ? oldPath : newPath;
+      if (!isAcceptablePath(path)) return malformed(lineNumber, "the file path is too long or reserved.");
       const existing = current as ChangedFile | null;
       // These headers refine a `diff --git` entry. After hunks, they begin a new file.
       if (existing && !currentHasHunks) existing.path = path;
@@ -177,10 +190,10 @@ export function parseChange(text: string): ParseResult {
       newLine = Number(header[2]);
       newLeft = header[3] === undefined ? 1 : Number(header[3]);
       currentHasHunks = true;
-    } else if (line.startsWith("\\") || FILE_METADATA.test(line) || line.trim() === "") {
+    } else if (line.trim() === "") {
       continue;
-    } else if (files.length === 0) {
-      // Text before the first header, such as a commit message. Still scanned.
+    } else if (line.startsWith("\\") || FILE_METADATA.test(line) || files.length === 0) {
+      // Metadata and text before the first header carry no code, but they are still scanned.
       preamble.context.push({ line: lineNumber, text: line });
     } else {
       return malformed(lineNumber, "unexpected text between hunks.");

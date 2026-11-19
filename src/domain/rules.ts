@@ -3,7 +3,7 @@
  * and recorded exceptions, it produces every finding and the risk level. It has no I/O and never
  * receives model output. Add a standard in `standards.ts` and its detection here.
  */
-import { normalizeText, PREAMBLE_PATH, SUMMARY_PATH, type ChangeLine, type ParsedChange } from "./input";
+import { CHANGE_PATH, normalizeText, PREAMBLE_PATH, SUMMARY_PATH, type ChangeLine, type ParsedChange } from "./input";
 import {
   SEVERITIES,
   type ExceptionRecord,
@@ -13,24 +13,47 @@ import {
   type StandardSetting,
 } from "./types";
 
-/** Pseudo-path for findings about the change as a whole. */
-export const CHANGE_PATH = "(whole change)";
-/** STD-SIZ-01 fires above this many added plus removed lines. */
+export { CHANGE_PATH };
+/** STD-SIZ-01 fires at this many added plus removed lines. */
 export const MAX_CHANGED_LINES = 400;
 /** Findings kept in a result. Risk is calculated before this cap applies. */
 const MAX_REPORTED_FINDINGS = 50;
 /** Longest evidence snippet stored with a finding. */
 const MAX_EVIDENCE_CHARS = 160;
 
-/**
- * Credential shapes for STD-SEC-01. Named assignments need a quoted value of 8 or more characters.
- */
+/** A credential-like name followed by an assignment operator. Quantifiers are bounded. */
+const SECRET_NAME = String.raw`\b[\w-]{0,40}(?:api[_-]?key|secret|token|passw(?:or)?d|credential)[\w-]{0,40}["']?\s{0,5}(?::=|=>|[:=])\s{0,5}`;
+/** A quoted value, excluding template placeholders. */
+const QUOTED_SECRET = String.raw`(["'])(?!\$\{|\{\{|<)(?:(?!\2).){8,400}?\2`;
+/** An unquoted value with a digit or symbol, which avoids matching ordinary identifiers. */
+const UNQUOTED_SECRET = String.raw`(?=[^\s"',;]{0,200}[\d!@#%^&*+/=~-])[^\s"',;()$<>{}.[\]]{8,200}(?=$|[\s,;])`;
+/** Named assignments. Group 1 is the name and operator, and group 2 is any opening quote. */
+const SECRET_ASSIGNMENT = String.raw`(${SECRET_NAME})(?:${QUOTED_SECRET}|${UNQUOTED_SECRET})`;
+/** Credentials recognizable by format alone. */
+const SECRET_TOKENS = [
+  String.raw`\bAKIA[0-9A-Z]{16}\b`,
+  String.raw`\bgh[pousr]_[A-Za-z0-9]{20,255}\b`,
+  String.raw`\bgithub_pat_[A-Za-z0-9_]{20,255}\b`,
+  String.raw`\bsk-[A-Za-z0-9_-]{16,255}\b`,
+  String.raw`\bxox[abeoprs]-[A-Za-z0-9-]{10,255}\b`,
+  String.raw`\beyJ[\w-]{8,1000}\.eyJ[\w-]{8,1000}\.[\w-]{8,1000}`,
+];
+/** An HTTP bearer credential. */
+const BEARER_TOKEN = String.raw`\bBearer\s{1,5}[A-Za-z0-9._~+/-]{20,1000}`;
+/** A password in a URL. Group 1 is the scheme and user, and group 2 precedes the host. */
+const URL_CREDENTIAL = String.raw`(\b[a-z][a-z0-9+.-]{1,20}://[^\s:/@]{1,100}:)[^\s/@]{1,200}(@)`;
+/** First line of a private key block. */
+const PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----/;
+/** Last line of a private key block. */
+const PRIVATE_KEY_END = /-----END [A-Z ]{0,40}PRIVATE KEY-----/;
+
+/** Detection for STD-SEC-01. It shares its sources with `redactSecrets`. */
 const SECRET_PATTERNS: readonly RegExp[] = [
-  /\b[\w-]*(?:api[_-]?key|secret|token|passw(?:or)?d|credential)[\w-]*["']?\s*[:=]\s*["'][^"'\s]{8,}["']/i,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
-  /\bBearer\s+[A-Za-z0-9._~+/-]{20,}/,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  new RegExp(SECRET_ASSIGNMENT, "i"),
+  ...SECRET_TOKENS.map((source) => new RegExp(source)),
+  new RegExp(BEARER_TOKEN),
+  new RegExp(URL_CREDENTIAL, "i"),
+  PRIVATE_KEY_BEGIN,
 ];
 
 /** Language aimed at automated reviewers, for STD-AGT-01 and gateway metadata. */
@@ -74,6 +97,8 @@ interface LineRule {
   summaryPatterns: readonly RegExp[];
   /** Also scan unchanged context lines and any text before the first file. */
   scanContext?: boolean;
+  /** Also scan the submitted file path, which the author fully controls. */
+  scanPath?: boolean;
 }
 
 /** Rules evaluated in `evaluateChange`. STD-SIZ-01 and STD-TST-01 are whole-change checks there. */
@@ -86,6 +111,7 @@ const LINE_RULES: readonly LineRule[] = [
       ...SECRET_PATTERNS,
       /\bhard-?cod(?:e|es|ed|ing)\b[^\n]{0,30}\b(?:password|secret|token|api key|credential)/i,
     ],
+    scanPath: true,
   },
   {
     standardId: "STD-SEC-02",
@@ -140,6 +166,7 @@ const LINE_RULES: readonly LineRule[] = [
     patterns: INJECTION_PATTERNS,
     summaryPatterns: INJECTION_PATTERNS,
     scanContext: true,
+    scanPath: true,
   },
 ];
 
@@ -150,22 +177,51 @@ export function containsInjectionLanguage(text: string): boolean {
 }
 
 /**
- * Masks credential-like values before text is stored, displayed or sent to a model.
- *
- * This is broader than detection: named assignments are masked at any length. Each pattern needs
- * its value in the supplied string, so the body of a private key is only masked when its BEGIN line
- * is part of the same call.
+ * Masks credential-like values before text is stored, displayed or sent to a model. It uses the
+ * same pattern sources as detection. A private key is masked from its BEGIN marker through its END
+ * marker when both are in the supplied text.
  */
 export function redactSecrets(text: string): string {
-  return text
-    .replace(
-      /(\b[\w-]*(?:api[_-]?key|secret|token|passw(?:or)?d|credential)[\w-]*["']?\s*[:=]\s*)(["'])[^"'\n]*\2/gi,
-      "$1$2[REDACTED]$2",
-    )
-    .replace(/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED]")
-    .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "[REDACTED]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{20,}/g, "Bearer [REDACTED]")
-    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, "[REDACTED PRIVATE KEY]");
+  let redacted = text.replace(new RegExp(SECRET_ASSIGNMENT, "gi"), (_match, name: string, quote?: string) =>
+    quote ? `${name}${quote}[REDACTED]${quote}` : `${name}[REDACTED]`,
+  );
+  for (const source of SECRET_TOKENS) redacted = redacted.replace(new RegExp(source, "g"), "[REDACTED]");
+  return redacted
+    .replace(new RegExp(BEARER_TOKEN, "g"), "Bearer [REDACTED]")
+    .replace(new RegExp(URL_CREDENTIAL, "gi"), "$1[REDACTED]$2")
+    .replace(/-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]{0,40}PRIVATE KEY-----|$)/g, "[REDACTED PRIVATE KEY]");
+}
+
+/** Characters held back so a secret split across stream chunks can still be masked. */
+const STREAM_HOLDBACK_CHARS = 240;
+
+/** Incrementally redacts model text before it is shown live. */
+export interface StreamRedactor {
+  /** Adds a chunk and returns text that is safe to release now. */
+  push(delta: string): string;
+  /** Returns the remaining text at the end of the stream. */
+  finish(): string;
+}
+
+/** Creates a redactor that releases text only at whitespace behind the holdback window. */
+export function createStreamRedactor(): StreamRedactor {
+  let pending = "";
+  return {
+    push(delta) {
+      pending += delta;
+      const limit = pending.length - STREAM_HOLDBACK_CHARS;
+      const boundary = limit > 0 ? pending.lastIndexOf(" ", limit) : -1;
+      if (boundary < 0) return "";
+      const ready = pending.slice(0, boundary + 1);
+      pending = pending.slice(boundary + 1);
+      return redactSecrets(ready);
+    },
+    finish() {
+      const rest = redactSecrets(pending);
+      pending = "";
+      return rest;
+    },
+  };
 }
 
 /** Produces the redacted, bounded snippet stored on a finding. */
@@ -212,9 +268,10 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
   const drafts = new Map<string, Draft>();
   const applicable = new Set<string>();
 
-  const record = (standardId: string, path: string, line: number | null, evidence: string) => {
+  const record = (standardId: string, rawPath: string, line: number | null, evidence: string) => {
     const standard = enabled.get(standardId);
     if (!standard) return;
+    const path = redactSecrets(rawPath);
     const key = `${standardId}|${path}`;
     const existing = drafts.get(key);
     if (existing) {
@@ -250,6 +307,10 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
           record(rule.standardId, file.path, line, text);
         }
       }
+      if (rule.scanPath && file.path !== PREAMBLE_PATH && file.path !== SUMMARY_PATH) {
+        const path = normalizeText(file.path);
+        if (rule.patterns.some((pattern) => pattern.test(path))) record(rule.standardId, file.path, null, file.path);
+      }
     }
   }
 
@@ -261,7 +322,7 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
     if (enabled.has("STD-SIZ-01")) {
       applicable.add("STD-SIZ-01");
       const changed = additions + deletions;
-      if (changed > MAX_CHANGED_LINES) {
+      if (changed >= MAX_CHANGED_LINES) {
         record("STD-SIZ-01", CHANGE_PATH, null, `${changed} changed lines`);
       }
     }
@@ -269,7 +330,7 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
     if (enabled.has("STD-TST-01") && sourceFiles.length > 0) {
       applicable.add("STD-TST-01");
       if (!realFiles.some((file) => TEST_FILE.test(file.path))) {
-        const names = sourceFiles.map((file) => file.path).slice(0, 3).join(", ");
+        const names = sourceFiles.map((file) => redactSecrets(file.path)).slice(0, 3).join(", ");
         record("STD-TST-01", CHANGE_PATH, null, `Source changed without a test: ${names}`);
       }
     }
@@ -317,23 +378,22 @@ export function evaluateChange(change: ParsedChange, context: RuleContext): Rule
 
 /**
  * Builds the short review title: the first summary line, or up to two changed paths.
- * Summary text is redacted. Diff paths are used as parsed.
+ * All submitted text is redacted.
  */
 export function describeChange(change: ParsedChange, text: string): string {
   if (change.kind === "summary") {
     const first = text.split("\n").find((line) => line.trim()) ?? "Change summary";
     return redactSecrets(normalizeText(first)).trim().slice(0, 90);
   }
-  const paths = change.files.filter((file) => file.path !== PREAMBLE_PATH && file.path !== SUMMARY_PATH).map((file) => file.path);
+  const paths = change.files.filter((file) => file.path !== PREAMBLE_PATH && file.path !== SUMMARY_PATH).map((file) => redactSecrets(file.path));
   const shown = paths.slice(0, 2).join(", ");
   return paths.length > 2 ? `${shown} and ${paths.length - 2} more` : shown;
 }
 
 /**
- * A bounded view of added lines that gives the model code context.
- *
- * Each line is redacted on its own, so a value spanning lines is masked only where a single-line
- * pattern matches it. Output stops at the first entry that would exceed the limit.
+ * A bounded view of added lines that gives the model code context. Paths and lines are redacted,
+ * and everything from a private key's BEGIN marker through its END marker is replaced. Output stops
+ * at the first entry that would exceed the limit.
  *
  * @param maxChars - Approximate limit on the returned text.
  */
@@ -341,8 +401,20 @@ export function buildExcerpt(change: ParsedChange, maxChars = 5_000): string {
   const parts: string[] = [];
   let used = 0;
   for (const file of change.files) {
+    const path = redactSecrets(file.path);
+    let insidePrivateKey = false;
     for (const { line, text } of file.additions) {
-      const entry = `${file.path}:${line}: ${redactSecrets(normalizeText(text)).slice(0, 200)}`;
+      const normalized = normalizeText(text);
+      if (insidePrivateKey) {
+        insidePrivateKey = !PRIVATE_KEY_END.test(normalized);
+        continue;
+      }
+      let content = redactSecrets(normalized).slice(0, 200);
+      if (PRIVATE_KEY_BEGIN.test(normalized)) {
+        insidePrivateKey = !PRIVATE_KEY_END.test(normalized);
+        content = "[REDACTED PRIVATE KEY]";
+      }
+      const entry = `${path}:${line}: ${content}`;
       if (used + entry.length > maxChars) return parts.join("\n");
       parts.push(entry);
       used += entry.length + 1;

@@ -3,7 +3,9 @@
  * Wrangler binds. Static assets are served by the platform; only `/agents/*` reaches this code.
  */
 import { routeAgentRequest } from "agents";
+import { verifyAccessToken } from "./access";
 import { repositoryNameSchema } from "./domain/schemas";
+import { isOffline } from "./llm";
 
 export { CodexGuardAgent } from "./agent";
 export { ReviewWorkflow } from "./workflow";
@@ -28,6 +30,21 @@ function hasAllowedOrigin(request: Request, url: URL): boolean {
 }
 
 /**
+ * Applies the access policy. A configured Access application is always enforced. Without one, only
+ * offline mode or an explicit local override may connect, so a deployment that can spend money and
+ * expose repository memory fails closed.
+ */
+async function authorize(request: Request, env: Env): Promise<Response | null> {
+  if (env.ACCESS_TEAM_DOMAIN && env.ACCESS_AUD) {
+    const token = request.headers.get("Cf-Access-Jwt-Assertion");
+    const valid = await verifyAccessToken(token, { teamDomain: env.ACCESS_TEAM_DOMAIN, audience: env.ACCESS_AUD });
+    return valid ? null : new Response("Unauthorized", { status: 401 });
+  }
+  if (isOffline(env) || env.ALLOW_UNAUTHENTICATED_AI === "true") return null;
+  return new Response("Cloudflare Access is not configured", { status: 503 });
+}
+
+/**
  * Validates agent connections before routing them. Cheap checks come first, so rejected requests
  * do not use the per-address connection budget.
  */
@@ -44,6 +61,8 @@ export default {
       return new Response("WebSocket required", { status: 426 });
     }
     if (!hasAllowedOrigin(request, url)) return new Response("Forbidden", { status: 403 });
+    const denied = await authorize(request, env);
+    if (denied) return denied;
 
     // The header is absent in local development, where all connections share one key.
     const client = request.headers.get("CF-Connecting-IP") ?? "local";

@@ -65,7 +65,7 @@ export const changeTextSchema = boundedText("The change", MAX_INPUT_CHARS).super
   const lines = text.split("\n");
   if (lines.length > MAX_INPUT_LINES) {
     context.addIssue({ code: "custom", message: `The change has ${count(lines.length)} lines. The limit is ${count(MAX_INPUT_LINES)}.` });
-  } else if (lines.some((line) => line.length > MAX_LINE_CHARS)) {
+  } else if (lines.some((line) => line.length > MAX_LINE_CHARS || normalizeText(line).length > MAX_LINE_CHARS)) {
     context.addIssue({ code: "custom", message: `A line is longer than ${count(MAX_LINE_CHARS)} characters. Remove generated or minified content.` });
   }
 });
@@ -147,14 +147,22 @@ const clientFrameSchema = z.strictObject({
 });
 
 /**
- * Think also accepts chat, tool-result, clear and state frames on this socket.
- * Allowing only named RPC calls keeps validation and rate limits unavoidable.
+ * Think also accepts chat, tool-result, clear and state frames on this socket. Returning an ID only
+ * for named RPC calls keeps validation and rate limits unavoidable.
+ *
+ * @returns The RPC ID of an allowed frame, or null for anything else.
  */
-export function isAllowedClientFrame(message: unknown): boolean {
-  if (typeof message !== "string" || message.length > MAX_CLIENT_FRAME_CHARS) return false;
+export function allowedClientFrameId(message: unknown): string | null {
+  if (typeof message !== "string" || message.length > MAX_CLIENT_FRAME_CHARS) return null;
   try {
-    return clientFrameSchema.safeParse(JSON.parse(message)).success;
+    const frame = clientFrameSchema.safeParse(JSON.parse(message));
+    return frame.success ? frame.data.id : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** True when a raw WebSocket frame is an allowed RPC call. */
+export function isAllowedClientFrame(message: unknown): boolean {
+  return allowedClientFrameId(message) !== null;
 }

@@ -7,7 +7,7 @@ import type { ReviewRecord } from "../src/domain/types";
 import worker from "../src/index";
 import { MODELS } from "../src/models";
 import { createOfflineModel } from "../src/offline-model";
-import { diffFor, FAKE_SECRET, INJECTION_LINE, OPEN_INGRESS } from "./fixtures";
+import { diffFor, FAKE_SECRET, INJECTION_LINE, OPEN_INGRESS, wavBase64 } from "./fixtures";
 
 const namespace = env.CodexGuardAgent as unknown as DurableObjectNamespace<CodexGuardAgent>;
 const newAgent = () => getAgentByName<Env, CodexGuardAgent>(namespace, `test-repo-${crypto.randomUUID().slice(0, 8)}`);
@@ -132,13 +132,16 @@ describe("review workflow", () => {
         state.storage.sql.exec("INSERT INTO reviews (id, request_id, created_at, status, title, workflow_started) VALUES (?, ?, ?, 'running', 'x', 1)", id, requestId(), createdAt);
         state.storage.sql.exec("INSERT INTO pending_inputs (review_id, text) VALUES (?, 'secret')", id);
       };
-      insert(stale, Date.now() - 11 * 60 * 1000);
+      insert(stale, Date.now() - 21 * 60 * 1000);
       insert(failed, Date.now());
       await instance.onWorkflowError("REVIEW_WORKFLOW", failed, "boom");
     });
     const { reviews } = await agent.getSnapshot();
     expect(reviews.map((review) => review.status)).toEqual(["failed", "failed"]);
-    await expect(agent.loadReviewInput(stale).catch((error: Error) => error.message)).resolves.toContain("no longer available");
+    const pending = await runInDurableObject(agent, (_instance, state) =>
+      state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM pending_inputs").one().count,
+    );
+    expect(pending).toBe(0);
   });
 
   it("ignores progress for other reviews and unknown steps", async () => {
@@ -220,10 +223,10 @@ describe("durable questions through Think", () => {
 
   it("stores one fallback answer when a turn fails, even if recovery repeats the hook", async () => {
     const agent = await newAgent();
-    await runInDurableObject(agent, (instance) => {
+    await runInDurableObject(agent, async (instance) => {
       const result = { requestId: "r1", status: "error", continuation: false, message: { id: "m", role: "assistant", parts: [] } };
-      instance.onChatResponse(result as never);
-      instance.onChatResponse(result as never);
+      await instance.onChatResponse(result as never);
+      await instance.onChatResponse(result as never);
     });
     const items = await answers(agent);
     expect(items).toHaveLength(1);
@@ -232,14 +235,14 @@ describe("durable questions through Think", () => {
 
   it("records which model answered and streams text to clients", async () => {
     const agent = await newAgent();
-    await runInDurableObject(agent, (instance) => {
+    await runInDurableObject(agent, async (instance) => {
       (instance as unknown as { env: Env }).env = { ...instance["env"], AI_MODE: "workers-ai" };
       const broadcast = vi.spyOn(instance, "broadcast");
-      instance.onChunk({ chunk: { type: "text-delta", id: "1", text: "Hello" } } as never);
+      instance.onChunk({ chunk: { type: "text-delta", id: "1", text: `${"word ".repeat(80)}` } } as never);
       instance.onChunk({ chunk: { type: "reasoning-delta", id: "1", text: "hidden" } } as never);
       expect(broadcast).toHaveBeenCalledTimes(1);
       instance.onStepEnd({ providerMetadata: { cloudflare: { model: MODELS.llm.secondary } } } as never);
-      instance.onChatResponse({ requestId: "r2", status: "completed", continuation: false, message: { id: "m", role: "assistant", parts: [{ type: "text", text: "Answer" }] } } as never);
+      await instance.onChatResponse({ requestId: "r2", status: "completed", continuation: false, message: { id: "m", role: "assistant", parts: [{ type: "text", text: "Answer" }] } } as never);
     });
     expect((await answers(agent))[0]).toMatchObject({ text: "Answer", source: "workers-ai", model: MODELS.llm.secondary });
   });
@@ -305,12 +308,7 @@ describe("exception memory", () => {
 });
 
 describe("voice", () => {
-  const wav = () => {
-    const bytes = new Uint8Array(60);
-    bytes.set(new TextEncoder().encode("RIFF"), 0);
-    bytes.set(new TextEncoder().encode("WAVE"), 8);
-    return btoa(String.fromCharCode(...bytes));
-  };
+  const wav = () => wavBase64();
 
   it("returns an offline transcript without storing or submitting it", async () => {
     const agent = await newAgent();

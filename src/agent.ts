@@ -11,10 +11,10 @@ import { callable, type Connection, type WSMessage } from "agents";
 import { buildSpokenReview, decodeWav, toSpokenText } from "./domain/audio";
 import { normalizeText, parseChange } from "./domain/input";
 import { buildQuestionPrompt, offlineAnswer } from "./domain/prompt";
-import { containsInjectionLanguage, describeChange, redactSecrets } from "./domain/rules";
+import { containsInjectionLanguage, createStreamRedactor, describeChange, redactSecrets } from "./domain/rules";
 import {
   acceptExceptionSchema,
-  isAllowedClientFrame,
+  allowedClientFrameId,
   parseInput,
   questionRequestSchema,
   reviewRequestSchema,
@@ -54,10 +54,18 @@ const MAX_REVIEWS_PER_HOUR = 30;
 /** Questions, transcriptions and speech requests one repository may make in a rolling hour. */
 const MAX_AI_ACTIONS_PER_HOUR = 60;
 /** Age at which a review still marked running is treated as abandoned. */
-const STALE_REVIEW_MS = 10 * 60 * 1000;
+const STALE_REVIEW_MS = 20 * 60 * 1000;
 /** Length of the rolling rate-limit window. */
 const HOUR_MS = 60 * 60 * 1000;
 /** Progress steps accepted from Workflow callbacks. */
+/** Plain chat rows kept per repository. */
+const MAX_STORED_MESSAGES = 500;
+/** Burst of client calls allowed per connection. */
+const FRAME_BURST = 60;
+/** Client calls restored per connection each second. */
+const FRAME_REFILL_PER_SECOND = 6;
+/** Think chat frames. This client does not use them, and they would carry raw model output. */
+const CHAT_PROTOCOL_FRAME = /^\{"type":"cf_agent_(?:use_chat|chat)_/;
 const STEP_NAMES: readonly StepName[] = ["intake", "rules", "commentary", "save"];
 /** Stored as the answer when a question turn fails or produces no text. */
 const UNAVAILABLE_ANSWER = "The model is unavailable right now. Rule results are unaffected.";
@@ -144,18 +152,48 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
    * so `onChatResponse` falls back to the primary model ID after an eviction.
    */
   private answerModel: string | null = null;
+  /** Masks live answer text while a turn streams. */
+  private answerRedactor = createStreamRedactor();
+  /** Blocks a second question while the first is being written to Think's inbox. */
+  private submittingQuestion = false;
+  /** Per-connection call budgets. They are advisory and reset if the object is evicted. */
+  private frameBudgets = new WeakMap<Connection, { tokens: number; updatedAt: number }>();
 
   /**
    * Think installs its chat protocol handler immediately before calling
    * onStart. Wrapping here keeps this allowlist in front of that handler.
-   * Rejected frames get no reply, so a client call sent that way times out.
+   * Rejected frames get no reply. Allowed calls over the connection budget get an RPC error.
    */
   private installClientFrameFilter(): void {
     const handleMessage = this.onMessage.bind(this);
     this.onMessage = async (connection: Connection, message: WSMessage) => {
-      if (isAllowedClientFrame(message)) await handleMessage(connection, message);
-      else console.warn("rejected client frame");
+      const id = allowedClientFrameId(message);
+      if (id === null) {
+        console.warn("rejected client frame");
+      } else if (this.takeFrameToken(connection)) {
+        await handleMessage(connection, message);
+      } else {
+        connection.send(JSON.stringify({ type: "rpc", id, success: false, error: "Too many requests." }));
+      }
     };
+  }
+
+  /** Spends one token from the connection's refilling budget. */
+  private takeFrameToken(connection: Connection): boolean {
+    const now = Date.now();
+    const budget = this.frameBudgets.get(connection) ?? { tokens: FRAME_BURST, updatedAt: now };
+    budget.tokens = Math.min(FRAME_BURST, budget.tokens + ((now - budget.updatedAt) / 1000) * FRAME_REFILL_PER_SECOND);
+    budget.updatedAt = now;
+    this.frameBudgets.set(connection, budget);
+    if (budget.tokens < 1) return false;
+    budget.tokens -= 1;
+    return true;
+  }
+
+  /** Drops Think's chat frames, which this client never reads. All other frames pass through. */
+  override broadcast(message: string | ArrayBuffer | ArrayBufferView, without?: string[]): void {
+    if (typeof message === "string" && CHAT_PROTOCOL_FRAME.test(message)) return;
+    super.broadcast(message, without);
   }
 
   /**
@@ -224,6 +262,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
    */
   override beforeTurn(context: TurnContext): TurnConfig {
     this.answerModel = null;
+    this.answerRedactor = createStreamRedactor();
     this.sendLive({ type: "answer-reset" });
     const question = lastUserText(context.messages);
     const result = this.latestResult();
@@ -248,11 +287,14 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   }
 
   /**
-   * Streams answer text to every connected client. This is a live preview of raw model output;
-   * the redacted, durable copy is written by `onChatResponse`.
+   * Streams redacted answer text to every connected client. The tail stays buffered until
+   * `onChatResponse` stores the complete redacted answer and clients refresh.
    */
   override onChunk(context: Parameters<Think<Env, GuardState>["onChunk"]>[0]): void {
-    if (context.chunk.type === "text-delta") this.sendLive({ type: "answer-delta", delta: context.chunk.text });
+    if (context.chunk.type === "text-delta") {
+      const delta = this.answerRedactor.push(context.chunk.text);
+      if (delta) this.sendLive({ type: "answer-delta", delta });
+    }
   }
 
   /** Records which model answered, which may be the gateway-routed fallback. */
@@ -266,7 +308,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
    * persisted and replays it after an interruption, so the stored answer is keyed by request.
    * Failed, aborted and empty turns store a fixed message instead of partial text.
    */
-  override onChatResponse(result: ChatResponseResult): void {
+  override async onChatResponse(result: ChatResponseResult): Promise<void> {
     const answer = result.message.parts
       .map((part) => (part.type === "text" ? part.text : ""))
       .join("")
@@ -279,6 +321,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     this.sql`INSERT OR IGNORE INTO messages (dedupe_key, role, kind, text, source, model, created_at)
       VALUES (${`answer:${result.requestId}`}, 'assistant', 'text', ${text}, ${source}, ${model}, ${Date.now()})`;
     this.publish({ activeQuestion: null });
+    await this.schedule(1, "clearTranscript", {});
   }
 
   // Browser methods. schemas.ts lists the names that clients may call ----------
@@ -327,6 +370,9 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     const [running] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews WHERE status = 'running'`;
     if ((running?.count ?? 0) > 0) return { ok: false, error: "A review is already running for this repository." };
 
+    if (!(await this.env.AI_ACTION_LIMIT.limit({ key: "global" })).success) {
+      return { ok: false, error: "The service is busy. Try again shortly." };
+    }
     const hourAgo = Date.now() - HOUR_MS;
     const [recent] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM reviews WHERE created_at > ${hourAgo}`;
     if ((recent?.count ?? 0) >= MAX_REVIEWS_PER_HOUR) {
@@ -417,6 +463,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     if (!enabled && !findStandard(id)?.waivable) {
       return { ok: false, error: `${id} is mandatory and cannot be turned off.` };
     }
+    if (this.readStandards().find((standard) => standard.id === id)?.enabled === enabled) return { ok: true };
     const value = enabled ? 1 : 0;
     this.sql`INSERT INTO standard_settings (id, enabled) VALUES (${id}, ${value})
       ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled`;
@@ -439,19 +486,28 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     // A retry skips the busy and budget checks because Think returns the original submission
     // for the same key and starts no new turn.
     if (!known) {
-      if (this.state.activeQuestion) return { ok: false, error: "The previous question is still being answered." };
-      if (!this.reserveAiAction()) return { ok: false, error: "This repository reached its hourly AI limit." };
+      if (this.state.activeQuestion || this.submittingQuestion) {
+        return { ok: false, error: "The previous question is still being answered." };
+      }
     }
-    const text = redactSecrets(normalizeText(question));
-    // The redacted text is what Think stores and what `beforeTurn` later reads.
-    const submission = await this.submitMessages(
-      [{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] }],
-      { idempotencyKey, metadata: { feature: "question" } },
-    );
-    this.sql`INSERT OR IGNORE INTO messages (dedupe_key, role, kind, text, created_at)
-      VALUES (${idempotencyKey}, 'user', 'text', ${text}, ${Date.now()})`;
-    if (submission.accepted) this.publish({ activeQuestion: { submissionId: submission.submissionId } });
-    return { ok: true, submissionId: submission.submissionId, accepted: submission.accepted };
+    this.submittingQuestion = true;
+    try {
+      if (!known && !(await this.reserveAiAction())) {
+        return { ok: false, error: "This repository reached its hourly AI limit." };
+      }
+      const text = redactSecrets(normalizeText(question));
+      // The redacted text is what Think stores and what `beforeTurn` later reads.
+      const submission = await this.submitMessages(
+        [{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] }],
+        { idempotencyKey, metadata: { feature: "question" } },
+      );
+      this.sql`INSERT OR IGNORE INTO messages (dedupe_key, role, kind, text, created_at)
+        VALUES (${idempotencyKey}, 'user', 'text', ${text}, ${Date.now()})`;
+      if (submission.accepted) this.publish({ activeQuestion: { submissionId: submission.submissionId } });
+      return { ok: true, submissionId: submission.submissionId, accepted: submission.accepted };
+    } finally {
+      this.submittingQuestion = false;
+    }
   }
 
   /**
@@ -467,7 +523,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     if (!input.ok) return input;
     const audio = decodeWav(input.data.audio);
     if (!audio.ok) return audio;
-    if (!this.reserveAiAction()) return { ok: false, error: "This repository reached its hourly AI limit." };
+    if (!(await this.reserveAiAction())) return { ok: false, error: "This repository reached its hourly AI limit." };
     try {
       const transcript = await transcribeAudio(this.env, audio.bytes, { repository: this.name, feature: "transcription" });
       return { ok: true, ...transcript, text: redactSecrets(normalizeText(transcript.text)) };
@@ -490,7 +546,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     if (!input.ok) return input;
     const target = this.readSpokenTarget(input.data);
     if (!target) return { ok: false, error: "There is nothing to read aloud yet." };
-    if (!this.reserveAiAction()) return { ok: false, error: "This repository reached its hourly AI limit." };
+    if (!(await this.reserveAiAction())) return { ok: false, error: "This repository reached its hourly AI limit." };
     try {
       const speech = await synthesizeSpeech(this.env, target.text, {
         repository: this.name,
@@ -512,7 +568,22 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
    */
   async resumeUnstartedReviews(): Promise<void> {
     const rows = this.sql<{ id: string }>`SELECT id FROM reviews WHERE status = 'running' AND workflow_started = 0`;
-    for (const { id } of rows) await this.launchReview(id);
+    for (const { id } of rows) await this.launchReview(id, true);
+  }
+
+  /**
+   * Removes Think's copy of finished turns. Answers are rebuilt from rule results, and the redacted
+   * conversation lives in `messages`, so this keeps raw model text from being replayed or retained.
+   * Think keeps submission records separately, so idempotency still works.
+   */
+  async clearTranscript(): Promise<void> {
+    const submissions = await this.listSubmissions();
+    if (submissions.some((submission) => ["pending", "running"].includes(submission.status))) {
+      await this.schedule(5, "clearTranscript", {});
+      return;
+    }
+    await this.session.clearMessages();
+    await this.syncMessagesFromStorage();
   }
 
   /**
@@ -534,9 +605,9 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   }
 
   /**
-   * Marks a review complete, deletes its raw input and prunes old history. Safe to repeat when the
-   * save step retries. It does not check the review's current status or whether it is the active
-   * review, so callers should treat it as the final word for that review.
+   * Marks a running review complete, deletes its raw input and prunes old history. It is safe to
+   * repeat, and a review already failed as stale keeps that status. Only this review's progress is
+   * cleared, so a newer active review is left alone.
    */
   finishReview(
     reviewId: string,
@@ -545,11 +616,12 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     const warnings = JSON.stringify(commentary.warnings);
     this.sql`UPDATE reviews SET status = 'complete', commentary = ${commentary.text},
       commentary_source = ${commentary.source}, model = ${commentary.model},
-      warnings_json = ${warnings} WHERE id = ${reviewId}`;
+      warnings_json = ${warnings} WHERE id = ${reviewId} AND status = 'running'`;
     // Kept until now so a retried rules step can read it again.
     this.sql`DELETE FROM pending_inputs WHERE review_id = ${reviewId}`;
     this.prune();
-    this.publish({ active: null });
+    if (this.state.active?.reviewId === reviewId) this.publish({ active: null });
+    else this.publish();
   }
 
   /**
@@ -594,17 +666,30 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   /**
    * Starts the Workflow, using the review ID as its instance ID so callbacks map back to the review.
    *
-   * @returns False after any start failure, including a rejected duplicate instance ID. The review
-   * is then marked failed.
+   * @param resuming - True after a restart, when an earlier attempt may already have created it.
+   * @returns False after a start failure. The review is then marked failed.
    */
-  private async launchReview(reviewId: string): Promise<boolean> {
+  private async launchReview(reviewId: string, resuming = false): Promise<boolean> {
     try {
       await this.runWorkflow("REVIEW_WORKFLOW", { reviewId, repository: this.name }, { id: reviewId });
-      this.sql`UPDATE reviews SET workflow_started = 1 WHERE id = ${reviewId}`;
-      return true;
     } catch (error) {
-      console.error("workflow start failed", error instanceof Error ? error.message : "unknown error");
-      this.markFailed(reviewId, "The review could not start. Try again.");
+      const alreadyCreated = resuming && (await this.workflowExists(reviewId));
+      if (!alreadyCreated) {
+        console.error("workflow start failed", error instanceof Error ? error.message : "unknown error");
+        this.markFailed(reviewId, "The review could not start. Try again.");
+        return false;
+      }
+    }
+    this.sql`UPDATE reviews SET workflow_started = 1 WHERE id = ${reviewId}`;
+    return true;
+  }
+
+  /** True when a Workflow instance with this ID already exists. */
+  private async workflowExists(reviewId: string): Promise<boolean> {
+    try {
+      await this.env.REVIEW_WORKFLOW.get(reviewId);
+      return true;
+    } catch {
       return false;
     }
   }
@@ -650,12 +735,12 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   }
 
   /**
-   * Claims one slot in the rolling hourly budget. This is a per-repository brake; AI Gateway limits
-   * are the account-level control.
+   * Claims one slot in the repository's hourly budget and in the shared per-minute ceiling.
    *
-   * @returns False when the budget is used up. A claimed slot is never returned.
+   * @returns False when either budget is used up. A claimed slot is never returned.
    */
-  private reserveAiAction(): boolean {
+  private async reserveAiAction(): Promise<boolean> {
+    if (!(await this.env.AI_ACTION_LIMIT.limit({ key: "global" })).success) return false;
     const hourAgo = Date.now() - HOUR_MS;
     this.sql`DELETE FROM ai_actions WHERE created_at <= ${hourAgo}`;
     const [used] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM ai_actions`;
@@ -704,13 +789,14 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   }
 
   /**
-   * Trims reviews to `MAX_STORED_REVIEWS` and removes their review messages. Plain question and
-   * answer messages have no review ID, so they are not removed here.
+   * Trims reviews to `MAX_STORED_REVIEWS`, removes their messages and caps plain chat history.
    */
   private prune(): void {
     this.sql`DELETE FROM reviews WHERE id NOT IN (
       SELECT id FROM reviews ORDER BY created_at DESC LIMIT ${MAX_STORED_REVIEWS})`;
     this.sql`DELETE FROM messages WHERE review_id IS NOT NULL
       AND review_id NOT IN (SELECT id FROM reviews)`;
+    this.sql`DELETE FROM messages WHERE id NOT IN (
+      SELECT id FROM messages ORDER BY id DESC LIMIT ${MAX_STORED_MESSAGES})`;
   }
 }

@@ -115,6 +115,8 @@ let submittingQuestion = false;
 /** Finding the exception dialog is editing. */
 let exceptionTarget: { reviewId: string; finding: Finding } | null = null;
 /** Active microphone capture. */
+let refreshInFlight = false;
+let refreshQueued = false;
 let recording: Recording | null = null;
 /** True while a recording is being transcribed. */
 let transcribing = false;
@@ -456,7 +458,7 @@ function renderSidebar(): void {
             {},
             h(
               "button",
-              { class: "history-item", type: "button", onClick: () => byId(`review-${review.id}`).scrollIntoView({ behavior: "smooth", block: "start" }) },
+              { class: "history-item", type: "button", onClick: () => document.getElementById(`review-${review.id}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) },
               h("span", { class: `severity small ${review.result?.risk ?? "pending"}` }, review.result?.risk ?? review.status),
               h("span", { class: "history-title" }, review.title),
             ),
@@ -467,18 +469,32 @@ function renderSidebar(): void {
 }
 
 /**
- * Fetches and renders the snapshot. A response for a replaced connection is dropped.
+ * Fetches and renders the snapshot. Calls made during a fetch collapse into one follow-up fetch, so
+ * bursts of revisions cannot multiply requests. A response for a replaced connection is dropped.
  *
  * @throws The RPC error, which callers report.
  */
 async function refresh(): Promise<void> {
   if (!client) return;
+  if (refreshInFlight) {
+    refreshQueued = true;
+    return;
+  }
+  refreshInFlight = true;
   const current = client;
-  const next = (await current.call("getSnapshot")) as unknown as Snapshot;
-  if (current !== client) return;
-  snapshot = next;
-  for (const review of next.reviews) if (review.status !== "running") liveCommentary.delete(review.id);
-  render();
+  try {
+    const next = (await current.call("getSnapshot")) as unknown as Snapshot;
+    if (current !== client) return;
+    snapshot = next;
+    for (const review of next.reviews) if (review.status !== "running") liveCommentary.delete(review.id);
+    render();
+  } finally {
+    refreshInFlight = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      void refresh().catch(reportFailure);
+    }
+  }
 }
 
 /** Shows an unexpected failure in the notice area. */
@@ -527,8 +543,8 @@ async function submitQuestion(): Promise<void> {
 
 /**
  * Starts recording, or stops the active recording. The starting call stays pending until
- * transcription ends, then appends the transcript to the composer for review. It uses whichever
- * connection is current when the recording finishes.
+ * transcription ends, then appends the transcript to the composer for review. A recording is
+ * discarded if the repository changes, so it is never sent to a different repository.
  */
 async function toggleRecording(): Promise<void> {
   if (recording) {
@@ -536,6 +552,7 @@ async function toggleRecording(): Promise<void> {
     return;
   }
   setNotice("");
+  const owner = client;
   try {
     const active = await startRecording();
     recording = active;
@@ -544,7 +561,7 @@ async function toggleRecording(): Promise<void> {
     recording = null;
     transcribing = true;
     updateComposer();
-    if (!client) return;
+    if (!client || client !== owner) return;
     const result = (await client.call("transcribe", [{ audio }])) as unknown as ActionResult<TranscriptResult>;
     if (!result.ok) {
       setNotice(result.error);
@@ -689,11 +706,6 @@ function connect(repository: string): void {
   ui.repoInput.value = repository;
   ui.timeline.replaceChildren();
   setConnection("Connecting", "connecting");
-  try {
-    localStorage.setItem("codex-guard-repo", repository);
-  } catch {
-    // The page works without saved preferences.
-  }
 
   const next = new AgentClient<unknown, GuardState>({
     agent: "CodexGuardAgent",
@@ -765,8 +777,15 @@ ui.mic.addEventListener("click", () => void toggleRecording());
 ui.repoForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const repository = toSlug(ui.repoInput.value);
-  if (repository) connect(repository);
-  else setNotice("Enter a repository name using letters, numbers, dots, dashes or underscores.");
+  if (repository) {
+    // Only an explicit choice is remembered, so a shared link cannot redirect later work.
+    try {
+      localStorage.setItem("codex-guard-repo", repository);
+    } catch {
+      // The page works without saved preferences.
+    }
+    connect(repository);
+  } else setNotice("Enter a repository name using letters, numbers, dots, dashes or underscores.");
 });
 ui.dialogForm.addEventListener("submit", (event) => {
   event.preventDefault();

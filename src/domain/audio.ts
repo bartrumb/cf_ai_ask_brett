@@ -15,18 +15,27 @@ export const MAX_SPOKEN_CHARS = 1_500;
 export type DecodedAudio = { ok: true; bytes: Uint8Array } | { ok: false; error: string };
 
 /**
- * Decodes schema-checked base64 and confirms that it is a bounded WAV file.
- *
- * Only the size and RIFF/WAVE markers are checked. Sample format is left to the speech model.
+ * Decodes schema-checked base64 and accepts only the format the browser client produces: 16 kHz,
+ * 16-bit, mono PCM with a canonical header. Fixing the rate makes the byte cap a duration cap.
  */
 export function decodeWav(base64: string): DecodedAudio {
   const bytes = new Uint8Array(Buffer.from(base64, "base64"));
   if (bytes.length > MAX_AUDIO_BYTES) return { ok: false, error: "That recording is too long. Keep it under 30 seconds." };
+  const invalid: DecodedAudio = { ok: false, error: "The audio must be a 16 kHz mono WAV recording." };
+  if (bytes.length <= 44) return invalid;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const ascii = (start: number, end: number) => String.fromCharCode(...bytes.subarray(start, end));
-  if (bytes.length <= 44 || ascii(0, 4) !== "RIFF" || ascii(8, 12) !== "WAVE") {
-    return { ok: false, error: "The audio must be a WAV recording." };
-  }
-  return { ok: true, bytes };
+  const valid =
+    ascii(0, 4) === "RIFF" &&
+    ascii(8, 16) === "WAVEfmt " &&
+    ascii(36, 40) === "data" &&
+    view.getUint32(16, true) === 16 &&
+    view.getUint16(20, true) === 1 &&
+    view.getUint16(22, true) === 1 &&
+    view.getUint32(24, true) === 16_000 &&
+    view.getUint16(34, true) === 16 &&
+    view.getUint32(40, true) === bytes.length - 44;
+  return valid ? { ok: true, bytes } : invalid;
 }
 
 /** Shortens text to `MAX_SPOKEN_CHARS`, ending at the last full sentence when one exists. */

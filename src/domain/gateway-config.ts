@@ -57,6 +57,8 @@ const READ_ONLY_FIELDS = ["id", "account_id", "account_tag", "internal_id", "cre
 export function desiredGateway(existing?: Record<string, unknown>): GatewaySettings {
   const current = { ...existing };
   for (const field of READ_ONLY_FIELDS) delete current[field];
+  // The API reports an unset limit as null, which must not override the safe defaults.
+  for (const [field, value] of Object.entries(current)) if (value === null) delete current[field];
   const guardrails = (current.guardrails ?? {}) as Partial<GatewaySettings["guardrails"]>;
   return {
     cache_invalidate_on_update: false,
