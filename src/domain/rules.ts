@@ -257,7 +257,9 @@ export function createStreamRedactor(): StreamRedactor {
       if (unchecked < STREAM_RECHECK_CHARS) return "";
       unchecked = 0;
       const clean = redactSecrets(raw);
-      const stable = clean.length - STREAM_HOLDBACK_CHARS;
+      let stable = clean.length - STREAM_HOLDBACK_CHARS;
+      // Never release part of an unbroken value, because later text could complete a credential.
+      while (stable > sent && !/\s/.test(clean[stable - 1] ?? "")) stable -= 1;
       if (stable <= sent) return "";
       const ready = clean.slice(sent, stable);
       sent = stable;

@@ -80,7 +80,14 @@ const CHAT_PROTOCOL_FRAME = /^\{"type":"cf_agent_(?:use_chat|chat)_/;
 /** Completed Think submissions are kept this long so retries stay idempotent. */
 const SUBMISSION_RETENTION_MS = 7 * 24 * HOUR_MS;
 /** Snapshot reads have their own budget, so background refreshes cannot block user actions. */
-const SNAPSHOT_FRAME = /"method":"getSnapshot"/;
+function isSnapshotFrame(message: string): boolean {
+  try {
+    return (JSON.parse(message) as { method?: unknown }).method === "getSnapshot";
+  } catch {
+    return false;
+  }
+}
+
 /** Identity saved on a connection by the Worker's verified headers. */
 interface ConnectionIdentity {
   accessExpiresAt?: number;
@@ -177,6 +184,8 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   private answerRedactor = createStreamRedactor();
   /** Blocks a second question while the first is being written to Think's inbox. */
   private submittingQuestion = false;
+  /** Allows one review request at a time to spend shared budget before its row is written. */
+  private startingReview = false;
   /** Per-connection call budgets. They are advisory and reset if the object is evicted. */
   private frameBudgets = new WeakMap<Connection, Record<"action" | "read", { tokens: number; updatedAt: number }>>();
 
@@ -202,13 +211,9 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
 
     const handleMessage = this.onMessage.bind(this);
     this.onMessage = async (connection: Connection, message: WSMessage) => {
-      const identity = connection.state as ConnectionIdentity | null;
-      if (identity?.accessExpiresAt && identity.accessExpiresAt <= Date.now() / 1000) {
-        connection.close(4401, "Access expired");
-        return;
-      }
+      if (this.closeIfExpired(connection)) return;
       const small = typeof message === "string" && message.length <= MAX_REJECTED_FRAME_CHARS;
-      const kind = small && SNAPSHOT_FRAME.test(message) ? "read" : "action";
+      const kind = small && isSnapshotFrame(message) ? "read" : "action";
       // The budget is checked first so an over-limit connection cannot force large frames to parse.
       if (!this.takeFrameToken(connection, kind)) {
         const id = small ? allowedClientFrameId(message) : null;
@@ -218,6 +223,14 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
       if (allowedClientFrameId(message) === null) console.warn("rejected client frame");
       else await handleMessage(connection, message);
     };
+  }
+
+  /** Closes a connection whose Access token has expired. */
+  private closeIfExpired(connection: Connection): boolean {
+    const identity = connection.state as ConnectionIdentity | null;
+    if (!identity?.accessExpiresAt || identity.accessExpiresAt > Date.now() / 1000) return false;
+    connection.close(4401, "Access expired");
+    return true;
   }
 
   /** Spends one token from the connection's refilling budget for this kind of call. */
@@ -239,6 +252,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
   /** Drops Think's chat frames, which this client never reads. All other frames pass through. */
   override broadcast(message: string | ArrayBuffer | ArrayBufferView, without?: string[]): void {
     if (typeof message === "string" && CHAT_PROTOCOL_FRAME.test(message)) return;
+    for (const connection of this.getConnections()) this.closeIfExpired(connection);
     super.broadcast(message, without);
   }
 
@@ -260,6 +274,9 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     this.sql`CREATE TABLE IF NOT EXISTS exceptions (
       id TEXT PRIMARY KEY, standard_id TEXT NOT NULL, path TEXT NOT NULL, reason TEXT NOT NULL,
       review_id TEXT NOT NULL, created_at INTEGER NOT NULL, created_by TEXT, UNIQUE (standard_id, path))`;
+    if (!this.sql`SELECT name FROM pragma_table_info('exceptions') WHERE name = 'created_by'`.length) {
+      this.sql`ALTER TABLE exceptions ADD COLUMN created_by TEXT`;
+    }
     this.sql`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe_key TEXT NOT NULL UNIQUE, role TEXT NOT NULL,
       kind TEXT NOT NULL, text TEXT NOT NULL, review_id TEXT, source TEXT, model TEXT,
@@ -426,7 +443,15 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     if ((recent?.count ?? 0) >= MAX_REVIEWS_PER_HOUR) {
       return { ok: false, error: "This repository reached its hourly review limit. Try again later." };
     }
-    if (!(await this.allowSharedAiSpend())) return { ok: false, error: "The service is busy. Try again shortly." };
+    if (this.startingReview) return { ok: false, error: "A review is already running for this repository." };
+    this.startingReview = true;
+    let allowed = false;
+    try {
+      allowed = await this.allowSharedAiSpend();
+    } finally {
+      this.startingReview = false;
+    }
+    if (!allowed) return { ok: false, error: "The service is busy. Try again shortly." };
 
     // Other requests can run during the await above, so both start conditions are checked again.
     const [raced] = this.sql<{ id: string }>`SELECT id FROM reviews WHERE request_id = ${requestId}`;
@@ -765,6 +790,7 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
    * clients use the new revision as their signal to refetch the snapshot.
    */
   private publish(change: Partial<Pick<GuardState, "active" | "activeQuestion">> = {}): void {
+    for (const connection of this.getConnections()) this.closeIfExpired(connection);
     this.setState({ ...this.state, ...change, revision: this.state.revision + 1 });
   }
 
@@ -875,9 +901,11 @@ export class CodexGuardAgent extends Think<Env, GuardState> {
     this.sql`DELETE FROM ai_actions WHERE created_at <= ${hourAgo}`;
     const [used] = this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM ai_actions`;
     if ((used?.count ?? 0) >= MAX_AI_ACTIONS_PER_HOUR) return false;
-    if (!(await this.allowSharedAiSpend())) return false;
-    this.sql`INSERT INTO ai_actions (created_at) VALUES (${Date.now()})`;
-    return true;
+    // The slot is held before the await, so concurrent calls cannot pass the hourly limit.
+    const [slot] = this.sql<{ rowid: number }>`INSERT INTO ai_actions (created_at) VALUES (${Date.now()}) RETURNING rowid`;
+    if (await this.allowSharedAiSpend()) return true;
+    this.sql`DELETE FROM ai_actions WHERE rowid = ${slot?.rowid ?? -1}`;
+    return false;
   }
 
   /**

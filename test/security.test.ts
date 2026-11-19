@@ -95,6 +95,16 @@ describe("secret detection and redaction", () => {
     }
   });
 
+  it("holds an unfinished JWT until redaction can see all of it", () => {
+    const jwt = `eyJ${"a".repeat(20)}.eyJ${"b".repeat(900)}.${"c".repeat(20)}`;
+    const text = `${"safe ".repeat(150)}${jwt} ${"more ".repeat(150)}`;
+    const redactor = createStreamRedactor();
+    let output = "";
+    for (let index = 0; index < text.length; index += 7) output += redactor.push(text.slice(index, index + 7));
+    output += redactor.finish();
+    expect(output).not.toContain("bbbb");
+  });
+
   it.each([
     ["a rotated key", ` -----BEGIN ${"PRIVATE"} KEY-----`, "-OLDVALUE", "+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw", ` -----END ${"PRIVATE"} KEY-----`],
     ["a rotated PGP key", ` -----BEGIN PGP ${"PRIVATE"} KEY BLOCK-----`, "-OLDVALUE", "+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw", ` -----END PGP ${"PRIVATE"} KEY BLOCK-----`],
@@ -284,8 +294,26 @@ describe("Cloudflare Access", () => {
     await until(() => closed === 4401);
   });
 
-  it("does not accept lifecycle or identity headers from clients", async () => {
-    const response = await connect({}, { "x-agents-lifecycle-props": "{bad", "x-codex-guard-access-expires": "1" });
+  it("closes an expired silent connection before later broadcasts", async () => {
+    const name = repository();
+    const access = { ...env, ACCESS_TEAM_DOMAIN: config.teamDomain, ACCESS_AUD: config.audience } as Env;
+    const { fetcher, sign } = await setup();
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetcher);
+    const headers = { Upgrade: "websocket", "Cf-Access-Jwt-Assertion": await sign({ exp: Date.now() / 1000 + 1 }) };
+    const response = await worker.fetch(new Request(`https://guard.example/agents/codex-guard-agent/${name}`, { headers }), access);
+    const socket = response.webSocket;
+    if (!socket) throw new Error("Expected a WebSocket.");
+    let closed = 0;
+    socket.addEventListener("close", (event) => { closed = event.code; });
+    socket.accept();
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    const agent = await getAgentByName<Env, CodexGuardAgent>(namespace, name);
+    await runInDurableObject(agent, (instance) => instance.broadcast("{}"));
+    await until(() => closed === 4401);
+  });
+
+  it("does not accept internal SDK or identity headers from clients", async () => {
+    const response = await connect({}, { "x-agents-lifecycle-props": "{bad", "x-cf-agents-subagent-url": "/sub/codex-guard-agent/child", "x-codex-guard-access-expires": "1" });
     expect(response.status).toBe(101);
     const socket = response.webSocket;
     if (!socket) throw new Error("Expected a WebSocket.");
@@ -410,6 +438,39 @@ describe("agent hardening", () => {
       expect(state.storage.sql.exec("SELECT id FROM messages").toArray()).toHaveLength(0);
       expect(await instance.listSubmissions()).toEqual([]);
       await instance.expireIdleData();
+    });
+  });
+
+  it("spends shared budget once for concurrent review requests", async () => {
+    const agent = await agentFor();
+    await runInDurableObject(agent, async (instance) => {
+      const limit = vi.fn(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); return { success: true }; });
+      (instance as unknown as { env: Env }).env = { ...instance["env"], AI_ACTION_LIMIT: { limit } as never };
+      const requests = Array.from({ length: 10 }, () => instance.startReview({ text: OPEN_INGRESS, requestId: crypto.randomUUID() }));
+      expect((await Promise.all(requests)).filter((result) => result.ok)).toHaveLength(1);
+      expect(limit).toHaveBeenCalledTimes(1);
+    });
+    await until(async () => (await agent.getSnapshot()).reviews.every((review) => review.status === "complete"));
+  });
+
+  it("does not exceed the hourly limit under concurrent actions", async () => {
+    const agent = await agentFor();
+    const audio = wavBase64();
+    await runInDurableObject(agent, async (instance, state) => {
+      for (let index = 0; index < 59; index += 1) state.storage.sql.exec("INSERT INTO ai_actions (created_at) VALUES (?)", Date.now());
+      const results = await Promise.all(Array.from({ length: 10 }, () => instance.transcribe({ audio })));
+      expect(results.filter((result) => result.ok)).toHaveLength(1);
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM ai_actions").one().count).toBe(60);
+    });
+  });
+
+  it("adds the exception actor column to older repositories", async () => {
+    const agent = await agentFor();
+    await runInDurableObject(agent, async (instance, state) => {
+      state.storage.sql.exec("DROP TABLE exceptions");
+      state.storage.sql.exec("CREATE TABLE exceptions (id TEXT PRIMARY KEY, standard_id TEXT NOT NULL, path TEXT NOT NULL, reason TEXT NOT NULL, review_id TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE (standard_id, path))");
+      await instance.onStart();
+      expect(state.storage.sql.exec("SELECT name FROM pragma_table_info('exceptions') WHERE name = 'created_by'").toArray()).toHaveLength(1);
     });
   });
 

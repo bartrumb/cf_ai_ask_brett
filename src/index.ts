@@ -45,12 +45,14 @@ async function authorize(request: Request, env: Env): Promise<{ denied: Response
 }
 
 /**
- * Rebuilds the request for the agent. Client values for internal headers and the SDK's lifecycle
- * header are removed, so only the Worker can supply identity to the Durable Object.
+ * Rebuilds the request for the agent. Client values for internal headers and the SDK's internal
+ * headers are removed, so only the Worker can supply identity to the Durable Object.
  */
 function forwardRequest(request: Request, identity: AccessIdentity | null): Request {
   const headers = new Headers(request.headers);
-  for (const name of [ACCESS_EXPIRES_HEADER, ACCESS_EMAIL_HEADER, "x-agents-lifecycle-props"]) headers.delete(name);
+  for (const name of [...headers.keys()]) {
+    if (name === ACCESS_EXPIRES_HEADER || name === ACCESS_EMAIL_HEADER || /^x-(?:cf-)?agents-/.test(name)) headers.delete(name);
+  }
   if (identity) headers.set(ACCESS_EXPIRES_HEADER, String(identity.expiresAt));
   if (identity?.email) headers.set(ACCESS_EMAIL_HEADER, identity.email);
   return new Request(request, { headers });
