@@ -53,6 +53,20 @@ export function ungroundedNumbers(answer: string, facts: string, question: strin
   return [...new Set(numbersIn(answer))].filter((value) => !known.has(value));
 }
 
+/** Strips the scheme, "www." and trailing punctuation so links compare as written. */
+const normalizeLink = (link: string) => link.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/[.,;:!?)\]'"]+$/, "").replace(/\/$/, "");
+
+/**
+ * Lists links in the answer that do not appear in the profile facts. A link with a scheme or a path
+ * counts; bare names such as "Outlook.com" do not. A misspelled profile link sends a recruiter to
+ * the wrong person, so it is scored like an invented number.
+ */
+export function ungroundedLinks(answer: string, facts: string): string[] {
+  const known = facts.toLowerCase().replace(/https?:\/\/(?:www\.)?/g, "");
+  const links = answer.match(/\bhttps?:\/\/[^\s<>()]+|\b(?:[a-z0-9-]+\.)+[a-z]{2,}\/[^\s<>()]*/gi) ?? [];
+  return [...new Set(links.map(normalizeLink))].filter((link) => !known.includes(link));
+}
+
 /**
  * Scores only whether the guard decision was right. This is all the offline run can see, since no
  * answer is written.
@@ -102,6 +116,8 @@ export function scoreCase(item: EvalCase, seen: Observation, facts: string): Sco
   if (words > MAX_ANSWER_WORDS) failures.push(`too long: ${words} words`);
   const invented = ungroundedNumbers(answer, facts, item.question);
   if (invented.length) failures.push(`numbers not in the facts: ${invented.join(", ")}`);
+  const badLinks = ungroundedLinks(answer, facts);
+  if (badLinks.length) failures.push(`links not in the facts: ${badLinks.join(", ")}`);
 
   return { passed: failures.length === 0, failures };
 }

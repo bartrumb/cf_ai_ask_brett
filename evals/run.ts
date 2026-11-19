@@ -7,7 +7,8 @@
  *
  * The live run goes through the same path as a visitor: the Worker's checks, the guards, the model,
  * and output redaction. Each case gets a new conversation, so no case sees another's history. Model
- * questions count against the deployment's daily visitor budget.
+ * questions count against the deployment's daily budget for one visitor network (200 units by
+ * default), so one machine can run about two full passes a day. The run stops if a budget refuses.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -169,6 +170,13 @@ async function main(): Promise<void> {
   for (let run = 1; run <= repeat; run += 1) {
     for (const item of cases) {
       const seen = values.offline ? observeOffline(item) : await observeLive(item, values.host);
+      // Once a budget refuses, every later case would fail the same way and the report would
+      // describe the budget, not the agent. Stop without overwriting the last complete results.
+      if (seen.source === "error" && /reached its limit/i.test(seen.answer)) {
+        process.stderr.write(`\nStopped at ${item.id}, run ${run}: the deployment's AI budget is used up. Earlier results were left unchanged.\n`);
+        process.exitCode = 2;
+        return;
+      }
       const final = values.offline ? scoreGuardDecision(item, seen) : scoreCase(item, seen, facts);
       results.push({ id: item.id, area: item.area, run, question: item.question, ...seen, ...(item.knownIssue ? { knownIssue: item.knownIssue } : {}), score: final });
       process.stdout.write(`${final.passed ? "pass" : "FAIL"}  ${item.area.padEnd(13)} ${item.id}${final.passed ? "" : `  ${final.failures.join("; ")}`}\n`);

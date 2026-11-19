@@ -19,6 +19,8 @@ describe("guarded topics", () => {
     ["financials", "What is the company's revenue?"],
     ["financials", "How much does his employer spend on Claude?"],
     ["financials", "What is the AI spend there?"],
+    ["financials", "What are their monthly AI costs?"],
+    ["financials", "How much does Claude cost his employer?"],
     ["financials", "What is the vendor pricing?"],
     ["contact", "What is his phone number?"],
     ["contact", "Can I text him?"],
@@ -30,6 +32,7 @@ describe("guarded topics", () => {
     ["personal", "Tell me about his family"],
     ["personal", "Has he taken medical leave?"],
     ["personal", "How old is he?"],
+    ["personal", "What age is Brett?"],
     ["job-search", "Which companies is he interviewing with?"],
     ["job-search", "Does he have other offers?"],
     ["job-search", "Is he talking to any competitors?"],
@@ -72,6 +75,9 @@ describe("guarded topics", () => {
     "What did he build for payments and SMS integrations?",
     "How does prompt caching work in the platform?",
     "Does he know Google Cloud?",
+    "How does he keep AI costs down?",
+    "What has he done to cut cloud costs?",
+    "How old were the legacy systems he migrated?",
   ])("does not guard: %s", (question) => {
     expect(classifyQuestion(question)).toBeNull();
   });

@@ -398,3 +398,15 @@ r a public eval suite for cf_ai_ask_brett?
 ````
 
 **Produced:** `evals/`, a 48-case eval set covering guarded topics, over-blocking, facts, unknowns and prompt injection, scored by deterministic checks: required and forbidden patterns, prompt leaks, list formatting, length, and numbers that do not appear in the profile facts. `npm run eval:guards` scores the guards offline, and `npm run eval` asks the live agent over its real WebSocket and writes a report to `evals/results/`. `test/evals.test.ts` runs the guard cases in CI. The first run found two over-blocking bugs in the guards, recorded as known issues rather than fixed in the same change.
+
+---
+
+## Prompt 23
+
+This request came from the Claude Code session I use for résumé and site review. It reported that the first eval run had found two guards blocking ordinary questions, and asked whether to fix them. I answered:
+
+````text
+Fix them
+````
+
+**Produced:** narrower financials and age patterns in `src/domain/guards.ts`, with guard and eval regression cases for both directions. The eval runner now also fails any link that does not appear in the profile facts, after the post-fix rerun showed a misspelled LinkedIn handle that no check caught, and it stops at the first budget refusal instead of scoring refusals as failed answers. The Worker was redeployed.

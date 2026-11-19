@@ -48,8 +48,11 @@ const GUARD_PATTERNS: readonly (readonly [GuardCategory, readonly RegExp[]])[] =
     "financials",
     [
       /\brevenue\b|\bannual recurring\b|\barr\b|\bprofit\b|\bvaluation\b/,
-      /\b(?:ai|claude|cloud|azure|model|vendor|company|employer)\s+(?:spend|spending|budget|bill|costs?)\b/,
-      /\bhow much\b.{0,50}\b(?:spend|spends|spent|saved|save|saves|recovered?|overbill\w*|budget)\b/,
+      /\b(?:ai|claude|cloud|azure|model|vendor|company|employer)\s+(?:spend|spending|budget|bill)\b/,
+      /\b(?:vendor|company|employer)\s+costs?\b/,
+      // "AI costs" alone is usually about how he keeps costs down. Amount and owner words mark a figure.
+      /\b(?:their|its|company'?s|employer'?s|monthly|annual|yearly|total)\s+(?:ai|claude|cloud|azure|model)\s+costs?\b/,
+      /\bhow much\b.{0,50}\b(?:spend|spends|spent|saved|save|saves|recovered?|overbill\w*|budget|costs?)\b/,
       /\bvendor pric\w+\b|\bdealer cost\b|\bwholesale\b/,
     ],
   ],
@@ -71,7 +74,9 @@ const GUARD_PATTERNS: readonly (readonly [GuardCategory, readonly RegExp[]])[] =
       new RegExp(String.raw`\bis\s+${PERSON}\s+(?:sick|healthy|ill|married|divorced|single)\b`),
       /\b(?:wife|husband|spouse|girlfriend|boyfriend|kids?|children|daughters?|sons?|mother|father|mom|dad|parents|siblings?)\b/,
       new RegExp(String.raw`\b${PERSON}(?:'s)?\s+famil(?:y|ies)\b|\bfamily (?:life|members?|situation|status)\b`),
-      /\bhow old\b|\bdate of birth\b|\breligio(?:n|us)\b|\bpolitical (?:views?|party)\b/,
+      // "How old" only about a person, so "how old were the systems" still reaches the model.
+      new RegExp(String.raw`\bhow old\s+(?:is|was|are)\s+${PERSON}\b|\bwhat age\s+is\s+${PERSON}\b`),
+      /\bdate of birth\b|\breligio(?:n|us)\b|\bpolitical (?:views?|party)\b/,
     ],
   ],
   [

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { classifyQuestion } from "../src/domain/guards";
 import { CASES } from "../evals/cases";
-import { numbersIn, scoreCase, scoreGuardDecision, ungroundedNumbers, wordCount } from "../evals/checks";
+import { numbersIn, scoreCase, scoreGuardDecision, ungroundedLinks, ungroundedNumbers, wordCount } from "../evals/checks";
 
 describe("eval set: guard decisions", () => {
   // The same check `npm run eval:guards` reports. A case with a known issue must still fail, so a fix
@@ -33,6 +33,12 @@ describe("eval checks", () => {
   it("flags numbers that are not in the facts", () => {
     expect(ungroundedNumbers("From 1,073 ms to 342 ms in 3 months.", facts, "q")).toEqual([]);
     expect(ungroundedNumbers("He cut it by 68% across 12 teams.", facts, "q")).toEqual(["68", "12"]);
+  });
+
+  it("flags links that are not in the facts", () => {
+    const withLinks = `${facts} Find him at https://www.linkedin.com/in/bartrumb and https://brett.bartrum.family/.`;
+    expect(ungroundedLinks("See linkedin.com/in/bartrumb or https://brett.bartrum.family/.", withLinks)).toEqual([]);
+    expect(ungroundedLinks("See linkedin.com/in/brettrumb, built with Outlook.com.", withLinks)).toEqual(["linkedin.com/in/brettrumb"]);
   });
 
   it("counts words", () => {
